@@ -391,10 +391,10 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
 	LOCKMODE	lockmode;
 
 	/* Determine strength of lock needed. */
-	if (stmt->concurrent)
-		lockmode = ExclusiveLock;
-	else if (stmt->whereClause)
+	if (stmt->concurrent && stmt->whereClause)
 		lockmode = RowExclusiveLock;
+	else if (stmt->concurrent || stmt->whereClause)
+		lockmode = ExclusiveLock;
 	else
 		lockmode = AccessExclusiveLock;
 
@@ -416,13 +416,13 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
  *
  * This refreshes a materialized view using one of three strategies:
  *
- * 1. Partial non-concurrent (WHERE clause, no CONCURRENTLY):
+ * 1. Partial concurrent (WHERE clause with CONCURRENTLY):
  * Directly modifies the matview in-place using a two-step approach
  * (SELECT FOR UPDATE followed by a CTE upsert/delete).
  * Uses RowExclusiveLock, allowing concurrent reads and concurrent writes
  * to non-overlapping rows. Overlapping writes are serialized by row locks.
  *
- * 2. Concurrent (CONCURRENTLY, with or without WHERE clause):
+ * 2. Diff-based (CONCURRENTLY without WHERE, or WHERE without CONCURRENTLY):
  * Creates a temporary table with new data, computes a diff against
  * the existing matview, and applies changes. Uses ExclusiveLock,
  * allowing concurrent reads throughout the operation but blocking all
@@ -607,9 +607,9 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	SetMatViewPopulatedState(matviewRel, !skipData);
 
 	/*
-	 * STRATEGY 1: PARTIAL NON-CONCURRENT
+	 * STRATEGY 1: PARTIAL CONCURRENT (direct modification)
 	 */
-	if (qual && !concurrent && !skipData)
+	if (qual && concurrent && !skipData)
 	{
 		int			old_depth = matview_maintenance_depth;
 
@@ -630,9 +630,9 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	}
 
 	/*
-	 * STRATEGY 2: CONCURRENT (PARTIAL or FULL)
+	 * STRATEGY 2: DIFF-BASED (FULL CONCURRENT or PARTIAL NON-CONCURRENT)
 	 */
-	else if (concurrent)
+	else if (concurrent || (qual && !skipData))
 	{
 		Oid			tableSpace;
 		char		relpersistence;
@@ -1127,23 +1127,10 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		}
 
 		/*
-		 * Prepare the row-locking statement.  This acquires FOR UPDATE locks
-		 * on matview rows matching the WHERE clause to serialize concurrent
-		 * partial refreshes on overlapping rows.
-		 */
-		initStringInfo(&buf);
-		appendStringInfo(&buf, "SELECT 1 FROM %s mv WHERE (%s) FOR UPDATE",
-						 matview_name, whereClauseStr);
-
-		cacheEntry->lockPlan = SPI_prepare(buf.data, nargs, argtypes);
-		if (cacheEntry->lockPlan == NULL)
-			elog(ERROR, "SPI_prepare failed for lock acquisition: %s", buf.data);
-		SPI_keepplan(cacheEntry->lockPlan);
-
-		/*
-		 * Build the refresh CTE: evaluate the underlying query with the WHERE
-		 * predicate, upsert the results, and delete matview rows that no
-		 * longer appear in the query output.
+		 * Build the unique-key column list once.  It drives the ON CONFLICT
+		 * target, the anti-join condition, and the deterministic ordering used
+		 * by the locking SELECT and the upsert to avoid deadlocks between
+		 * overlapping refreshes.
 		 */
 		indexRel = index_open(uniqueIndexOid, AccessShareLock);
 		indexStruct = indexRel->rd_index;
@@ -1152,7 +1139,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		initStringInfo(&set_clause);
 		initStringInfo(&join_clause);
 
-		/* Build the ON CONFLICT column list and anti-join condition. */
 		first = true;
 		for (i = 0; i < indexStruct->indnkeyatts; i++)
 		{
@@ -1210,6 +1196,29 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 
 		index_close(indexRel, NoLock);
 
+		/*
+		 * Prepare the row-locking statement.  This acquires FOR UPDATE locks
+		 * on matview rows matching the WHERE clause to serialize concurrent
+		 * partial refreshes on overlapping rows.  The ORDER BY makes every
+		 * refresh acquire those locks in the same key order so overlapping
+		 * refreshes cannot deadlock.
+		 */
+		initStringInfo(&buf);
+		appendStringInfo(&buf,
+						 "SELECT 1 FROM %s mv WHERE (%s) ORDER BY %s FOR UPDATE",
+						 matview_name, whereClauseStr, conflict_cols.data);
+
+		cacheEntry->lockPlan = SPI_prepare(buf.data, nargs, argtypes);
+		if (cacheEntry->lockPlan == NULL)
+			elog(ERROR, "SPI_prepare failed for lock acquisition: %s", buf.data);
+		SPI_keepplan(cacheEntry->lockPlan);
+
+		/*
+		 * Build the refresh CTE: evaluate the underlying query with the WHERE
+		 * predicate, upsert the results (feeding the insert from a key-ordered
+		 * source for the same anti-deadlock reason), and delete matview rows
+		 * that no longer appear in the query output.
+		 */
 		resetStringInfo(&buf);
 
 		if (has_non_key_cols)
@@ -1219,14 +1228,15 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 							 "  SELECT * FROM (%s) %s WHERE (%s) "
 							 "), "
 							 "upsert AS ( "
-							 "  INSERT INTO %s SELECT * FROM new_data "
+							 "  INSERT INTO %s SELECT * FROM new_data ORDER BY %s "
 							 "  ON CONFLICT (%s) DO UPDATE SET %s "
 							 ") "
 							 "DELETE FROM %s mv WHERE (%s) AND NOT EXISTS ( "
 							 "  SELECT 1 FROM new_data nd WHERE %s"
 							 ")",
 							 view_sql, matview_alias, whereClauseStr,
-							 matview_name, conflict_cols.data, set_clause.data,
+							 matview_name, conflict_cols.data,
+							 conflict_cols.data, set_clause.data,
 							 matview_name, whereClauseStr, join_clause.data);
 		}
 		else
@@ -1236,7 +1246,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 							 "  SELECT * FROM (%s) %s WHERE (%s) "
 							 "), "
 							 "upsert AS ( "
-							 "  INSERT INTO %s SELECT * FROM new_data "
+							 "  INSERT INTO %s SELECT * FROM new_data ORDER BY %s "
 							 "  ON CONFLICT (%s) DO NOTHING "
 							 ") "
 							 "DELETE FROM %s mv WHERE (%s) AND NOT EXISTS ( "
@@ -1244,6 +1254,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 							 ")",
 							 view_sql, matview_alias, whereClauseStr,
 							 matview_name, conflict_cols.data,
+							 conflict_cols.data,
 							 matview_name, whereClauseStr, join_clause.data);
 		}
 
@@ -1632,10 +1643,124 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 
 	/* Inserts go last. */
 	resetStringInfo(&querybuf);
-	appendStringInfo(&querybuf,
-					 "INSERT INTO %s SELECT (diff.newdata).* "
-					 "FROM %s diff WHERE tid IS NULL",
-					 matviewname, diffname);
+	if (whereClauseStr)
+	{
+		/*
+		 * In a partial refresh a freshly computed row can collide on the
+		 * unique key with an existing matview row that the predicate did not
+		 * match (and so was not deleted above).  Resolve such collisions in
+		 * place via ON CONFLICT against a single arbiter unique index,
+		 * mirroring the direct modification path.
+		 */
+		Oid			arbiterIndexOid = InvalidOid;
+		List	   *idxlist = RelationGetIndexList(matviewRel);
+		ListCell   *l;
+		Relation	arbIndexRel;
+		Form_pg_index arbIndexStruct;
+		StringInfoData conflict_cols;
+		StringInfoData set_clause;
+		bool		first;
+		bool		has_non_key_cols = false;
+		int			i;
+
+		foreach(l, idxlist)
+		{
+			Oid			indexoid = lfirst_oid(l);
+			Relation	ir = index_open(indexoid, AccessShareLock);
+			bool		usable = is_usable_unique_index(ir);
+			bool		is_pk = ir->rd_index->indisprimary;
+
+			index_close(ir, AccessShareLock);
+			if (usable)
+			{
+				if (is_pk)
+				{
+					arbiterIndexOid = indexoid;
+					break;
+				}
+				if (!OidIsValid(arbiterIndexOid))
+					arbiterIndexOid = indexoid;
+			}
+		}
+		list_free(idxlist);
+
+		arbIndexRel = index_open(arbiterIndexOid, AccessShareLock);
+		arbIndexStruct = arbIndexRel->rd_index;
+
+		initStringInfo(&conflict_cols);
+		initStringInfo(&set_clause);
+
+		first = true;
+		for (i = 0; i < arbIndexStruct->indnkeyatts; i++)
+		{
+			int			attnum = arbIndexStruct->indkey.values[i];
+			Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+
+			if (!first)
+				appendStringInfoString(&conflict_cols, ", ");
+			first = false;
+			appendStringInfoString(&conflict_cols,
+								   quote_identifier(NameStr(attr->attname)));
+		}
+
+		first = true;
+		for (i = 0; i < tupdesc->natts; i++)
+		{
+			Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+			const char *quoted;
+			bool		is_key = false;
+			int			j;
+
+			if (attr->attisdropped)
+				continue;
+
+			for (j = 0; j < arbIndexStruct->indnkeyatts; j++)
+			{
+				if (arbIndexStruct->indkey.values[j] == (i + 1))
+				{
+					is_key = true;
+					break;
+				}
+			}
+
+			if (is_key)
+				continue;
+
+			if (!first)
+				appendStringInfoString(&set_clause, ", ");
+			first = false;
+			has_non_key_cols = true;
+
+			quoted = quote_identifier(NameStr(attr->attname));
+			appendStringInfo(&set_clause, "%s = EXCLUDED.%s", quoted, quoted);
+		}
+
+		index_close(arbIndexRel, AccessShareLock);
+
+		if (has_non_key_cols)
+			appendStringInfo(&querybuf,
+							 "INSERT INTO %s SELECT (diff.newdata).* "
+							 "FROM %s diff WHERE tid IS NULL "
+							 "ON CONFLICT (%s) DO UPDATE SET %s",
+							 matviewname, diffname,
+							 conflict_cols.data, set_clause.data);
+		else
+			appendStringInfo(&querybuf,
+							 "INSERT INTO %s SELECT (diff.newdata).* "
+							 "FROM %s diff WHERE tid IS NULL "
+							 "ON CONFLICT (%s) DO NOTHING",
+							 matviewname, diffname, conflict_cols.data);
+
+		pfree(conflict_cols.data);
+		pfree(set_clause.data);
+	}
+	else
+	{
+		appendStringInfo(&querybuf,
+						 "INSERT INTO %s SELECT (diff.newdata).* "
+						 "FROM %s diff WHERE tid IS NULL",
+						 matviewname, diffname);
+	}
 	if (SPI_exec(querybuf.data, 0) != SPI_OK_INSERT)
 		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
 

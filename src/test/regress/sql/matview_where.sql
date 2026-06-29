@@ -171,36 +171,33 @@ DROP MATERIALIZED VIEW mv_swap;
 DROP TABLE mv_swap_base;
 
 --
--- Test 7: Scope Drift / Constraint Violation
--- Addressed specific worry: "If WHERE predicate would be different... UK violation couldn't be solved"
+-- Test 7: Scope Drift
+-- A row drifts into the predicate's scope and collides on the unique key with
+-- an existing row the predicate does not match.  Both refresh paths resolve
+-- this in place via ON CONFLICT instead of raising a unique violation.
 --
 
 CREATE TABLE mv_drift_base (id int primary key, category_id int);
 INSERT INTO mv_drift_base VALUES (1, 100), (2, 200);
 
 CREATE MATERIALIZED VIEW mv_drift AS SELECT * FROM mv_drift_base;
--- KEY FIX: Index on ID, not Category.
--- We want to test that the Refresh logic detects ID conflicts when rows drift into scope,
--- not that Postgres enforces unique indexes on non-unique data.
+-- Unique index on id, not category_id, so a category change can collide on id.
 CREATE UNIQUE INDEX ON mv_drift(id);
 
--- Update Row 1 to collide with Row 2's category
+-- Row 1 moves from category 100 into category 200 (Row 2's category).  The
+-- predicate "category_id = 200" sees the new (1, 200) but not the stale
+-- (1, 100) still present in the view.
 UPDATE mv_drift_base SET category_id = 200 WHERE id = 1;
 
--- Attempt to refresh using the NEW category value as the filter.
--- The View still contains (1, 100).
--- The Filter "category_id = 200" sees the NEW row (1, 200) in the base table.
--- The Filter "category_id = 200" does NOT see the OLD row (1, 100) in the View.
--- Result: The system thinks (1, 200) is a brand new row and tries to INSERT it.
--- This MUST fail with a Unique Constraint Violation on 'id' because (1, 100) was never deleted.
-\set VERBOSITY terse
+-- Concurrent (direct modification) path resolves the collision in place.
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_drift WHERE category_id = 200;
-\set VERBOSITY default
+SELECT * FROM mv_drift ORDER BY id;
 
--- Correct usage: Scope must include BOTH the Old location (100) and New location (200)
--- so the system sees the update as an update (or delete+insert).
-REFRESH MATERIALIZED VIEW CONCURRENTLY mv_drift WHERE category_id IN (100, 200);
-
+-- Recreate the stale state and exercise the non-concurrent (diff) path.
+UPDATE mv_drift_base SET category_id = 100 WHERE id = 1;
+REFRESH MATERIALIZED VIEW mv_drift;
+UPDATE mv_drift_base SET category_id = 200 WHERE id = 1;
+REFRESH MATERIALIZED VIEW mv_drift WHERE category_id = 200;
 SELECT * FROM mv_drift ORDER BY id;
 
 DROP MATERIALIZED VIEW mv_drift;
