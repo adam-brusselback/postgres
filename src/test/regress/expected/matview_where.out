@@ -342,3 +342,84 @@ SELECT * FROM mv_trigger_view WHERE id = 99; -- Should NOT see it
 DROP MATERIALIZED VIEW mv_trigger_view;
 DROP TABLE mv_trigger_base;
 DROP FUNCTION maintain_mv_trigger_view();
+--
+-- Test 10: WHERE predicate privilege model
+-- The predicate executes as the matview owner, so a non-owner holding only
+-- MAINTAIN may use leakproof expressions but not non-leakproof functions or
+-- subqueries.
+--
+CREATE ROLE regress_mvowner;
+CREATE ROLE regress_mvmaint;
+CREATE TABLE mv_priv_base (id int, amt numeric);
+INSERT INTO mv_priv_base VALUES (1, 10.5), (2, 20.5), (3, 30.5);
+CREATE MATERIALIZED VIEW mv_priv AS SELECT id, amt FROM mv_priv_base;
+CREATE UNIQUE INDEX ON mv_priv(id);
+ALTER TABLE mv_priv_base OWNER TO regress_mvowner;
+ALTER MATERIALIZED VIEW mv_priv OWNER TO regress_mvowner;
+GRANT MAINTAIN ON mv_priv TO regress_mvmaint;
+CREATE FUNCTION mv_priv_stable(int) RETURNS bool LANGUAGE sql STABLE AS 'SELECT true';
+ALTER FUNCTION mv_priv_stable(int) OWNER TO regress_mvowner;
+CREATE DOMAIN mv_priv_dom AS int CHECK (public.mv_priv_stable(VALUE));
+SET ROLE regress_mvmaint;
+-- Leakproof predicate: allowed
+REFRESH MATERIALIZED VIEW mv_priv WHERE id = 1;
+-- Known limitation: numeric comparators are not marked leakproof, so this
+-- safe predicate is currently rejected.  It should be allowed.
+REFRESH MATERIALIZED VIEW mv_priv WHERE amt > 0;
+ERROR:  permission denied to refresh materialized view "mv_priv"
+DETAIL:  The WHERE clause contains non-leakproof functions or subqueries.
+HINT:  Only the owner of the materialized view can use such a WHERE clause.
+-- Non-leakproof function: rejected
+REFRESH MATERIALIZED VIEW mv_priv WHERE public.mv_priv_stable(id);
+ERROR:  permission denied to refresh materialized view "mv_priv"
+DETAIL:  The WHERE clause contains non-leakproof functions or subqueries.
+HINT:  Only the owner of the materialized view can use such a WHERE clause.
+-- Subquery: rejected
+REFRESH MATERIALIZED VIEW mv_priv WHERE id IN (SELECT id FROM public.mv_priv_base);
+ERROR:  permission denied to refresh materialized view "mv_priv"
+DETAIL:  The WHERE clause contains non-leakproof functions or subqueries.
+HINT:  Only the owner of the materialized view can use such a WHERE clause.
+-- Domain whose CHECK hides a function call: rejected
+REFRESH MATERIALIZED VIEW mv_priv WHERE (id::public.mv_priv_dom) = id;
+ERROR:  permission denied to refresh materialized view "mv_priv"
+DETAIL:  The WHERE clause contains non-leakproof functions or subqueries.
+HINT:  Only the owner of the materialized view can use such a WHERE clause.
+RESET ROLE;
+-- Owner may use a non-leakproof predicate
+SET ROLE regress_mvowner;
+REFRESH MATERIALIZED VIEW mv_priv WHERE public.mv_priv_stable(id);
+RESET ROLE;
+DROP MATERIALIZED VIEW mv_priv;
+DROP DOMAIN mv_priv_dom;
+DROP FUNCTION mv_priv_stable(int);
+DROP TABLE mv_priv_base;
+DROP ROLE regress_mvmaint;
+DROP ROLE regress_mvowner;
+--
+-- Test 11: a failed partial refresh must not leave the matview writable
+--
+CREATE TABLE mv_leak_base (id int, code int, val text);
+INSERT INTO mv_leak_base VALUES (1, 100, 'a'), (2, 200, 'b'), (3, 300, 'c');
+CREATE MATERIALIZED VIEW mv_leak AS SELECT id, code, val FROM mv_leak_base;
+CREATE UNIQUE INDEX ON mv_leak(code);
+-- Drift two rows onto the same key so the refresh fails mid-flight
+UPDATE mv_leak_base SET code = 999 WHERE id IN (1, 2);
+\set VERBOSITY terse
+REFRESH MATERIALIZED VIEW mv_leak WHERE id <= 2;
+ERROR:  ON CONFLICT DO UPDATE command cannot affect row a second time
+\set VERBOSITY default
+-- Direct DML on the matview must still be rejected after the failure
+DELETE FROM mv_leak WHERE id = 1;
+ERROR:  cannot change materialized view "mv_leak"
+INSERT INTO mv_leak VALUES (42, 4242, 'injected');
+ERROR:  cannot change materialized view "mv_leak"
+SELECT * FROM mv_leak ORDER BY id;
+ id | code | val 
+----+------+-----
+  1 |  100 | a
+  2 |  200 | b
+  3 |  300 | c
+(3 rows)
+
+DROP MATERIALIZED VIEW mv_leak;
+DROP TABLE mv_leak_base;

@@ -31,6 +31,7 @@
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "miscadmin.h"
+#include "nodes/nodeFuncs.h"
 #include "pgstat.h"
 #include "optimizer/optimizer.h"
 #include "parser/parse_clause.h"
@@ -40,6 +41,7 @@
 #include "rewrite/rewriteHandler.h"
 #include "storage/lmgr.h"
 #include "tcop/tcopprot.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
@@ -220,6 +222,66 @@ transformRefreshWhereClause(Oid relid, Node *whereClause, ParamListInfo params)
 	free_parsestate(pstate);
 
 	return result;
+}
+
+static bool
+refresh_where_clause_unsafe_checker(Oid func_id, void *context)
+{
+	return !get_func_leakproof(func_id);
+}
+
+static bool
+refresh_where_clause_unsafe_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+
+	switch (nodeTag(node))
+	{
+		case T_Var:
+		case T_Const:
+		case T_Param:
+		case T_BoolExpr:
+		case T_RelabelType:
+		case T_CollateExpr:
+		case T_CaseExpr:
+		case T_CaseWhen:
+		case T_CaseTestExpr:
+		case T_CoalesceExpr:
+		case T_NullTest:
+		case T_BooleanTest:
+		case T_ArrayExpr:
+		case T_RowExpr:
+		case T_FieldSelect:
+		case T_FieldStore:
+		case T_NamedArgExpr:
+		case T_SQLValueFunction:
+		case T_List:
+			break;
+		case T_FuncExpr:
+		case T_OpExpr:
+		case T_DistinctExpr:
+		case T_NullIfExpr:
+		case T_ScalarArrayOpExpr:
+		case T_CoerceViaIO:
+		case T_ArrayCoerceExpr:
+		case T_RowCompareExpr:
+			if (check_functions_in_node(node,
+										refresh_where_clause_unsafe_checker,
+										context))
+				return true;
+			break;
+		default:
+			return true;
+	}
+	return expression_tree_walker(node, refresh_where_clause_unsafe_walker,
+								  context);
+}
+
+static bool
+refresh_where_clause_needs_owner(Node *whereClause)
+{
+	return refresh_where_clause_unsafe_walker(whereClause, NULL);
 }
 
 static char *
@@ -473,6 +535,16 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	if (whereClause)
 	{
 		qual = transformRefreshWhereClause(matviewOid, whereClause, params);
+
+		if (!object_ownercheck(RelationRelationId, matviewOid, save_userid) &&
+			refresh_where_clause_needs_owner(qual))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("permission denied to refresh materialized view \"%s\"",
+							RelationGetRelationName(matviewRel)),
+					 errdetail("The WHERE clause contains non-leakproof functions or subqueries."),
+					 errhint("Only the owner of the materialized view can use such a WHERE clause.")));
+
 		qual_str = deparseRefreshWhereClause(matviewOid, qual);
 	}
 
@@ -539,9 +611,22 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	 */
 	if (qual && !concurrent && !skipData)
 	{
-		processed = refresh_by_direct_modification(matviewOid, relowner,
-												   save_sec_context, qual_str,
-												   params);
+		int			old_depth = matview_maintenance_depth;
+
+		PG_TRY();
+		{
+			processed = refresh_by_direct_modification(matviewOid, relowner,
+													   save_sec_context, qual_str,
+													   params);
+		}
+		PG_CATCH();
+		{
+			matview_maintenance_depth = old_depth;
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+
+		Assert(matview_maintenance_depth == old_depth);
 	}
 
 	/*
