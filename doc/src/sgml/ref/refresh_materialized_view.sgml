@@ -111,13 +111,18 @@ REFRESH MATERIALIZED VIEW [ CONCURRENTLY ] <replaceable class="parameter">name</
       under a <literal>ROW EXCLUSIVE</literal> lock.  This allows concurrent
       reads as well as concurrent writes to non-overlapping rows; partial
       refreshes whose predicates cover overlapping existing rows are serialized.
+      Because this form identifies rows through the unique index, the index's
+      key columns must not contain <literal>NULL</literal> values within the
+      scope of the <literal>WHERE</literal> clause, unless the index is declared
+      <literal>NULLS NOT DISTINCT</literal>; otherwise an error is raised.
      </para>
      <para>
       Without <literal>CONCURRENTLY</literal>, a <literal>WHERE</literal>
       refresh uses the diff-based algorithm under an
       <literal>EXCLUSIVE</literal> lock, which allows concurrent reads but
-      blocks concurrent writes.  Both forms require a usable unique index on
-      the materialized view.
+      blocks concurrent writes.  This form does not have the
+      <literal>NULL</literal>-key restriction described above.  Both forms
+      require a usable unique index on the materialized view.
      </para>
      <para>
       The <literal>WHERE</literal> clause cannot contain volatile functions or
@@ -158,11 +163,26 @@ REFRESH MATERIALIZED VIEW [ CONCURRENTLY ] <replaceable class="parameter">name</
   </para>
 
   <para>
-   Rows are matched by the unique index rather than by the predicate.  If a
-   freshly computed row's key collides with an existing row that does not match
-   the predicate, that existing row is updated in place instead of causing a
-   unique-violation error.  This can only happen when the predicate references
-   non-key columns.
+   Rows are matched by a single unique index rather than by the predicate.  If
+   a freshly computed row's key collides on that index with an existing row that
+   the predicate did not match, the existing row is updated in place rather than
+   causing a unique-violation error.  This drift can only occur when the
+   predicate references non-key columns.  Note that the collision is resolved
+   only for the one index used for matching; if the materialized view has
+   several unique indexes and a drifting row collides on a different one, the
+   refresh still fails with a unique-violation error.  In that case widen the
+   <literal>WHERE</literal> clause to also cover the row's previous location, or
+   use a full refresh.
+  </para>
+
+  <para>
+   A partial refresh reads the base tables under the transaction's snapshot,
+   just like a full refresh.  Under the default <literal>READ COMMITTED</literal>
+   isolation level, the work is performed with fresh snapshots and overlapping
+   refreshes serialize transparently.  Under <literal>REPEATABLE READ</literal>
+   or <literal>SERIALIZABLE</literal>, the refresh sees the transaction's
+   snapshot, and overlapping partial refreshes may instead fail with a
+   serialization error and need to be retried.
   </para>
  </refsect1>
 

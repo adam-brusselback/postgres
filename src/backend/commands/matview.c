@@ -79,6 +79,9 @@ typedef struct MatViewPartialRefreshCache
 								 * plans */
 
 	/* The cached plans */
+	SPIPlanPtr	guardPlan;		/* Reject NULL arbiter keys; NULL when the
+								 * arbiter index is declared NULLS NOT
+								 * DISTINCT and so needs no check */
 	SPIPlanPtr	lockPlan;		/* SELECT FOR UPDATE */
 	SPIPlanPtr	refreshPlan;	/* Fused CTE: Evaluate -> Upsert -> Delete */
 }			MatViewPartialRefreshCache;
@@ -94,8 +97,8 @@ static void transientrel_destroy(DestReceiver *self);
 static uint64 refresh_matview_datafill(DestReceiver *dest, Query *query,
 									   const char *queryString, bool is_create);
 static void refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
-								   int save_sec_context, char *whereClauseStr,
-								   ParamListInfo params);
+								   Oid save_userid, int save_sec_context,
+								   char *whereClauseStr, ParamListInfo params);
 static uint64 refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 											 int save_sec_context, char *whereClauseStr,
 											 ParamListInfo params);
@@ -542,7 +545,7 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("permission denied to refresh materialized view \"%s\"",
 							RelationGetRelationName(matviewRel)),
-					 errdetail("The WHERE clause contains non-leakproof functions or subqueries."),
+					 errdetail("The WHERE clause contains non-leakproof functions, operators, or other constructs that would be evaluated with the privileges of the materialized view's owner."),
 					 errhint("Only the owner of the materialized view can use such a WHERE clause.")));
 
 		qual_str = deparseRefreshWhereClause(matviewOid, qual);
@@ -695,7 +698,8 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 		PG_TRY();
 		{
 			refresh_by_match_merge(matviewOid, OIDNewHeap, relowner,
-								   save_sec_context, qual_str, params);
+								   save_userid, save_sec_context, qual_str,
+								   params);
 		}
 		PG_CATCH();
 		{
@@ -1076,6 +1080,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		if (found)
 		{
 			/* Index or WHERE clause changed; discard stale plans. */
+			if (cacheEntry->guardPlan)
+				SPI_freeplan(cacheEntry->guardPlan);
 			if (cacheEntry->lockPlan)
 				SPI_freeplan(cacheEntry->lockPlan);
 			if (cacheEntry->refreshPlan)
@@ -1084,9 +1090,11 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 				pfree(cacheEntry->whereClauseStr);
 		}
 
+		cacheEntry->guardPlan = NULL;
 		cacheEntry->lockPlan = NULL;
 		cacheEntry->refreshPlan = NULL;
 		cacheEntry->whereClauseStr = NULL;
+		cacheEntry->uniqueIndexOid = InvalidOid;
 	}
 
 	OpenMatViewIncrementalMaintenance();
@@ -1108,8 +1116,10 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		StringInfoData conflict_cols;
 		StringInfoData set_clause;
 		StringInfoData join_clause;
+		StringInfoData null_check;
 		bool		first;
 		bool		has_non_key_cols = false;
+		bool		nulls_not_distinct;
 		int			i;
 		MemoryContext oldcxt;
 
@@ -1128,16 +1138,18 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 
 		/*
 		 * Build the unique-key column list once.  It drives the ON CONFLICT
-		 * target, the anti-join condition, and the deterministic ordering used
-		 * by the locking SELECT and the upsert to avoid deadlocks between
-		 * overlapping refreshes.
+		 * target, the anti-join condition, the deterministic ordering used by
+		 * the locking SELECT and the upsert to avoid deadlocks between
+		 * overlapping refreshes, and the NULL-key guard below.
 		 */
 		indexRel = index_open(uniqueIndexOid, AccessShareLock);
 		indexStruct = indexRel->rd_index;
+		nulls_not_distinct = indexStruct->indnullsnotdistinct;
 
 		initStringInfo(&conflict_cols);
 		initStringInfo(&set_clause);
 		initStringInfo(&join_clause);
+		initStringInfo(&null_check);
 
 		first = true;
 		for (i = 0; i < indexStruct->indnkeyatts; i++)
@@ -1152,6 +1164,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 			{
 				appendStringInfoString(&conflict_cols, ", ");
 				appendStringInfoString(&join_clause, " AND ");
+				appendStringInfoString(&null_check, " OR ");
 			}
 			first = false;
 
@@ -1159,6 +1172,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 			appendStringInfo(&join_clause,
 							 "nd.%s IS NOT DISTINCT FROM mv.%s",
 							 quoted, quoted);
+			appendStringInfo(&null_check, "%s IS NULL", quoted);
 		}
 
 		/* Build the DO UPDATE SET clause for non-key columns. */
@@ -1214,10 +1228,40 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		SPI_keepplan(cacheEntry->lockPlan);
 
 		/*
+		 * Prepare a NULL-key guard.  The in-place upsert/anti-join identity
+		 * model cannot represent rows whose arbiter key is NULL: such rows
+		 * never conflict in the index (so ON CONFLICT can't update them) and
+		 * compare equal to one another under IS NOT DISTINCT FROM (so the
+		 * anti-join can't tell them apart).  Refuse the refresh when the
+		 * WHERE scope contains a NULL key, either among the existing matview
+		 * rows or in the freshly computed data; the diff-based path (no
+		 * CONCURRENTLY) handles NULL keys correctly.  An index declared NULLS
+		 * NOT DISTINCT has at most one NULL key and conflicts on it, so it
+		 * needs no guard.
+		 */
+		if (!nulls_not_distinct)
+		{
+			resetStringInfo(&buf);
+			appendStringInfo(&buf,
+							 "SELECT 1 WHERE EXISTS ("
+							 "SELECT 1 FROM %s mv WHERE (%s) AND (%s)) "
+							 "OR EXISTS ("
+							 "SELECT 1 FROM (%s) %s WHERE (%s) AND (%s))",
+							 matview_name, whereClauseStr, null_check.data,
+							 view_sql, matview_alias, whereClauseStr,
+							 null_check.data);
+
+			cacheEntry->guardPlan = SPI_prepare(buf.data, nargs, argtypes);
+			if (cacheEntry->guardPlan == NULL)
+				elog(ERROR, "SPI_prepare failed for NULL-key check: %s", buf.data);
+			SPI_keepplan(cacheEntry->guardPlan);
+		}
+
+		/*
 		 * Build the refresh CTE: evaluate the underlying query with the WHERE
-		 * predicate, upsert the results (feeding the insert from a key-ordered
-		 * source for the same anti-deadlock reason), and delete matview rows
-		 * that no longer appear in the query output.
+		 * predicate, upsert the results (feeding the insert from a
+		 * key-ordered source for the same anti-deadlock reason), and delete
+		 * matview rows that no longer appear in the query output.
 		 */
 		resetStringInfo(&buf);
 
@@ -1275,10 +1319,28 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		pfree(conflict_cols.data);
 		pfree(set_clause.data);
 		pfree(join_clause.data);
+		pfree(null_check.data);
 		if (argtypes != NULL)
 			pfree(argtypes);
 	}
 
+
+	/*
+	 * Reject NULL arbiter keys in scope, which the in-place model cannot
+	 * represent (see the guard's preparation above).
+	 */
+	if (cacheEntry->guardPlan != NULL)
+	{
+		if (matview_execute_spi_plan(cacheEntry->guardPlan, params, false) < 0)
+			elog(ERROR, "SPI_execute_plan failed during NULL-key check");
+		if (SPI_processed > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot refresh materialized view \"%s\" concurrently with this WHERE clause",
+							RelationGetRelationName(matviewRel)),
+					 errdetail("The unique index used for the refresh has NULL key values within the scope of the WHERE clause."),
+					 errhint("Refresh without CONCURRENTLY, or use a unique index declared with NULLS NOT DISTINCT.")));
+	}
 
 	/* Execute: lock matching rows, then run the refresh CTE. */
 	if (matview_execute_spi_plan(cacheEntry->lockPlan, params, false) < 0)
@@ -1334,8 +1396,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
  */
 static void
 refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
-					   int save_sec_context, char *whereClauseStr,
-					   ParamListInfo params)
+					   Oid save_userid, int save_sec_context,
+					   char *whereClauseStr, ParamListInfo params)
 {
 	StringInfoData querybuf;
 	Relation	matviewRel;
@@ -1405,18 +1467,22 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 	if (SPI_processed > 0)
 	{
 		/*
-		 * Note that this ereport() is returning data to the user.  Generally,
-		 * we would want to make sure that the user has been granted access to
-		 * this data.  However, REFRESH MAT VIEW is only able to be run by the
-		 * owner of the mat view (or a superuser) and therefore there is no
-		 * need to check for access to data in the mat view.
+		 * This ereport() returns a row of the owner's data in its detail.  A
+		 * MAINTAIN-privileged caller need not have permission to read the
+		 * matview (and REFRESH ... WHERE routes non-concurrent refreshes
+		 * here), so only echo the offending row when the invoking user could
+		 * read the matview anyway.
 		 */
+		bool		may_see = object_ownercheck(RelationRelationId, matviewOid,
+												save_userid) ||
+			pg_class_aclcheck(matviewOid, save_userid, ACL_SELECT) == ACLCHECK_OK;
+
 		ereport(ERROR,
-				(errcode(ERRCODE_CARDINALITY_VIOLATION),
-				 errmsg("new data for materialized view \"%s\" contains duplicate rows without any null columns",
-						RelationGetRelationName(matviewRel)),
-				 errdetail("Row: %s",
-						   SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1))));
+				errcode(ERRCODE_CARDINALITY_VIOLATION),
+				errmsg("new data for materialized view \"%s\" contains duplicate rows without any null columns",
+					   RelationGetRelationName(matviewRel)),
+				may_see ? errdetail("Row: %s",
+									SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1)) : 0);
 	}
 
 	/*

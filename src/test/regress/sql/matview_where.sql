@@ -369,3 +369,74 @@ SELECT * FROM mv_leak ORDER BY id;
 
 DROP MATERIALIZED VIEW mv_leak;
 DROP TABLE mv_leak_base;
+
+--
+-- Test 12: NULL values in the unique-index key
+-- The in-place (CONCURRENTLY) path cannot represent NULL keys and must error
+-- without changing the matview; the diff path (no CONCURRENTLY) handles them;
+-- a NULLS NOT DISTINCT index lets the in-place path proceed.
+--
+
+CREATE TABLE mv_null_base (k int, v int);
+INSERT INTO mv_null_base VALUES (NULL, 1), (5, 50);
+CREATE MATERIALIZED VIEW mv_null AS SELECT k, v FROM mv_null_base;
+CREATE UNIQUE INDEX ON mv_null(k);
+
+UPDATE mv_null_base SET v = 2 WHERE v = 1;
+
+-- In-place path: rejected, matview left unchanged.
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_null WHERE k IS NULL;
+SELECT k, v FROM mv_null ORDER BY k NULLS FIRST;
+
+-- Diff path: handles the NULL key.
+REFRESH MATERIALIZED VIEW mv_null WHERE k IS NULL;
+SELECT k, v FROM mv_null ORDER BY k NULLS FIRST;
+
+DROP MATERIALIZED VIEW mv_null;
+DROP TABLE mv_null_base;
+
+-- A NULLS NOT DISTINCT unique index makes the in-place path safe.
+CREATE TABLE mv_nnd_base (k int, v int);
+INSERT INTO mv_nnd_base VALUES (NULL, 1);
+CREATE MATERIALIZED VIEW mv_nnd AS SELECT k, v FROM mv_nnd_base;
+CREATE UNIQUE INDEX ON mv_nnd(k) NULLS NOT DISTINCT;
+UPDATE mv_nnd_base SET v = 9 WHERE v = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_nnd WHERE k IS NULL;
+SELECT k, v FROM mv_nnd ORDER BY k NULLS FIRST;
+DROP MATERIALIZED VIEW mv_nnd;
+DROP TABLE mv_nnd_base;
+
+--
+-- Test 13: a MAINTAIN-only role must not see the matview's data leaked through
+-- the duplicate-row error detail.
+--
+
+CREATE ROLE regress_mvowner2;
+CREATE ROLE regress_mvmaint2;
+
+CREATE TABLE mv_leak2_base (id int, secret text);
+INSERT INTO mv_leak2_base VALUES (1, 'visible');
+CREATE MATERIALIZED VIEW mv_leak2 AS SELECT id, secret FROM mv_leak2_base;
+CREATE UNIQUE INDEX ON mv_leak2(id);
+
+ALTER TABLE mv_leak2_base OWNER TO regress_mvowner2;
+ALTER MATERIALIZED VIEW mv_leak2 OWNER TO regress_mvowner2;
+GRANT MAINTAIN ON mv_leak2 TO regress_mvmaint2;
+
+-- Introduce duplicate rows into the source data.
+INSERT INTO mv_leak2_base VALUES (2, 'dup'), (2, 'dup');
+
+-- MAINTAIN-only (no SELECT): the error must not echo the offending row.
+SET ROLE regress_mvmaint2;
+REFRESH MATERIALIZED VIEW mv_leak2 WHERE id = 2;
+RESET ROLE;
+
+-- The owner may see the row in the error detail.
+SET ROLE regress_mvowner2;
+REFRESH MATERIALIZED VIEW mv_leak2 WHERE id = 2;
+RESET ROLE;
+
+DROP MATERIALIZED VIEW mv_leak2;
+DROP TABLE mv_leak2_base;
+DROP ROLE regress_mvmaint2;
+DROP ROLE regress_mvowner2;
