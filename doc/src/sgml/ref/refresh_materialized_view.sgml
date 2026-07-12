@@ -179,7 +179,10 @@ REFRESH MATERIALIZED VIEW [ CONCURRENTLY ] <replaceable class="parameter">name</
    A partial refresh reads the base tables under the transaction's snapshot,
    just like a full refresh.  Under the default <literal>READ COMMITTED</literal>
    isolation level, the work is performed with fresh snapshots and overlapping
-   refreshes serialize transparently.  Under <literal>REPEATABLE READ</literal>
+   refreshes normally serialize transparently, though as with ordinary DML two
+   refreshes updating each other's rows (for example when rows drift across
+   predicate scopes) can occasionally fail with a deadlock error and need to
+   be retried.  Under <literal>REPEATABLE READ</literal>
    or <literal>SERIALIZABLE</literal>, the refresh sees the transaction's
    snapshot, and overlapping partial refreshes may instead fail with a
    serialization error and need to be retried.

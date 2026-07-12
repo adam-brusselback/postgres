@@ -77,6 +77,10 @@ typedef struct MatViewPartialRefreshCache
 								 * resolution */
 	char	   *whereClauseStr; /* The WHERE clause string used to build the
 								 * plans */
+	int			nargs;			/* Number of parameters the plans expect */
+	Oid		   *argtypes;		/* Their types; identical WHERE clause text
+								 * can be prepared with different parameter
+								 * types across executions */
 
 	/* The cached plans */
 	SPIPlanPtr	guardPlan;		/* Reject NULL arbiter keys; NULL when the
@@ -508,6 +512,12 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 				 errmsg("%s options %s and %s cannot be used together",
 						"REFRESH", "CONCURRENTLY", "WITH NO DATA")));
 
+	/* The grammar enforces this for REFRESH; check for other callers. */
+	if (whereClause && skipData)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("cannot specify WHERE clause with WITH NO DATA")));
+
 	/*
 	 * Check that everything is correct for a refresh. Problems at this point
 	 * are internal errors, so elog is sufficient.
@@ -553,9 +563,11 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 
 	/*
 	 * Check that there is a unique index with no WHERE clause on one or more
-	 * columns of the materialized view if CONCURRENTLY is specified.
+	 * columns of the materialized view if CONCURRENTLY or a WHERE clause is
+	 * specified.  Both the diff-based and the direct-modification strategies
+	 * need it to match old and new versions of a row.
 	 */
-	if (concurrent)
+	if (concurrent || whereClause)
 	{
 		List	   *indexoidlist = RelationGetIndexList(matviewRel);
 		ListCell   *indexoidscan;
@@ -580,7 +592,11 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 		if (!hasUniqueIndex)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 concurrent ?
 					 errmsg("cannot refresh materialized view \"%s\" concurrently",
+							quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
+													   RelationGetRelationName(matviewRel))) :
+					 errmsg("cannot refresh materialized view \"%s\" partially",
 							quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
 													   RelationGetRelationName(matviewRel))),
 					 errhint("Create a unique index with no WHERE clause on one or more columns of the materialized view.")));
@@ -671,11 +687,17 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 
 				/*
 				 * Init buffer before SPI connection to avoid double free
-				 * issues on context destroy
+				 * issues on context destroy.
+				 *
+				 * The subquery must be aliased with the matview's own name:
+				 * the deparsed WHERE clause qualifies column references with
+				 * it (in particular references from within sublinks).
 				 */
 				initStringInfo(&buf);
-				appendStringInfo(&buf, "INSERT INTO %s SELECT * FROM (%s) _mv_q WHERE %s",
-								 transient_name, view_sql, qual_str);
+				appendStringInfo(&buf, "INSERT INTO %s SELECT * FROM (%s) %s WHERE %s",
+								 transient_name, view_sql,
+								 quote_identifier(RelationGetRelationName(matviewRel)),
+								 qual_str);
 
 				SPI_connect();
 				if (matview_execute_spi(buf.data, params, false) != SPI_OK_INSERT)
@@ -1015,8 +1037,17 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	MatViewPartialRefreshCache *cacheEntry;
 	bool		found;
 	uint64		result_processed = 0;
+	int			nargs = (params != NULL) ? params->numParams : 0;
+	Oid		   *argtypes = NULL;
 
 	matviewRel = table_open(matviewOid, NoLock);
+
+	if (nargs > 0)
+	{
+		argtypes = (Oid *) palloc(nargs * sizeof(Oid));
+		for (int i = 0; i < nargs; i++)
+			argtypes[i] = params->params[i].ptype;
+	}
 
 	/* Find a usable unique index, preferring the primary key. */
 	indexoidlist = RelationGetIndexList(matviewRel);
@@ -1063,7 +1094,10 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 
 	/*
 	 * We have a cache hit ONLY if the entry exists, the unique index matches,
-	 * and the WHERE clause string perfectly matches.  We also ensure
+	 * the WHERE clause string perfectly matches, and the parameter signature
+	 * (count and types) matches: the same clause text can be prepared with
+	 * different parameter types, and executing a cached plan with values of
+	 * another type would misinterpret their datums.  We also ensure
 	 * whereClauseStr is not NULL to prevent a strcmp segfault if a previous
 	 * compilation failed midway.
 	 */
@@ -1071,7 +1105,10 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		cacheEntry->uniqueIndexOid == uniqueIndexOid &&
 		cacheEntry->whereClauseStr != NULL &&
 		whereClauseStr != NULL &&
-		strcmp(cacheEntry->whereClauseStr, whereClauseStr) == 0)
+		strcmp(cacheEntry->whereClauseStr, whereClauseStr) == 0 &&
+		cacheEntry->nargs == nargs &&
+		(nargs == 0 ||
+		 memcmp(cacheEntry->argtypes, argtypes, nargs * sizeof(Oid)) == 0))
 	{
 		/* Cache is valid.  Do nothing. */
 	}
@@ -1079,7 +1116,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	{
 		if (found)
 		{
-			/* Index or WHERE clause changed; discard stale plans. */
+			/* Index, WHERE clause or parameters changed; discard stale plans. */
 			if (cacheEntry->guardPlan)
 				SPI_freeplan(cacheEntry->guardPlan);
 			if (cacheEntry->lockPlan)
@@ -1088,6 +1125,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 				SPI_freeplan(cacheEntry->refreshPlan);
 			if (cacheEntry->whereClauseStr)
 				pfree(cacheEntry->whereClauseStr);
+			if (cacheEntry->argtypes)
+				pfree(cacheEntry->argtypes);
 		}
 
 		cacheEntry->guardPlan = NULL;
@@ -1095,6 +1134,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		cacheEntry->refreshPlan = NULL;
 		cacheEntry->whereClauseStr = NULL;
 		cacheEntry->uniqueIndexOid = InvalidOid;
+		cacheEntry->nargs = 0;
+		cacheEntry->argtypes = NULL;
 	}
 
 	OpenMatViewIncrementalMaintenance();
@@ -1108,10 +1149,11 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		char	   *view_sql;
 		char	   *matview_name;
 		const char *matview_alias;
-		Oid		   *argtypes = NULL;
-		int			nargs = 0;
+		const char *nd_alias;
 		Relation	indexRel;
 		Form_pg_index indexStruct;
+		oidvector  *indclass;
+		Datum		indclassDatum;
 		TupleDesc	tupdesc = matviewRel->rd_att;
 		StringInfoData conflict_cols;
 		StringInfoData set_clause;
@@ -1123,28 +1165,42 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		int			i;
 		MemoryContext oldcxt;
 
+		/*
+		 * Every scan of the matview (and of the freshly evaluated view query
+		 * standing in for it) is aliased with the matview's own name, because
+		 * that is how the deparsed WHERE clause qualifies column references,
+		 * notably references from within sublinks.  The new_data alias only
+		 * has to differ from that name.
+		 */
 		matview_name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
 												  RelationGetRelationName(matviewRel));
 		matview_alias = quote_identifier(RelationGetRelationName(matviewRel));
+		nd_alias = (strcmp(RelationGetRelationName(matviewRel), "nd") != 0) ?
+			"nd" : "nd2";
 		view_sql = get_matview_view_query(matviewOid);
-
-		if (params && params->numParams > 0)
-		{
-			nargs = params->numParams;
-			argtypes = (Oid *) palloc(nargs * sizeof(Oid));
-			for (i = 0; i < nargs; i++)
-				argtypes[i] = params->params[i].ptype;
-		}
 
 		/*
 		 * Build the unique-key column list once.  It drives the ON CONFLICT
 		 * target, the anti-join condition, the deterministic ordering used by
 		 * the locking SELECT and the upsert to avoid deadlocks between
 		 * overlapping refreshes, and the NULL-key guard below.
+		 *
+		 * The anti-join compares keys with the index opclass's equality
+		 * operator so that its notion of a match agrees with the ON CONFLICT
+		 * arbitration (and, unlike IS NOT DISTINCT FROM, stays hashable for
+		 * large scopes).  NULL keys cannot make that comparison lie: for a
+		 * NULLS DISTINCT index they are rejected by the guard below, and for
+		 * a NULLS NOT DISTINCT index we use IS NOT DISTINCT FROM, matching
+		 * the index's treatment of NULLs as equal.
 		 */
 		indexRel = index_open(uniqueIndexOid, AccessShareLock);
 		indexStruct = indexRel->rd_index;
 		nulls_not_distinct = indexStruct->indnullsnotdistinct;
+
+		indclassDatum = SysCacheGetAttrNotNull(INDEXRELID,
+											   indexRel->rd_indextuple,
+											   Anum_pg_index_indclass);
+		indclass = (oidvector *) DatumGetPointer(indclassDatum);
 
 		initStringInfo(&conflict_cols);
 		initStringInfo(&set_clause);
@@ -1157,6 +1213,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 			int			attnum = indexStruct->indkey.values[i];
 			Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
 			const char *quoted;
+			char	   *nd_col;
+			char	   *mv_col;
 
 			quoted = quote_identifier(NameStr(attr->attname));
 
@@ -1169,10 +1227,45 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 			first = false;
 
 			appendStringInfoString(&conflict_cols, quoted);
-			appendStringInfo(&join_clause,
-							 "nd.%s IS NOT DISTINCT FROM mv.%s",
-							 quoted, quoted);
 			appendStringInfo(&null_check, "%s IS NULL", quoted);
+
+			nd_col = quote_qualified_identifier(nd_alias,
+												NameStr(attr->attname));
+			mv_col = quote_qualified_identifier(RelationGetRelationName(matviewRel),
+												NameStr(attr->attname));
+
+			if (nulls_not_distinct)
+				appendStringInfo(&join_clause, "%s IS NOT DISTINCT FROM %s",
+								 nd_col, mv_col);
+			else
+			{
+				Oid			opclass = indclass->values[i];
+				HeapTuple	cla_ht;
+				Form_pg_opclass cla_tup;
+				Oid			opfamily;
+				Oid			opcintype;
+				Oid			op;
+
+				/* Identify the index opclass's equality operator. */
+				cla_ht = SearchSysCache1(CLAOID, ObjectIdGetDatum(opclass));
+				if (!HeapTupleIsValid(cla_ht))
+					elog(ERROR, "cache lookup failed for opclass %u", opclass);
+				cla_tup = (Form_pg_opclass) GETSTRUCT(cla_ht);
+				opfamily = cla_tup->opcfamily;
+				opcintype = cla_tup->opcintype;
+				ReleaseSysCache(cla_ht);
+
+				op = get_opfamily_member_for_cmptype(opfamily, opcintype,
+													 opcintype, COMPARE_EQ);
+				if (!OidIsValid(op))
+					elog(ERROR, "missing equality operator for (%u,%u) in opfamily %u",
+						 opcintype, opcintype, opfamily);
+
+				generate_operator_clause(&join_clause,
+										 nd_col, attr->atttypid,
+										 op,
+										 mv_col, attr->atttypid);
+			}
 		}
 
 		/* Build the DO UPDATE SET clause for non-key columns. */
@@ -1214,13 +1307,18 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		 * Prepare the row-locking statement.  This acquires FOR UPDATE locks
 		 * on matview rows matching the WHERE clause to serialize concurrent
 		 * partial refreshes on overlapping rows.  The ORDER BY makes every
-		 * refresh acquire those locks in the same key order so overlapping
-		 * refreshes cannot deadlock.
+		 * refresh acquire those locks in the same key order, so refreshes
+		 * whose predicate scopes overlap cannot deadlock against each other.
+		 * (A deadlock remains possible when a refresh's upsert has to update
+		 * a drifted row outside its own predicate scope that another refresh
+		 * has locked; the deadlock detector resolves such cases and the
+		 * refresh can be retried.)
 		 */
 		initStringInfo(&buf);
 		appendStringInfo(&buf,
-						 "SELECT 1 FROM %s mv WHERE (%s) ORDER BY %s FOR UPDATE",
-						 matview_name, whereClauseStr, conflict_cols.data);
+						 "SELECT 1 FROM %s AS %s WHERE (%s) ORDER BY %s FOR UPDATE",
+						 matview_name, matview_alias, whereClauseStr,
+						 conflict_cols.data);
 
 		cacheEntry->lockPlan = SPI_prepare(buf.data, nargs, argtypes);
 		if (cacheEntry->lockPlan == NULL)
@@ -1231,23 +1329,23 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		 * Prepare a NULL-key guard.  The in-place upsert/anti-join identity
 		 * model cannot represent rows whose arbiter key is NULL: such rows
 		 * never conflict in the index (so ON CONFLICT can't update them) and
-		 * compare equal to one another under IS NOT DISTINCT FROM (so the
-		 * anti-join can't tell them apart).  Refuse the refresh when the
-		 * WHERE scope contains a NULL key, either among the existing matview
-		 * rows or in the freshly computed data; the diff-based path (no
-		 * CONCURRENTLY) handles NULL keys correctly.  An index declared NULLS
-		 * NOT DISTINCT has at most one NULL key and conflicts on it, so it
-		 * needs no guard.
+		 * have no usable identity for the anti-join either.  Refuse the
+		 * refresh when the WHERE scope contains a NULL key, either among the
+		 * existing matview rows or in the freshly computed data; the
+		 * diff-based path (no CONCURRENTLY) handles NULL keys correctly.  An
+		 * index declared NULLS NOT DISTINCT has at most one NULL key and
+		 * conflicts on it, so it needs no guard.
 		 */
 		if (!nulls_not_distinct)
 		{
 			resetStringInfo(&buf);
 			appendStringInfo(&buf,
 							 "SELECT 1 WHERE EXISTS ("
-							 "SELECT 1 FROM %s mv WHERE (%s) AND (%s)) "
+							 "SELECT 1 FROM %s AS %s WHERE (%s) AND (%s)) "
 							 "OR EXISTS ("
 							 "SELECT 1 FROM (%s) %s WHERE (%s) AND (%s))",
-							 matview_name, whereClauseStr, null_check.data,
+							 matview_name, matview_alias, whereClauseStr,
+							 null_check.data,
 							 view_sql, matview_alias, whereClauseStr,
 							 null_check.data);
 
@@ -1275,13 +1373,14 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 							 "  INSERT INTO %s SELECT * FROM new_data ORDER BY %s "
 							 "  ON CONFLICT (%s) DO UPDATE SET %s "
 							 ") "
-							 "DELETE FROM %s mv WHERE (%s) AND NOT EXISTS ( "
-							 "  SELECT 1 FROM new_data nd WHERE %s"
+							 "DELETE FROM %s AS %s WHERE (%s) AND NOT EXISTS ( "
+							 "  SELECT 1 FROM new_data %s WHERE %s"
 							 ")",
 							 view_sql, matview_alias, whereClauseStr,
 							 matview_name, conflict_cols.data,
 							 conflict_cols.data, set_clause.data,
-							 matview_name, whereClauseStr, join_clause.data);
+							 matview_name, matview_alias, whereClauseStr,
+							 nd_alias, join_clause.data);
 		}
 		else
 		{
@@ -1293,13 +1392,14 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 							 "  INSERT INTO %s SELECT * FROM new_data ORDER BY %s "
 							 "  ON CONFLICT (%s) DO NOTHING "
 							 ") "
-							 "DELETE FROM %s mv WHERE (%s) AND NOT EXISTS ( "
-							 "  SELECT 1 FROM new_data nd WHERE %s"
+							 "DELETE FROM %s AS %s WHERE (%s) AND NOT EXISTS ( "
+							 "  SELECT 1 FROM new_data %s WHERE %s"
 							 ")",
 							 view_sql, matview_alias, whereClauseStr,
 							 matview_name, conflict_cols.data,
 							 conflict_cols.data,
-							 matview_name, whereClauseStr, join_clause.data);
+							 matview_name, matview_alias, whereClauseStr,
+							 nd_alias, join_clause.data);
 		}
 
 		cacheEntry->refreshPlan = SPI_prepare(buf.data, nargs, argtypes);
@@ -1311,6 +1411,12 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
 		cacheEntry->uniqueIndexOid = uniqueIndexOid;
 		cacheEntry->whereClauseStr = pstrdup(whereClauseStr);
+		cacheEntry->nargs = nargs;
+		if (nargs > 0)
+		{
+			cacheEntry->argtypes = (Oid *) palloc(nargs * sizeof(Oid));
+			memcpy(cacheEntry->argtypes, argtypes, nargs * sizeof(Oid));
+		}
 		MemoryContextSwitchTo(oldcxt);
 
 		pfree(matview_name);
@@ -1320,8 +1426,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		pfree(set_clause.data);
 		pfree(join_clause.data);
 		pfree(null_check.data);
-		if (argtypes != NULL)
-			pfree(argtypes);
 	}
 
 

@@ -440,3 +440,81 @@ DROP MATERIALIZED VIEW mv_leak2;
 DROP TABLE mv_leak2_base;
 DROP ROLE regress_mvmaint2;
 DROP ROLE regress_mvowner2;
+
+--
+-- Test 14: partial refresh requires a usable unique index
+--
+
+CREATE TABLE mv_nouk_base (id int, val text);
+INSERT INTO mv_nouk_base VALUES (1, 'x');
+CREATE MATERIALIZED VIEW mv_nouk AS SELECT * FROM mv_nouk_base;
+REFRESH MATERIALIZED VIEW mv_nouk WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_nouk WHERE id = 1;
+DROP MATERIALIZED VIEW mv_nouk;
+DROP TABLE mv_nouk_base;
+
+--
+-- Test 15: correlated subquery in the predicate (owner only).  The deparsed
+-- predicate qualifies the outer column reference with the matview's name, so
+-- every internal statement must alias its scan of the matview (or of the
+-- freshly evaluated defining query) with that name.
+--
+
+CREATE TABLE mv_corr_base (id int primary key, val text);
+CREATE TABLE mv_corr_flag (id int primary key, flagged bool);
+INSERT INTO mv_corr_base VALUES (1, 'one'), (2, 'two');
+INSERT INTO mv_corr_flag VALUES (1, true), (2, false);
+CREATE MATERIALIZED VIEW mv_corr AS SELECT * FROM mv_corr_base;
+CREATE UNIQUE INDEX ON mv_corr(id);
+
+UPDATE mv_corr_base SET val = 'one updated' WHERE id = 1;
+UPDATE mv_corr_base SET val = 'two updated' WHERE id = 2;
+
+-- Diff path: only the flagged row is refreshed.
+REFRESH MATERIALIZED VIEW mv_corr
+  WHERE EXISTS (SELECT 1 FROM public.mv_corr_flag f
+                WHERE f.id = mv_corr.id AND f.flagged);
+SELECT * FROM mv_corr ORDER BY id;
+
+-- Direct-modification path: now refresh the other row.
+UPDATE mv_corr_flag SET flagged = NOT flagged;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_corr
+  WHERE EXISTS (SELECT 1 FROM public.mv_corr_flag f
+                WHERE f.id = mv_corr.id AND f.flagged);
+SELECT * FROM mv_corr ORDER BY id;
+
+DROP MATERIALIZED VIEW mv_corr;
+DROP TABLE mv_corr_base;
+DROP TABLE mv_corr_flag;
+
+--
+-- Test 16: cached plans must not be reused when the parameter types change
+-- between executions with identical predicate text.
+--
+
+CREATE TABLE mv_ptype_base (k bigint primary key, v text);
+INSERT INTO mv_ptype_base VALUES (5, 'small'), (4294967301, 'big');
+CREATE MATERIALIZED VIEW mv_ptype AS SELECT * FROM mv_ptype_base;
+CREATE UNIQUE INDEX ON mv_ptype(k);
+
+UPDATE mv_ptype_base SET v = 'small updated' WHERE k = 5;
+UPDATE mv_ptype_base SET v = 'big updated' WHERE k = 4294967301;
+
+-- First execution caches the plans with an integer parameter ...
+DO $$
+BEGIN
+  EXECUTE 'REFRESH MATERIALIZED VIEW CONCURRENTLY mv_ptype WHERE k = $1'
+    USING 5;
+END $$;
+-- ... and this execution supplies a bigint wider than 32 bits.  It must not
+-- be squeezed through the cached integer parameter (which would silently
+-- refresh the wrong row).
+DO $$
+BEGIN
+  EXECUTE 'REFRESH MATERIALIZED VIEW CONCURRENTLY mv_ptype WHERE k = $1'
+    USING 4294967301;
+END $$;
+SELECT * FROM mv_ptype ORDER BY k;
+
+DROP MATERIALIZED VIEW mv_ptype;
+DROP TABLE mv_ptype_base;
