@@ -382,7 +382,9 @@ CREATE TABLE people (
    A generated column cannot be written to directly.  In
    <command>INSERT</command> or <command>UPDATE</command> commands, a value
    cannot be specified for a generated column, but the keyword
-   <literal>DEFAULT</literal> may be specified.
+   <literal>DEFAULT</literal> may be specified.  Also, a generated column
+   cannot be used in the <literal>FOR PORTION OF</literal> clause of an
+   <command>UPDATE</command> or <command>DELETE</command> command.
   </para>
 
   <para>
@@ -3756,6 +3758,26 @@ REVOKE CREATE ON SCHEMA public FROM PUBLIC;
     names beginning with <literal>pg_</literal>, so that they will not
     conflict with unqualified user-table names so long as users avoid
     the <literal>pg_</literal> prefix.
+   </para>
+  </sect2>
+
+  <sect2 id="ddl-schemas-conflict">
+   <title>The Conflict Schema</title>
+
+   <indexterm zone="ddl-schemas-conflict">
+    <primary>conflict</primary>
+    <secondary>schema</secondary>
+   </indexterm>
+
+   <para>
+    The <literal>pg_conflict</literal> schema (sometimes referred to as the
+    <emphasis>conflict schema</emphasis>) contains system-managed conflict
+    log tables used for logical replication conflict tracking.
+    These tables are created and maintained by the system and are not intended for
+    direct user manipulation. Unlike <literal>pg_catalog</literal>, the
+    <literal>pg_conflict</literal> schema is not implicitly included in the
+    search path, so objects within it must be referenced explicitly or by
+    adjusting the search path.
    </para>
   </sect2>
 

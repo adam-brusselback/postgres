@@ -676,8 +676,6 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 
 	/* clean up the resource owner we created */
 	ReleaseAuxProcessResources(true);
-
-	basebackup_progress_done();
 }
 
 /*
@@ -1412,7 +1410,7 @@ sendDir(bbsink *sink, const char *path, int basepathlen, bool sizeonly,
 		if (strcmp(path, "./pg_tblspc") == 0 && S_ISLNK(statbuf.st_mode))
 		{
 			char		linkpath[MAXPGPATH];
-			int			rllen;
+			ssize_t		rllen;
 
 			rllen = readlink(pathbuf, linkpath, sizeof(linkpath));
 			if (rllen < 0)
