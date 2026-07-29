@@ -342,3 +342,183 @@ SELECT * FROM mv_trigger_view WHERE id = 99; -- Should NOT see it
 DROP MATERIALIZED VIEW mv_trigger_view;
 DROP TABLE mv_trigger_base;
 DROP FUNCTION maintain_mv_trigger_view();
+--
+-- Test 10: NULL values in the unique key column
+--
+-- The direct-modification path resolves conflicts with ON CONFLICT, which
+-- arbitrates via the unique index.  A NULLS DISTINCT index never reports a
+-- conflict for a NULL key, so every row is inserted afresh.  The anti-join
+-- that removes stale rows uses IS NOT DISTINCT FROM, which *does* treat two
+-- NULLs as equal, so the pre-existing row is never removed.  The two halves
+-- disagree, and rows accumulate.
+--
+CREATE TABLE mv_null_base (id int, v text);
+INSERT INTO mv_null_base VALUES (NULL, 'x'), (1, 'a');
+CREATE MATERIALIZED VIEW mv_null AS SELECT id, v FROM mv_null_base;
+CREATE UNIQUE INDEX ON mv_null(id);
+SELECT count(*) AS rows_initial FROM mv_null;
+ rows_initial 
+--------------
+            2
+(1 row)
+
+-- The base table is not modified, so each of these must be a no-op.
+REFRESH MATERIALIZED VIEW mv_null WHERE id IS NULL;
+REFRESH MATERIALIZED VIEW mv_null WHERE id IS NULL;
+-- XXX BUG: should still be 2.  Each refresh duplicates the NULL-keyed row.
+SELECT count(*) AS rows_after_two_noop_refreshes FROM mv_null;
+ rows_after_two_noop_refreshes 
+-------------------------------
+                             4
+(1 row)
+
+-- The match/merge path compares whole rows, so it is unaffected, and it also
+-- repairs the damage done above.
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_null WHERE id IS NULL;
+SELECT count(*) AS rows_after_concurrent_refresh FROM mv_null;
+ rows_after_concurrent_refresh 
+-------------------------------
+                             2
+(1 row)
+
+-- With NULLS NOT DISTINCT the upsert does arbitrate on NULL, which agrees
+-- with the anti-join, and the refresh behaves correctly.
+CREATE MATERIALIZED VIEW mv_null_nnd AS SELECT id, v FROM mv_null_base;
+CREATE UNIQUE INDEX ON mv_null_nnd(id) NULLS NOT DISTINCT;
+SELECT count(*) AS rows_initial FROM mv_null_nnd;
+ rows_initial 
+--------------
+            2
+(1 row)
+
+REFRESH MATERIALIZED VIEW mv_null_nnd WHERE id IS NULL;
+REFRESH MATERIALIZED VIEW mv_null_nnd WHERE id IS NULL;
+SELECT count(*) AS rows_after_two_noop_refreshes FROM mv_null_nnd;
+ rows_after_two_noop_refreshes 
+-------------------------------
+                             2
+(1 row)
+
+DROP MATERIALIZED VIEW mv_null_nnd;
+DROP MATERIALIZED VIEW mv_null;
+DROP TABLE mv_null_base;
+--
+-- Test 11: Scope drift, direct-modification path
+--
+-- Test 7 above shows the match/merge path failing when a row drifts into the
+-- predicate's scope.  The direct-modification path resolves the same case with
+-- ON CONFLICT DO UPDATE, so the two paths disagree on identical input.
+--
+CREATE TABLE mv_drift2_base (id int primary key, category_id int);
+INSERT INTO mv_drift2_base VALUES (1, 100), (2, 200);
+CREATE MATERIALIZED VIEW mv_drift2 AS SELECT id, category_id FROM mv_drift2_base;
+CREATE UNIQUE INDEX ON mv_drift2(id);
+-- Row 1 drifts from category 100 into category 200.  The predicate only sees
+-- the new location, so the stale row at the old location is not deleted.
+UPDATE mv_drift2_base SET category_id = 200 WHERE id = 1;
+-- Direct modification absorbs the collision.
+REFRESH MATERIALIZED VIEW mv_drift2 WHERE category_id = 200;
+SELECT * FROM mv_drift2 ORDER BY id;
+ id | category_id 
+----+-------------
+  1 |         200
+  2 |         200
+(2 rows)
+
+-- The same drift, this time handled by match/merge.
+UPDATE mv_drift2_base SET category_id = 300 WHERE id = 1;
+-- XXX BUG: errors, where the direct-modification path above succeeded.
+\set VERBOSITY terse
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_drift2 WHERE category_id = 300;
+ERROR:  duplicate key value violates unique constraint "mv_drift2_id_idx"
+\set VERBOSITY default
+SELECT * FROM mv_drift2 ORDER BY id;
+ id | category_id 
+----+-------------
+  1 |         200
+  2 |         200
+(2 rows)
+
+DROP MATERIALIZED VIEW mv_drift2;
+DROP TABLE mv_drift2_base;
+--
+-- Test 12: The predicate is parsed under a restricted search_path
+--
+-- REFRESH switches to the matview's owner and calls RestrictSearchPath(), so
+-- the predicate is analyzed with search_path set to "pg_catalog, pg_temp".
+-- Objects the caller can see unqualified are not visible to the predicate.
+--
+CREATE TABLE mv_sp_base (id int primary key, v text);
+INSERT INTO mv_sp_base VALUES (1, 'one'), (2, 'two');
+CREATE MATERIALIZED VIEW mv_sp AS SELECT id, v FROM mv_sp_base;
+CREATE UNIQUE INDEX ON mv_sp(id);
+CREATE TABLE mv_sp_ids (id int);
+INSERT INTO mv_sp_ids VALUES (1);
+SHOW search_path;
+   search_path   
+-----------------
+ "$user", public
+(1 row)
+
+-- XXX unqualified reference fails even though "public" is in search_path.
+REFRESH MATERIALIZED VIEW mv_sp WHERE id IN (SELECT id FROM mv_sp_ids);
+ERROR:  relation "mv_sp_ids" does not exist
+-- Schema-qualifying it works.
+REFRESH MATERIALIZED VIEW mv_sp WHERE id IN (SELECT s.id FROM public.mv_sp_ids s);
+SELECT * FROM mv_sp ORDER BY id;
+ id |  v  
+----+-----
+  1 | one
+  2 | two
+(2 rows)
+
+DROP TABLE mv_sp_ids;
+DROP MATERIALIZED VIEW mv_sp;
+DROP TABLE mv_sp_base;
+--
+-- Test 13: More than one unique index
+--
+-- The direct-modification path picks a single arbiter index, so a change that
+-- a full or concurrent refresh applies cleanly can fail on a second index.
+--
+-- NB: this test must stay last in this file.  The error below escapes
+-- refresh_by_direct_modification() between OpenMatViewIncrementalMaintenance()
+-- and its matching Close, which leaves matview_maintenance_depth above zero
+-- for the rest of the session.  See matview_where_privs.sql, which tests that
+-- leak directly.
+--
+CREATE TABLE mv_multi2_base (id int primary key, email text, uname text);
+INSERT INTO mv_multi2_base VALUES (1, 'a@example.com', 'ua'),
+                                 (2, 'b@example.com', 'ub');
+CREATE MATERIALIZED VIEW mv_multi2 AS
+  SELECT id, email, uname FROM mv_multi2_base;
+CREATE UNIQUE INDEX ON mv_multi2(email);
+CREATE UNIQUE INDEX ON mv_multi2(uname);
+-- Swap the two email addresses.  Both the old and the new row set satisfy
+-- every unique index, so a refresh has no reason to fail.
+UPDATE mv_multi2_base SET email = CASE id WHEN 1 THEN 'b@example.com'
+                                          ELSE 'a@example.com' END;
+-- XXX BUG: the upsert arbitrates on mv_multi2_email_idx and collides on
+-- mv_multi2_uname_idx.
+\set VERBOSITY terse
+REFRESH MATERIALIZED VIEW mv_multi2 WHERE id IN (1, 2);
+ERROR:  duplicate key value violates unique constraint "mv_multi2_uname_idx"
+\set VERBOSITY default
+SELECT * FROM mv_multi2 ORDER BY id;
+ id |     email     | uname 
+----+---------------+-------
+  1 | a@example.com | ua
+  2 | b@example.com | ub
+(2 rows)
+
+-- The match/merge path deletes before inserting, so it applies the change.
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_multi2 WHERE id IN (1, 2);
+SELECT * FROM mv_multi2 ORDER BY id;
+ id |     email     | uname 
+----+---------------+-------
+  1 | b@example.com | ua
+  2 | a@example.com | ub
+(2 rows)
+
+DROP MATERIALIZED VIEW mv_multi2;
+DROP TABLE mv_multi2_base;

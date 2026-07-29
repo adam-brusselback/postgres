@@ -1,0 +1,41 @@
+Stress reproducer: REFRESH MATERIALIZED VIEW ... WHERE ... lock ordering
+========================================================================
+
+This directory is NOT part of any test schedule and is not wired into either
+build system.  It exists because one of the failure modes of the non-concurrent
+partial refresh cannot be expressed deterministically as an isolation spec.
+
+The row-locking step of refresh_by_direct_modification() is
+
+    SELECT 1 FROM <matview> mv WHERE (<predicate>) FOR UPDATE
+
+with no ORDER BY, so a single refresh statement locks rows in whatever order its
+plan happens to produce.  Two concurrent refreshes whose predicates select
+overlapping rows but produce different plans will therefore lock those rows in
+different orders and deadlock.  Reproducing that requires both statements to be
+simultaneously mid-scan, which isolationtester cannot arrange -- it drives one
+step at a time.
+
+src/test/isolation/specs/matview-where-deadlock.spec covers the deterministic,
+cross-statement variant of the same flaw.  Note that adding ORDER BY to the
+locking SELECT fixes the variant reproduced here but not the one in that spec:
+ordering within one statement says nothing about the order of separate
+statements.
+
+Usage
+-----
+
+    ./run.sh [PGPORT] [PGHOST] [PGDATABASE]
+
+Defaults: port 5432, host /tmp, database postgres.  Requires psql on PATH.
+
+The script builds a matview whose physical row order is the reverse of its key
+order, then runs two sessions in parallel:
+
+  - one refreshing with a predicate the planner satisfies with an index scan,
+    which locks in ascending key order;
+  - one refreshing with a predicate that forces a sequential scan, which locks
+    in physical order, i.e. descending key order.
+
+It exits non-zero and prints a count if any deadlock is detected.  On an
+unfixed tree roughly half the refreshes abort.

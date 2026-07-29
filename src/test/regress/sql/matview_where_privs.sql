@@ -1,0 +1,171 @@
+--
+-- REFRESH MATERIALIZED VIEW ... WHERE ... : privileges and session state
+--
+-- These tests exercise the security boundary of the WHERE clause and the
+-- session-level matview maintenance flag.  The last test deliberately leaves
+-- the session in a broken state, so nothing may be added after it.
+--
+
+--
+-- Test 1: The predicate runs with the matview owner's privileges
+--
+-- RefreshMatViewByOid() switches to the owner before analyzing or executing
+-- anything, so functions named in a caller-supplied predicate run as the
+-- owner.  A caller holding only MAINTAIN can therefore reach objects it has no
+-- privileges on.
+--
+
+CREATE ROLE regress_matview_owner;
+CREATE ROLE regress_matview_maint;
+
+CREATE TABLE matview_priv_target (note text);
+CREATE MATERIALIZED VIEW matview_priv_mv AS SELECT 1 AS id;
+CREATE UNIQUE INDEX ON matview_priv_mv (id);
+
+ALTER TABLE matview_priv_target OWNER TO regress_matview_owner;
+ALTER MATERIALIZED VIEW matview_priv_mv OWNER TO regress_matview_owner;
+
+CREATE SCHEMA matview_priv_atk AUTHORIZATION regress_matview_maint;
+GRANT MAINTAIN ON matview_priv_mv TO regress_matview_maint;
+
+SET ROLE regress_matview_maint;
+
+GRANT USAGE ON SCHEMA matview_priv_atk TO regress_matview_owner;
+
+-- The write is done by a volatile function, wrapped in a stable one so that
+-- the volatility check in transformRefreshWhereClause() does not reject it.
+CREATE FUNCTION matview_priv_atk.do_write() RETURNS void
+  LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+  INSERT INTO public.matview_priv_target
+    VALUES ('written as ' || pg_catalog.current_user());
+END $$;
+
+CREATE FUNCTION matview_priv_atk.pred(int) RETURNS boolean
+  LANGUAGE plpgsql STABLE AS $$
+BEGIN
+  PERFORM matview_priv_atk.do_write();
+  RETURN true;
+END $$;
+
+-- The caller cannot write to the table directly.
+INSERT INTO public.matview_priv_target VALUES ('direct write');
+
+-- XXX BUG: but it can through a refresh predicate.
+REFRESH MATERIALIZED VIEW matview_priv_mv WHERE matview_priv_atk.pred(id);
+
+RESET ROLE;
+
+-- XXX BUG: expected zero rows.  The count also shows how many times a single
+-- refresh evaluates the predicate: once for the row-locking SELECT, once for
+-- the new_data CTE, and once for the anti-join DELETE.
+SELECT note, count(*) AS predicate_evaluations
+  FROM matview_priv_target GROUP BY note;
+
+DROP FUNCTION matview_priv_atk.pred(int);
+DROP FUNCTION matview_priv_atk.do_write();
+DROP SCHEMA matview_priv_atk;
+DROP MATERIALIZED VIEW matview_priv_mv;
+DROP TABLE matview_priv_target;
+DROP ROLE regress_matview_maint;
+DROP ROLE regress_matview_owner;
+
+--
+-- Test 2: The predicate runs inside the matview maintenance window
+--
+-- OpenMatViewIncrementalMaintenance() is called before the SPI statements that
+-- evaluate the predicate, so a predicate function is exempt from the "cannot
+-- change materialized view" check -- and that exemption is global, not scoped
+-- to the matview being refreshed.
+--
+-- Everything here is owned by the role running the test, so that no ACL
+-- failure can mask the behaviour under test.
+--
+
+CREATE TABLE matview_mw_base (id int primary key, v text);
+INSERT INTO matview_mw_base VALUES (1, 'a');
+CREATE MATERIALIZED VIEW matview_mw_driver AS SELECT id, v FROM matview_mw_base;
+CREATE UNIQUE INDEX ON matview_mw_driver (id);
+
+CREATE TABLE matview_mw_vbase (id int primary key, v text);
+INSERT INTO matview_mw_vbase VALUES (1, 'a'), (2, 'b');
+CREATE MATERIALIZED VIEW matview_mw_victim AS SELECT id, v FROM matview_mw_vbase;
+CREATE UNIQUE INDEX ON matview_mw_victim (id);
+
+CREATE FUNCTION matview_mw_write() RETURNS void
+  LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+  DELETE FROM public.matview_mw_victim;
+  INSERT INTO public.matview_mw_victim VALUES (99, 'injected');
+END $$;
+
+CREATE FUNCTION matview_mw_pred(int) RETURNS boolean
+  LANGUAGE plpgsql STABLE AS $$
+BEGIN
+  PERFORM public.matview_mw_write();
+  RETURN true;
+END $$;
+
+-- Called outside a refresh, the write is correctly refused.
+SELECT public.matview_mw_write();
+
+SELECT count(*) AS victim_rows_before FROM matview_mw_victim;
+
+-- XXX BUG: reached through a predicate, the same write succeeds -- against a
+-- matview that is not the one being refreshed.
+REFRESH MATERIALIZED VIEW matview_mw_driver WHERE public.matview_mw_pred(id);
+
+-- XXX BUG: expected the two original rows.
+SELECT * FROM matview_mw_victim ORDER BY id;
+
+DROP FUNCTION matview_mw_pred(int);
+DROP FUNCTION matview_mw_write();
+DROP MATERIALIZED VIEW matview_mw_victim;
+DROP TABLE matview_mw_vbase;
+DROP MATERIALIZED VIEW matview_mw_driver;
+DROP TABLE matview_mw_base;
+
+--
+-- Test 3: matview_maintenance_depth leaks when a refresh fails
+--
+-- refresh_by_direct_modification() has no PG_TRY between
+-- OpenMatViewIncrementalMaintenance() and its matching Close (compare the
+-- match/merge call site, which does).  An error in between skips the Close and
+-- leaves the counter above zero, disabling the "cannot change materialized
+-- view" check for the remainder of the session.
+--
+-- NB: nothing may be added after this test.  It leaves the session unable to
+-- protect any matview from direct DML.
+--
+
+CREATE TABLE mv_leak_base (id int, code int, v text);
+INSERT INTO mv_leak_base VALUES (1, 100, 'a'), (2, 200, 'b'), (3, 300, 'c');
+
+CREATE MATERIALIZED VIEW mv_leak AS SELECT id, code, v FROM mv_leak_base;
+CREATE UNIQUE INDEX ON mv_leak (code);
+
+-- Control: direct DML is refused, as it must be.
+DELETE FROM mv_leak WHERE id = 1;
+SELECT count(*) AS rows_before FROM mv_leak;
+
+-- Make two source rows collide on the arbiter index so the refresh CTE fails.
+UPDATE mv_leak_base SET code = 999 WHERE id IN (1, 2);
+\set VERBOSITY terse
+REFRESH MATERIALIZED VIEW mv_leak WHERE id <= 2;
+\set VERBOSITY default
+
+-- XXX BUG: both of these should still be refused, and the row count should be
+-- unchanged from rows_before above.
+DELETE FROM mv_leak WHERE id = 1;
+INSERT INTO mv_leak (id, code, v) VALUES (42, 4242, 'injected');
+SELECT * FROM mv_leak ORDER BY id;
+
+-- XXX BUG: the exemption is not scoped to mv_leak -- every matview in the
+-- session is now writable, including one with no unique index at all.
+CREATE MATERIALIZED VIEW mv_leak_other AS SELECT id, v FROM mv_leak_base;
+DELETE FROM mv_leak_other;
+SELECT count(*) AS other_rows_after_delete FROM mv_leak_other;
+
+DROP MATERIALIZED VIEW mv_leak_other;
+DROP MATERIALIZED VIEW mv_leak;
+DROP TABLE mv_leak_base;

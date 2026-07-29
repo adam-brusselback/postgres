@@ -1,0 +1,40 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_change s1_ref1 s2_read s2_ref2 s2_commit s1_commit s2_final
+step s1_change: UPDATE mvw_base SET v = 'one-s1' WHERE id = 1;
+step s1_ref1: REFRESH MATERIALIZED VIEW mvw WHERE id = 1;
+step s2_read: SELECT id, v FROM mvw ORDER BY id;
+id|v    
+--+-----
+ 1|one  
+ 2|two  
+ 3|three
+(3 rows)
+
+step s2_ref2: REFRESH MATERIALIZED VIEW mvw WHERE id = 2;
+step s2_commit: COMMIT;
+step s1_commit: COMMIT;
+step s2_final: SELECT id, v FROM mvw ORDER BY id;
+id|v     
+--+------
+ 1|one-s1
+ 2|two   
+ 3|three 
+(3 rows)
+
+
+starting permutation: s1_change s1_ref1 s2_ref1 s1_commit s2_commit s2_final
+step s1_change: UPDATE mvw_base SET v = 'one-s1' WHERE id = 1;
+step s1_ref1: REFRESH MATERIALIZED VIEW mvw WHERE id = 1;
+step s2_ref1: REFRESH MATERIALIZED VIEW mvw WHERE id = 1; <waiting ...>
+step s1_commit: COMMIT;
+step s2_ref1: <... completed>
+step s2_commit: COMMIT;
+step s2_final: SELECT id, v FROM mvw ORDER BY id;
+id|v     
+--+------
+ 1|one-s1
+ 2|two   
+ 3|three 
+(3 rows)
+

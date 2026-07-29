@@ -70,8 +70,13 @@ test: brin gin gist spgist privileges init_privs security_label collate matview 
 
 # ----------
 # Additional Mat View tests
+#
+# Each of these depends on per-session state (the partial refresh plan cache,
+# and matview_maintenance_depth), so they must each get their own connection.
+# pg_regress gives one connection per test file, so listing them here is
+# sufficient; they may still run concurrently with each other.
 # ----------
-test: matview_where
+test: matview_where matview_where_cache matview_where_privs
 
 # ----------
 # Additional BRIN tests
