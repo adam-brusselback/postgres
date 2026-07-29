@@ -10,6 +10,10 @@
 -- describes what the command should do, so the test fails until the defect is
 -- fixed, and an XXX comment names the behaviour seen today.
 --
+-- Each also carries a Disposition line saying whether it is worth keeping in the
+-- tree once the defect is fixed, or is scaffolding to delete then.  Grep for
+-- "Disposition:" across these files to review that at once.
+--
 -- Setup
 CREATE TABLE mv_base_a (id int primary key, val text);
 INSERT INTO mv_base_a VALUES (1, 'One'), (2, 'Two'), (3, 'Three');
@@ -360,6 +364,9 @@ DROP FUNCTION maintain_mv_trigger_view();
 -- constraint matching the ON CONFLICT specification".  Fixed by using
 -- indnkeyatts; this is the regression guard, and it passes.
 --
+-- Disposition: keep.  Nothing else exercises an index with INCLUDE columns on
+-- this path, and the cost is two refreshes.
+--
 CREATE TABLE mv_incl_base (id int primary key, extra text, v text);
 INSERT INTO mv_incl_base VALUES (1, 'x', 'one'), (2, 'y', 'two');
 CREATE MATERIALIZED VIEW mv_incl AS SELECT id, extra, v FROM mv_incl_base;
@@ -398,6 +405,11 @@ DROP TABLE mv_incl_base;
 -- that removes stale rows uses IS NOT DISTINCT FROM, which *does* treat two
 -- NULLs as equal, so the pre-existing row is never removed.  The two halves
 -- disagree, and rows accumulate.
+--
+-- Disposition: keep.  "A refresh that changes nothing changes nothing" is an
+-- invariant worth asserting permanently, whichever way the disagreement is
+-- resolved -- by matching the index's NULL semantics in the anti-join, or by
+-- requiring NOT NULL or NULLS NOT DISTINCT key columns.
 --
 CREATE TABLE mv_null_base (id int, v text);
 INSERT INTO mv_null_base VALUES (NULL, 'x'), (1, 'a');
@@ -462,6 +474,9 @@ DROP TABLE mv_null_base;
 -- predicate's scope.  This shows the direct-modification path resolving the
 -- same case, so the two paths disagree on identical input.
 --
+-- Disposition: keep.  The two paths agreeing on the same input is an invariant,
+-- and Test 7 will need its expected output updated at the same time.
+--
 CREATE TABLE mv_drift2_base (id int primary key, category_id int);
 INSERT INTO mv_drift2_base VALUES (1, 100), (2, 200);
 CREATE MATERIALIZED VIEW mv_drift2 AS SELECT id, category_id FROM mv_drift2_base;
@@ -515,6 +530,12 @@ DROP TABLE mv_drift2_base;
 -- is what makes the owner-privilege model tractable, so what should happen here
 -- depends on how the privilege question is settled.
 --
+-- Disposition: keep the subquery half; REVISIT the search_path half.  If the
+-- privilege fix moves predicate analysis to the caller's search_path, the
+-- unqualified reference starts working and this becomes an assertion of the new
+-- behaviour rather than a record of the old.  If the restricted path stays, it
+-- should move into the documentation instead of being asserted here.
+--
 CREATE TABLE mv_sp_base (id int primary key, v text);
 INSERT INTO mv_sp_base VALUES (1, 'one'), (2, 'two');
 CREATE MATERIALIZED VIEW mv_sp AS SELECT id, v FROM mv_sp_base;
@@ -543,12 +564,82 @@ DROP TABLE mv_sp_ids;
 DROP MATERIALIZED VIEW mv_sp;
 DROP TABLE mv_sp_base;
 --
--- Test 14: More than one unique index
+-- Test 14: Which form of the command allows concurrent writers
+--
+-- Reported on -hackers by Vellaipandiyan: "The CONCURRENTLY behavior also feels
+-- somewhat unintuitive here.  With WHERE refreshes, the non-CONCURRENT path
+-- appears more permissive for writers than CONCURRENTLY WHERE, which seems
+-- opposite to the expectation established by normal REFRESH MATERIALIZED VIEW
+-- semantics."  Adam Brusselback agreed to swap the two paths, so that
+-- CONCURRENTLY selects the direct-modification path and the bare form selects
+-- match/merge.  That swap is not in the tree.
+--
+-- What decides whether writers are blocked is the lock ExecRefreshMatView()
+-- takes on the matview: match/merge takes ExclusiveLock, direct modification
+-- takes only RowExclusiveLock.  Reading it back inside the refreshing
+-- transaction is enough to tell which path ran.
+--
+-- Disposition: DELETE once the swap lands.  This asserts a lock level rather
+-- than a behaviour, which is exactly the kind of test that breaks on unrelated
+-- locking changes.  It is here to pin the agreed direction until it is
+-- implemented, not to live in the tree afterwards.  What should survive is the
+-- documented statement of which form blocks writers.
+--
+CREATE TABLE mv_lock_base (id int primary key, v text);
+INSERT INTO mv_lock_base VALUES (1, 'one'), (2, 'two');
+CREATE MATERIALIZED VIEW mv_lock AS SELECT id, v FROM mv_lock_base;
+CREATE UNIQUE INDEX ON mv_lock(id);
+-- CONCURRENTLY must be the permissive form: writers are not blocked.
+-- XXX currently true, because CONCURRENTLY still selects match/merge.
+BEGIN;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_lock WHERE id = 1;
+SELECT bool_or(mode = 'ExclusiveLock') AS concurrently_blocks_writers
+  FROM pg_locks
+  WHERE locktype = 'relation' AND relation = 'mv_lock'::pg_catalog.regclass;
+ concurrently_blocks_writers 
+-----------------------------
+ f
+(1 row)
+
+COMMIT;
+-- The bare form must be the conservative one: writers are blocked.
+-- XXX currently false, because the bare form still selects direct modification.
+BEGIN;
+REFRESH MATERIALIZED VIEW mv_lock WHERE id = 1;
+SELECT bool_or(mode = 'ExclusiveLock') AS bare_where_blocks_writers
+  FROM pg_locks
+  WHERE locktype = 'relation' AND relation = 'mv_lock'::pg_catalog.regclass;
+ bare_where_blocks_writers 
+---------------------------
+ t
+(1 row)
+
+COMMIT;
+-- A full refresh is unaffected by the swap and keeps AccessExclusiveLock.
+BEGIN;
+REFRESH MATERIALIZED VIEW mv_lock;
+SELECT bool_or(mode = 'AccessExclusiveLock') AS full_refresh_blocks_everything
+  FROM pg_locks
+  WHERE locktype = 'relation' AND relation = 'mv_lock'::pg_catalog.regclass;
+ full_refresh_blocks_everything 
+--------------------------------
+ t
+(1 row)
+
+COMMIT;
+DROP MATERIALIZED VIEW mv_lock;
+DROP TABLE mv_lock_base;
+--
+-- Test 15: More than one unique index
 --
 -- Not yet reported on -hackers; found while writing these tests.  Test 8 above
 -- covers a change that happens to arbitrate cleanly; this covers one that does
 -- not.  The direct-modification path picks a single arbiter index, so a change
 -- that a full or concurrent refresh applies cleanly can fail on a second index.
+--
+-- Disposition: keep.  That a refresh accepts every row set a full refresh
+-- accepts is an invariant, and it is easy to reintroduce by changing how the
+-- arbiter index is chosen.
 --
 -- NB: while this case still fails, it must stay last in this file.  The error
 -- escapes refresh_by_direct_modification() between

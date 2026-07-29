@@ -365,6 +365,43 @@ DROP TABLE pgss_select_into;
 
 SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
+--
+-- Track the total number of rows affected by a partial
+-- REFRESH MATERIALIZED VIEW
+--
+-- Reported nowhere yet; found while reviewing the WHERE clause patch.
+-- refresh_by_direct_modification() reports SPI_processed from its fused CTE,
+-- whose top-level statement is the anti-join DELETE, so rows that were upserted
+-- are not counted.  A refresh that only deletes therefore reports a sensible
+-- number while one that only updates reports zero.
+--
+-- Disposition: keep.  This belongs with the rows-tracking cases above; the
+-- count is part of the command's contract, not scaffolding.
+--
+CREATE TABLE pgss_pr_base AS SELECT a, 'v'::text AS b FROM generate_series(1, 10) a;
+CREATE MATERIALIZED VIEW pgss_pr_matv AS SELECT a, b FROM pgss_pr_base;
+CREATE UNIQUE INDEX ON pgss_pr_matv (a);
+UPDATE pgss_pr_base SET b = 'w' WHERE a <= 3;
+DELETE FROM pgss_pr_base WHERE a >= 9;
+
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
+
+-- Three rows in scope, all three changed, so three rows are applied.
+REFRESH MATERIALIZED VIEW pgss_pr_matv WHERE a <= 3;
+-- Two rows in scope, both gone from the source, so two rows are applied.
+REFRESH MATERIALIZED VIEW pgss_pr_matv WHERE a >= 9;
+
+-- XXX the first of these reports 0 rather than 3.  The second is only right by
+-- accident: its work happens to be entirely deletion.
+SELECT calls, rows, query FROM pg_stat_statements
+  WHERE query LIKE 'REFRESH MATERIALIZED VIEW pgss_pr_matv%'
+  ORDER BY query COLLATE "C";
+
+DROP MATERIALIZED VIEW pgss_pr_matv;
+DROP TABLE pgss_pr_base;
+
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
+
 -- Special cases.  Keep these ones at the end to avoid conflicts.
 SET SCHEMA 'foo';
 SET SCHEMA 'public';

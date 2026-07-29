@@ -24,6 +24,10 @@
 # regressing while the rest of the feature is reworked.  The claim it does not
 # cover is that overlapping refreshes never abort -- see
 # matview-where-deadlock.spec.
+#
+# Disposition: keep.  This is the executable form of the feature's concurrency
+# contract, and it will need rewriting rather than deleting if the locking model
+# changes.
 
 setup
 {

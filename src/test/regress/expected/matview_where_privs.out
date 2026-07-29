@@ -17,6 +17,12 @@
 -- so its wording is not knowable here; the SQLSTATE that a correct rejection
 -- must carry is.
 --
+-- Disposition: keep, all three.  These are security regressions, and the
+-- classes they cover -- a caller reaching objects through a predicate it could
+-- not reach directly, a predicate modifying a matview, and an error leaving the
+-- maintenance flag raised -- are all easy to reintroduce.  They should stay in
+-- the tree after the fixes land.
+--
 -- The last test deliberately leaves the session unable to protect any matview
 -- from direct DML, so nothing may be added after it.
 --

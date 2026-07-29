@@ -19,6 +19,14 @@
 -- command should do, so they fail until the defect is fixed, and an XXX comment
 -- names the behaviour seen today.
 --
+-- Disposition: Tests 1 to 3 -- DELETE if the plan cache goes away.  All three
+-- exist only because plans are cached across statements and revalidated by
+-- re-analyzing a raw parse tree; drop the cache and they assert nothing.  If the
+-- cache stays and gains proper invalidation, keep them as guards for it.
+--
+-- Disposition: Test 4 -- keep.  It asserts that a refresh acts on the rows its
+-- predicate identifies, which holds however the plan is or is not cached.
+--
 --
 -- Test 1: Renaming the materialized view
 --

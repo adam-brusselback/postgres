@@ -28,6 +28,12 @@
 # question is settled there is no correct output to assert, so the expected file
 # below is a characterisation, and the XXX marks the contract violation.
 #
+# Disposition: REPLACE or DELETE once the locking model is settled.  If
+# overlapping refreshes are made to serialize properly, this permutation stops
+# being drivable and the spec should be rewritten around whatever the new model
+# guarantees.  If deadlock is accepted as normal for row-level locking, the
+# behaviour belongs in the documentation and this spec can go.
+#
 # XXX There is a second, non-deterministic variant that this spec cannot cover:
 # a *single* refresh statement locks rows in whatever order its plan happens to
 # produce, so two overlapping refreshes with different predicates (and therefore
