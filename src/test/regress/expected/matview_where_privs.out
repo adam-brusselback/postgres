@@ -2,16 +2,27 @@
 -- REFRESH MATERIALIZED VIEW ... WHERE ... : privileges and session state
 --
 -- These tests exercise the security boundary of the WHERE clause and the
--- session-level matview maintenance flag.  The last test deliberately leaves
--- the session in a broken state, so nothing may be added after it.
+-- session-level matview maintenance flag.  Every case covers a known defect:
+-- the expected output describes what the command should do, so they fail until
+-- the defect is fixed, and each one is annotated with an XXX comment naming the
+-- behaviour seen today.
+--
+-- Where the correct outcome is "the statement is rejected", the statement is
+-- wrapped in a block that reports the SQLSTATE instead of letting the message
+-- text through.  The fix that produces the rejection has not been written yet,
+-- so its wording is not knowable here; the SQLSTATE that a correct rejection
+-- must carry is.
+--
+-- The last test deliberately leaves the session unable to protect any matview
+-- from direct DML, so nothing may be added after it.
 --
 --
--- Test 1: The predicate runs with the matview owner's privileges
+-- Test 1: The predicate must not run with the matview owner's privileges
 --
 -- RefreshMatViewByOid() switches to the owner before analyzing or executing
 -- anything, so functions named in a caller-supplied predicate run as the
--- owner.  A caller holding only MAINTAIN can therefore reach objects it has no
--- privileges on.
+-- owner.  A caller holding only MAINTAIN must not be able to reach objects it
+-- has no privileges on.
 --
 CREATE ROLE regress_matview_owner;
 CREATE ROLE regress_matview_maint;
@@ -41,18 +52,28 @@ END $$;
 -- The caller cannot write to the table directly.
 INSERT INTO public.matview_priv_target VALUES ('direct write');
 ERROR:  permission denied for table matview_priv_target
--- XXX BUG: but it can through a refresh predicate.
-REFRESH MATERIALIZED VIEW matview_priv_mv WHERE matview_priv_atk.pred(id);
+-- A predicate naming a function the caller could not usefully run itself must
+-- be refused.  42501 is insufficient_privilege.
+-- XXX currently allowed.
+DO $$
+BEGIN
+  EXECUTE 'REFRESH MATERIALIZED VIEW matview_priv_mv'
+          ' WHERE matview_priv_atk.pred(id)';
+  RAISE NOTICE 'refresh was allowed';
+EXCEPTION WHEN others THEN
+  RAISE NOTICE 'refresh was rejected, SQLSTATE %', SQLSTATE;
+END $$;
+NOTICE:  refresh was rejected, SQLSTATE 42501
 RESET ROLE;
--- XXX BUG: expected zero rows.  The count also shows how many times a single
--- refresh evaluates the predicate: once for the row-locking SELECT, once for
--- the new_data CTE, and once for the anti-join DELETE.
+-- Must be empty.
+-- XXX currently holds one row per predicate evaluation: the refresh evaluates
+-- the predicate three times, once for the row-locking SELECT, once for the
+-- new_data CTE and once for the anti-join DELETE.
 SELECT note, count(*) AS predicate_evaluations
   FROM matview_priv_target GROUP BY note;
-               note               | predicate_evaluations 
-----------------------------------+-----------------------
- written as regress_matview_owner |                     3
-(1 row)
+ note | predicate_evaluations 
+------+-----------------------
+(0 rows)
 
 DROP FUNCTION matview_priv_atk.pred(int);
 DROP FUNCTION matview_priv_atk.do_write();
@@ -62,7 +83,7 @@ DROP TABLE matview_priv_target;
 DROP ROLE regress_matview_maint;
 DROP ROLE regress_matview_owner;
 --
--- Test 2: The predicate runs inside the matview maintenance window
+-- Test 2: The predicate must not run inside the matview maintenance window
 --
 -- OpenMatViewIncrementalMaintenance() is called before the SPI statements that
 -- evaluate the predicate, so a predicate function is exempt from the "cannot
@@ -103,15 +124,26 @@ SELECT count(*) AS victim_rows_before FROM matview_mw_victim;
                   2
 (1 row)
 
--- XXX BUG: reached through a predicate, the same write succeeds -- against a
--- matview that is not the one being refreshed.
-REFRESH MATERIALIZED VIEW matview_mw_driver WHERE public.matview_mw_pred(id);
--- XXX BUG: expected the two original rows.
+-- Reached through a predicate, the same write must still be refused.  42809 is
+-- wrong_object_type, which is what "cannot change materialized view" carries.
+-- XXX currently allowed.
+DO $$
+BEGIN
+  EXECUTE 'REFRESH MATERIALIZED VIEW matview_mw_driver'
+          ' WHERE public.matview_mw_pred(id)';
+  RAISE NOTICE 'refresh was allowed';
+EXCEPTION WHEN others THEN
+  RAISE NOTICE 'refresh was rejected, SQLSTATE %', SQLSTATE;
+END $$;
+NOTICE:  refresh was rejected, SQLSTATE 42809
+-- Must be the two original rows.
+-- XXX currently replaced by the row the predicate inserted.
 SELECT * FROM matview_mw_victim ORDER BY id;
- id |    v     
-----+----------
- 99 | injected
-(1 row)
+ id | v 
+----+---
+  1 | a
+  2 | b
+(2 rows)
 
 DROP FUNCTION matview_mw_pred(int);
 DROP FUNCTION matview_mw_write();
@@ -120,7 +152,7 @@ DROP TABLE matview_mw_vbase;
 DROP MATERIALIZED VIEW matview_mw_driver;
 DROP TABLE matview_mw_base;
 --
--- Test 3: matview_maintenance_depth leaks when a refresh fails
+-- Test 3: matview_maintenance_depth must not leak when a refresh fails
 --
 -- refresh_by_direct_modification() has no PG_TRY between
 -- OpenMatViewIncrementalMaintenance() and its matching Close (compare the
@@ -128,8 +160,7 @@ DROP TABLE matview_mw_base;
 -- leaves the counter above zero, disabling the "cannot change materialized
 -- view" check for the remainder of the session.
 --
--- NB: nothing may be added after this test.  It leaves the session unable to
--- protect any matview from direct DML.
+-- NB: while this leak still exists, nothing may be added after this test.
 --
 CREATE TABLE mv_leak_base (id int, code int, v text);
 INSERT INTO mv_leak_base VALUES (1, 100, 'a'), (2, 200, 'b'), (3, 300, 'c');
@@ -145,31 +176,36 @@ SELECT count(*) AS rows_before FROM mv_leak;
 (1 row)
 
 -- Make two source rows collide on the arbiter index so the refresh CTE fails.
+-- Failing here is correct; what matters is the state left behind.
 UPDATE mv_leak_base SET code = 999 WHERE id IN (1, 2);
 \set VERBOSITY terse
 REFRESH MATERIALIZED VIEW mv_leak WHERE id <= 2;
 ERROR:  ON CONFLICT DO UPDATE command cannot affect row a second time
 \set VERBOSITY default
--- XXX BUG: both of these should still be refused, and the row count should be
--- unchanged from rows_before above.
+-- Both of these must still be refused, and the contents must be unchanged.
+-- XXX currently both succeed.
 DELETE FROM mv_leak WHERE id = 1;
+ERROR:  cannot change materialized view "mv_leak"
 INSERT INTO mv_leak (id, code, v) VALUES (42, 4242, 'injected');
+ERROR:  cannot change materialized view "mv_leak"
 SELECT * FROM mv_leak ORDER BY id;
- id | code |    v     
-----+------+----------
+ id | code | v 
+----+------+---
+  1 |  100 | a
   2 |  200 | b
   3 |  300 | c
- 42 | 4242 | injected
 (3 rows)
 
--- XXX BUG: the exemption is not scoped to mv_leak -- every matview in the
--- session is now writable, including one with no unique index at all.
+-- The exemption is not scoped to mv_leak either: every matview in the session
+-- becomes writable, including one with no unique index at all.
+-- XXX currently succeeds.
 CREATE MATERIALIZED VIEW mv_leak_other AS SELECT id, v FROM mv_leak_base;
 DELETE FROM mv_leak_other;
+ERROR:  cannot change materialized view "mv_leak_other"
 SELECT count(*) AS other_rows_after_delete FROM mv_leak_other;
  other_rows_after_delete 
 -------------------------
-                       0
+                       3
 (1 row)
 
 DROP MATERIALIZED VIEW mv_leak_other;

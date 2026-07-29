@@ -10,6 +10,16 @@
 # single-row partial refreshes in opposite orders, which is what a trigger-driven
 # maintenance scheme produces naturally.
 #
+# Unlike the regression tests for this feature, this spec records what happens
+# today rather than asserting a fix, and so it passes.  That is deliberate: the
+# stated contract is that overlapping partial refreshes serialize, and the
+# permutation below violates it, but no row-granularity locking scheme can
+# satisfy it here -- the two transactions form a genuine cycle.  Honouring the
+# contract needs a coarser lock, under which s2's first refresh would block
+# immediately and this permutation could not be driven at all.  Until that design
+# question is settled there is no correct output to assert, so the expected file
+# below is a characterisation, and the XXX marks the contract violation.
+#
 # XXX There is a second, non-deterministic variant that this spec cannot cover:
 # a *single* refresh statement locks rows in whatever order its plan happens to
 # produce, so two overlapping refreshes with different predicates (and therefore
@@ -46,6 +56,6 @@ step s2_commit   { COMMIT; }
 step s2_final    { SELECT id, v FROM mvwd ORDER BY id; }
 
 # s1 holds row 1 and wants row 2; s2 holds row 2 and wants row 1.
-# XXX BUG: deadlock.  A partial refresh is documented as serializing against
-# overlapping refreshes, so this should wait rather than abort.
+# XXX a partial refresh is documented as serializing against overlapping
+# refreshes, so neither of these should abort.
 permutation s1_ref1 s2_ref2 s1_ref2 s2_ref1 s1_commit s2_commit s2_final

@@ -1,6 +1,10 @@
 --
 -- REFRESH MATERIALIZED VIEW ... WHERE ...
 --
+-- Tests 10 and up cover known defects.  Their expected output describes what
+-- the command should do, so they fail until the defect is fixed; each one is
+-- annotated with an XXX comment naming the behaviour seen today.
+--
 
 -- Setup
 CREATE TABLE mv_base_a (id int primary key, val text);
@@ -324,11 +328,11 @@ SELECT count(*) AS rows_initial FROM mv_null;
 REFRESH MATERIALIZED VIEW mv_null WHERE id IS NULL;
 REFRESH MATERIALIZED VIEW mv_null WHERE id IS NULL;
 
--- XXX BUG: should still be 2.  Each refresh duplicates the NULL-keyed row.
+-- Must still be 2.
+-- XXX currently returns 4: each refresh duplicates the NULL-keyed row.
 SELECT count(*) AS rows_after_two_noop_refreshes FROM mv_null;
 
--- The match/merge path compares whole rows, so it is unaffected, and it also
--- repairs the damage done above.
+-- The match/merge path compares whole rows, so it is unaffected.
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_null WHERE id IS NULL;
 SELECT count(*) AS rows_after_concurrent_refresh FROM mv_null;
 
@@ -368,9 +372,14 @@ UPDATE mv_drift2_base SET category_id = 200 WHERE id = 1;
 REFRESH MATERIALIZED VIEW mv_drift2 WHERE category_id = 200;
 SELECT * FROM mv_drift2 ORDER BY id;
 
--- The same drift, this time handled by match/merge.
+-- The same drift, this time handled by match/merge.  Must succeed too.
 UPDATE mv_drift2_base SET category_id = 300 WHERE id = 1;
--- XXX BUG: errors, where the direct-modification path above succeeded.
+-- XXX currently fails with a unique key violation on mv_drift2_id_idx, where
+-- the direct-modification path above succeeded on identical input.
+--
+-- The VERBOSITY guard keeps that failure's diff to a single line: the CONTEXT
+-- of a match/merge error names the transient tables, whose names are not
+-- stable across runs.
 \set VERBOSITY terse
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_drift2 WHERE category_id = 300;
 \set VERBOSITY default
@@ -397,7 +406,11 @@ INSERT INTO mv_sp_ids VALUES (1);
 
 SHOW search_path;
 
--- XXX unqualified reference fails even though "public" is in search_path.
+-- An unqualified reference fails even though "public" is in search_path.
+-- Unlike the other cases in this file, this one records current behaviour
+-- rather than asserting a fix: restricting the path is what makes the
+-- owner-privilege model tractable, so what should happen here depends on how
+-- the privilege question is settled.
 REFRESH MATERIALIZED VIEW mv_sp WHERE id IN (SELECT id FROM mv_sp_ids);
 
 -- Schema-qualifying it works.
@@ -414,11 +427,11 @@ DROP TABLE mv_sp_base;
 -- The direct-modification path picks a single arbiter index, so a change that
 -- a full or concurrent refresh applies cleanly can fail on a second index.
 --
--- NB: this test must stay last in this file.  The error below escapes
--- refresh_by_direct_modification() between OpenMatViewIncrementalMaintenance()
--- and its matching Close, which leaves matview_maintenance_depth above zero
--- for the rest of the session.  See matview_where_privs.sql, which tests that
--- leak directly.
+-- NB: while this case still fails, it must stay last in this file.  The error
+-- escapes refresh_by_direct_modification() between
+-- OpenMatViewIncrementalMaintenance() and its matching Close, leaving
+-- matview_maintenance_depth above zero for the rest of the session.  See
+-- matview_where_privs.sql, which tests that leak directly.
 --
 
 CREATE TABLE mv_multi2_base (id int primary key, email text, uname text);
@@ -435,14 +448,15 @@ CREATE UNIQUE INDEX ON mv_multi2(uname);
 UPDATE mv_multi2_base SET email = CASE id WHEN 1 THEN 'b@example.com'
                                           ELSE 'a@example.com' END;
 
--- XXX BUG: the upsert arbitrates on mv_multi2_email_idx and collides on
--- mv_multi2_uname_idx.
+-- XXX currently fails: the upsert arbitrates on mv_multi2_email_idx and then
+-- collides on mv_multi2_uname_idx.  See the note on the VERBOSITY guard above.
 \set VERBOSITY terse
 REFRESH MATERIALIZED VIEW mv_multi2 WHERE id IN (1, 2);
 \set VERBOSITY default
 SELECT * FROM mv_multi2 ORDER BY id;
 
--- The match/merge path deletes before inserting, so it applies the change.
+-- The match/merge path deletes before inserting, so it already applies the
+-- change; once the case above is fixed this is a no-op.
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_multi2 WHERE id IN (1, 2);
 SELECT * FROM mv_multi2 ORDER BY id;
 

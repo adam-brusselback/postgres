@@ -11,6 +11,11 @@
 #
 # The row locks are held to the end of the refreshing transaction, so a refresh
 # issued inside an explicit transaction block keeps them until COMMIT.
+#
+# All three claims hold today, so this spec passes; it is here to keep them from
+# regressing while the rest of the feature is reworked.  The claim it does not
+# cover is that overlapping refreshes never abort -- see
+# matview-where-deadlock.spec.
 
 setup
 {

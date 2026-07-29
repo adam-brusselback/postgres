@@ -10,6 +10,10 @@
 -- live in their own file to keep that state predictable, and they must run in
 -- the order written.
 --
+-- Every case here covers a known defect.  The expected output describes what
+-- the command should do, so they fail until the defect is fixed; each one is
+-- annotated with an XXX comment naming the behaviour seen today.
+--
 
 --
 -- Test 1: Renaming the materialized view
@@ -32,10 +36,14 @@ REFRESH MATERIALIZED VIEW mv_c WHERE id = 1;
 ALTER MATERIALIZED VIEW mv_c RENAME TO mv_c_renamed;
 UPDATE mv_c_base SET v = 'one-updated' WHERE id = 1;
 
--- XXX BUG: the cached plan still names the pre-rename relation.
+-- Must succeed and pick up the new value.
+-- XXX currently errors: the cached plan still names the pre-rename relation.
+-- The VERBOSITY guard keeps that failure to one line instead of also emitting
+-- the generated statement.
 \set VERBOSITY terse
 REFRESH MATERIALIZED VIEW mv_c_renamed WHERE id = 1;
 \set VERBOSITY default
+SELECT * FROM mv_c_renamed ORDER BY id;
 
 --
 -- Test 2: Another relation taking over the old name
@@ -54,13 +62,12 @@ CREATE UNIQUE INDEX ON mv_c(id);
 -- Refresh the *original* matview, by its current name.
 REFRESH MATERIALIZED VIEW mv_c_renamed WHERE id = 1;
 
--- XXX BUG: the refresh reported success but did nothing here.  Expected
--- (1, one-updated).
+-- XXX the refresh above reports success but does nothing here.
 SELECT * FROM mv_c_renamed ORDER BY id;
 
--- XXX BUG: ... and wrote to this unrelated matview instead, with data drawn
--- from the other matview's base table.  Expected (1, decoy-one).
--- Note that no lock and no MAINTAIN privilege check was ever taken on mv_c.
+-- XXX ... and writes to this unrelated matview instead, with data drawn from
+-- the other matview's base table.  No lock and no MAINTAIN privilege check was
+-- ever taken on mv_c.
 SELECT * FROM mv_c ORDER BY id;
 
 DROP MATERIALIZED VIEW mv_c;
@@ -93,7 +100,8 @@ SELECT pg_get_viewdef('mv_c2'::pg_catalog.regclass);
 
 REFRESH MATERIALIZED VIEW mv_c2 WHERE id = 1;
 
--- XXX BUG: filled from the decoy table.  Expected (1, real).
+-- XXX currently filled from the decoy table rather than from the table the
+-- view definition actually names.
 SELECT * FROM mv_c2 ORDER BY id;
 
 DROP MATERIALIZED VIEW mv_c2;
@@ -131,8 +139,7 @@ DO $$ BEGIN
   EXECUTE 'REFRESH MATERIALIZED VIEW mv_c3 WHERE id = $1' USING 4294967297::bigint;
 END $$;
 
--- XXX BUG: id = 1 was refreshed instead of id = 4294967297.  Expected
--- (1, orig-small) and (4294967297, new-large).
+-- XXX currently refreshes id = 1 instead of id = 4294967297.
 SELECT * FROM mv_c3 ORDER BY id;
 
 -- The match/merge path builds its SQL fresh every time, so it is unaffected.
