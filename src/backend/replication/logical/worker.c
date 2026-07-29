@@ -5732,7 +5732,7 @@ run_apply_worker(void)
 	 * We don't really use the output identify_system for anything but it does
 	 * some initializations on the upstream so let's still call it.
 	 */
-	(void) walrcv_identify_system(LogRepWorkerWalRcvConn, &startpointTLI);
+	(void) walrcv_identify_system(LogRepWorkerWalRcvConn, &startpointTLI, NULL);
 
 	set_apply_error_context_origin(originname);
 
@@ -5808,6 +5808,14 @@ InitializeLogRepWorker(void)
 	 * code (e.g. pg_index.indexprs).
 	 */
 	SetConfigOption("search_path", "", PGC_SUSET, PGC_S_OVERRIDE);
+
+	/*
+	 * Ignore default_transaction_read_only for logical replication workers,
+	 * as they need to be able to modify subscriber-side state regardless of
+	 * that setting.
+	 */
+	SetConfigOption("default_transaction_read_only", "off", PGC_SUSET,
+					PGC_S_OVERRIDE);
 
 	ApplyContext = AllocSetContextCreate(TopMemoryContext,
 										 "ApplyContext",
@@ -5977,8 +5985,18 @@ SetupApplyOrSyncWorker(int worker_slot)
 	 */
 
 	/* Initialise stats to a sanish value */
-	MyLogicalRepWorker->last_send_time = MyLogicalRepWorker->last_recv_time =
-		MyLogicalRepWorker->reply_time = GetCurrentTimestamp();
+	if (am_sequencesync_worker())
+	{
+		MyLogicalRepWorker->last_send_time =
+			MyLogicalRepWorker->last_recv_time =
+			MyLogicalRepWorker->reply_time = 0;
+	}
+	else
+	{
+		MyLogicalRepWorker->last_send_time =
+			MyLogicalRepWorker->last_recv_time =
+			MyLogicalRepWorker->reply_time = GetCurrentTimestamp();
+	}
 
 	/* Load the libpq-specific functions */
 	load_file("libpqwalreceiver", false);
