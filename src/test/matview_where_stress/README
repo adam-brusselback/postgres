@@ -1,8 +1,16 @@
-Stress reproducer: REFRESH MATERIALIZED VIEW ... WHERE ... lock ordering
-========================================================================
+Branch-local material for REFRESH MATERIALIZED VIEW ... WHERE ...
+================================================================
 
 This directory is NOT part of any test schedule and is not wired into either
-build system.  It exists because one of the failure modes of the non-concurrent
+build system.  Delete it before posting the patch to -hackers.  It holds the
+two things that do not belong in the patch itself:
+
+  ISSUES.md  Open review items, split into those raised on the -hackers thread
+             and those found separately, each mapped to the test that covers it.
+
+  run.sh     The stress reproducer described below.
+
+The reproducer exists because one of the failure modes of the non-concurrent
 partial refresh cannot be expressed deterministically as an isolation spec.
 
 The row-locking step of refresh_by_direct_modification() is

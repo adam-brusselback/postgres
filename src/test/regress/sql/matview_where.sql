@@ -1,9 +1,14 @@
 --
 -- REFRESH MATERIALIZED VIEW ... WHERE ...
 --
--- Tests 10 and up cover known defects.  Their expected output describes what
--- the command should do, so they fail until the defect is fixed; each one is
--- annotated with an XXX comment naming the behaviour seen today.
+-- Tests 10 and up were added while reviewing the patch against the -hackers
+-- thread "[Patch] Add WHERE clause support to REFRESH MATERIALIZED VIEW".  Each
+-- one says whether it came from that thread or was found separately, so that
+-- review items can be checked off against it.
+--
+-- Where a test covers a defect that is still unfixed, its expected output
+-- describes what the command should do, so the test fails until the defect is
+-- fixed, and an XXX comment names the behaviour seen today.
 --
 
 -- Setup
@@ -306,7 +311,40 @@ DROP TABLE mv_trigger_base;
 DROP FUNCTION maintain_mv_trigger_view();
 
 --
--- Test 10: NULL values in the unique key column
+-- Test 10: Unique index with INCLUDE columns
+--
+-- Reported on -hackers by Dharin Shah (repro test_include_bug.sql): the
+-- ON CONFLICT target was built from indnatts, so INCLUDE columns landed in it
+-- and the generated statement failed with "there is no unique or exclusion
+-- constraint matching the ON CONFLICT specification".  Fixed by using
+-- indnkeyatts; this is the regression guard, and it passes.
+--
+
+CREATE TABLE mv_incl_base (id int primary key, extra text, v text);
+INSERT INTO mv_incl_base VALUES (1, 'x', 'one'), (2, 'y', 'two');
+
+CREATE MATERIALIZED VIEW mv_incl AS SELECT id, extra, v FROM mv_incl_base;
+CREATE UNIQUE INDEX ON mv_incl(id) INCLUDE (extra);
+
+-- Change both a plain column and the INCLUDE column, so that the DO UPDATE SET
+-- list has to cover the INCLUDE column while the conflict target must not.
+UPDATE mv_incl_base SET extra = 'x2', v = 'one-updated' WHERE id = 1;
+
+REFRESH MATERIALIZED VIEW mv_incl WHERE id = 1;
+SELECT * FROM mv_incl ORDER BY id;
+
+-- The match/merge path builds its join quals from indnkeyatts as well.
+UPDATE mv_incl_base SET extra = 'y2', v = 'two-updated' WHERE id = 2;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_incl WHERE id = 2;
+SELECT * FROM mv_incl ORDER BY id;
+
+DROP MATERIALIZED VIEW mv_incl;
+DROP TABLE mv_incl_base;
+
+--
+-- Test 11: NULL values in the unique key column
+--
+-- Not yet reported on -hackers; found while writing these tests.
 --
 -- The direct-modification path resolves conflicts with ON CONFLICT, which
 -- arbitrates via the unique index.  A NULLS DISTINCT index never reports a
@@ -351,11 +389,17 @@ DROP MATERIALIZED VIEW mv_null;
 DROP TABLE mv_null_base;
 
 --
--- Test 11: Scope drift, direct-modification path
+-- Test 12: Scope drift, direct-modification path
+--
+-- Reported on -hackers by Adam Brusselback, who wrote that "both the
+-- direct-modification and match/merge paths resolve this by using an
+-- INSERT ... ON CONFLICT DO UPDATE step (or DO NOTHING if there are no non-key
+-- columns) against the arbiter index".  Only the direct-modification path does;
+-- refresh_by_match_merge()'s final insert is still a plain INSERT.
 --
 -- Test 7 above shows the match/merge path failing when a row drifts into the
--- predicate's scope.  The direct-modification path resolves the same case with
--- ON CONFLICT DO UPDATE, so the two paths disagree on identical input.
+-- predicate's scope.  This shows the direct-modification path resolving the
+-- same case, so the two paths disagree on identical input.
 --
 
 CREATE TABLE mv_drift2_base (id int primary key, category_id int);
@@ -389,11 +433,21 @@ DROP MATERIALIZED VIEW mv_drift2;
 DROP TABLE mv_drift2_base;
 
 --
--- Test 12: The predicate is parsed under a restricted search_path
+-- Test 13: What the predicate can reference
 --
--- REFRESH switches to the matview's owner and calls RestrictSearchPath(), so
--- the predicate is analyzed with search_path set to "pg_catalog, pg_temp".
--- Objects the caller can see unqualified are not visible to the predicate.
+-- The subquery half was reported on -hackers by Dharin Shah, who noted that
+-- the script claimed "Subqueries -> Error" while the expected output showed
+-- none, and that nothing in transformRefreshWhereClause() forbids them.  The
+-- comment has been removed; a schema-qualified subquery is allowed, and this
+-- is the regression guard for that.
+--
+-- The unqualified half is not reported on -hackers.  REFRESH switches to the
+-- matview's owner and calls RestrictSearchPath(), so the predicate is analyzed
+-- with search_path set to "pg_catalog, pg_temp" and cannot see objects the
+-- caller sees unqualified.  Unlike the other defects in this file, this one
+-- records current behaviour rather than asserting a fix: restricting the path
+-- is what makes the owner-privilege model tractable, so what should happen here
+-- depends on how the privilege question is settled.
 --
 
 CREATE TABLE mv_sp_base (id int primary key, v text);
@@ -407,10 +461,6 @@ INSERT INTO mv_sp_ids VALUES (1);
 SHOW search_path;
 
 -- An unqualified reference fails even though "public" is in search_path.
--- Unlike the other cases in this file, this one records current behaviour
--- rather than asserting a fix: restricting the path is what makes the
--- owner-privilege model tractable, so what should happen here depends on how
--- the privilege question is settled.
 REFRESH MATERIALIZED VIEW mv_sp WHERE id IN (SELECT id FROM mv_sp_ids);
 
 -- Schema-qualifying it works.
@@ -422,10 +472,12 @@ DROP MATERIALIZED VIEW mv_sp;
 DROP TABLE mv_sp_base;
 
 --
--- Test 13: More than one unique index
+-- Test 14: More than one unique index
 --
--- The direct-modification path picks a single arbiter index, so a change that
--- a full or concurrent refresh applies cleanly can fail on a second index.
+-- Not yet reported on -hackers; found while writing these tests.  Test 8 above
+-- covers a change that happens to arbitrate cleanly; this covers one that does
+-- not.  The direct-modification path picks a single arbiter index, so a change
+-- that a full or concurrent refresh applies cleanly can fail on a second index.
 --
 -- NB: while this case still fails, it must stay last in this file.  The error
 -- escapes refresh_by_direct_modification() between

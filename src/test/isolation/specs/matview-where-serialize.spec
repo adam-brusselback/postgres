@@ -1,5 +1,13 @@
 # REFRESH MATERIALIZED VIEW ... WHERE ... concurrency model
 #
+# Asked for on -hackers by Dharin Shah ("I think it would help the patch to
+# explicitly define the intended safety model") and by Vellaipandiyan ("It may
+# also help to document the intended guarantees around overlapping partial
+# refreshes and concurrent DML on base tables").  Adam Brusselback answered with
+# a written-out set of guarantees; this spec is the executable form of the three
+# that concern overlapping refreshes.  The prose itself has not landed in the
+# docs yet, which remains an open review item.
+#
 # The non-concurrent partial refresh takes only RowExclusiveLock, and relies on
 # a "SELECT ... FOR UPDATE" over the rows matching the predicate to serialize
 # against other partial refreshes.  This spec pins down the three claims that

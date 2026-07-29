@@ -2,10 +2,14 @@
 -- REFRESH MATERIALIZED VIEW ... WHERE ... : privileges and session state
 --
 -- These tests exercise the security boundary of the WHERE clause and the
--- session-level matview maintenance flag.  Every case covers a known defect:
--- the expected output describes what the command should do, so they fail until
--- the defect is fixed, and each one is annotated with an XXX comment naming the
--- behaviour seen today.
+-- session-level matview maintenance flag.  Each one says whether it came from
+-- the -hackers thread "[Patch] Add WHERE clause support to REFRESH MATERIALIZED
+-- VIEW" or was found separately, so that review items can be checked off
+-- against it.
+--
+-- Every case covers a live defect.  The expected output describes what the
+-- command should do, so they fail until the defect is fixed, and an XXX comment
+-- names the behaviour seen today.
 --
 -- Where the correct outcome is "the statement is rejected", the statement is
 -- wrapped in a block that reports the SQLSTATE instead of letting the message
@@ -19,6 +23,12 @@
 
 --
 -- Test 1: The predicate must not run with the matview owner's privileges
+--
+-- Reported on -hackers by Zsolt Parragi: "The patch in its current form has a
+-- security escalation bug, WHERE functions are executed with the privileges of
+-- the owner, not the maintainer."  Acknowledged by Adam Brusselback, who
+-- proposed allowing MAINTAIN callers only when every function in the predicate
+-- is leakproof and requiring ownership otherwise.  This is Zsolt's repro.
 --
 -- RefreshMatViewByOid() switches to the owner before analyzing or executing
 -- anything, so functions named in a caller-supplied predicate run as the
@@ -94,6 +104,13 @@ DROP ROLE regress_matview_owner;
 --
 -- Test 2: The predicate must not run inside the matview maintenance window
 --
+-- Not reported on -hackers.  Related to Zsolt Parragi's escalation report
+-- above, but distinct from it and not covered by the leakproof gating proposed
+-- in reply: the predicate runs not only as the owner but with matview write
+-- protection switched off, which is exposure the full and concurrent refresh
+-- paths do not have, since the statements they run inside that window contain
+-- no user-supplied expressions.
+--
 -- OpenMatViewIncrementalMaintenance() is called before the SPI statements that
 -- evaluate the predicate, so a predicate function is exempt from the "cannot
 -- change materialized view" check -- and that exemption is global, not scoped
@@ -157,6 +174,14 @@ DROP TABLE matview_mw_base;
 
 --
 -- Test 3: matview_maintenance_depth must not leak when a refresh fails
+--
+-- Reported on -hackers by Zsolt Parragi: "There's also another issue where an
+-- error during refresh removes the modification restrictions."  Diagnosed by
+-- Adam Brusselback as "a missing PG_TRY around the
+-- OpenMatViewIncrementalMaintenance()/Close pair in the direct-modification
+-- path (the match/merge site already handles it)", with "Will fix".  This is
+-- Zsolt's repro, extended to show that the exemption is not scoped to the
+-- matview being refreshed.
 --
 -- refresh_by_direct_modification() has no PG_TRY between
 -- OpenMatViewIncrementalMaintenance() and its matching Close (compare the

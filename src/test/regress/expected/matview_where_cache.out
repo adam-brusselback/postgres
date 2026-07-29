@@ -10,9 +10,14 @@
 -- live in their own file to keep that state predictable, and they must run in
 -- the order written.
 --
--- Every case here covers a known defect.  The expected output describes what
--- the command should do, so they fail until the defect is fixed; each one is
--- annotated with an XXX comment naming the behaviour seen today.
+-- None of the cases in this file were reported on -hackers; the plan cache had
+-- not come up in the thread "[Patch] Add WHERE clause support to REFRESH
+-- MATERIALIZED VIEW" at all.  They were found by reviewing the cache against
+-- the plancache contract.
+--
+-- Every case covers a live defect.  The expected output describes what the
+-- command should do, so they fail until the defect is fixed, and an XXX comment
+-- names the behaviour seen today.
 --
 --
 -- Test 1: Renaming the materialized view

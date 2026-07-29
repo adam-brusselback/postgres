@@ -1,5 +1,13 @@
 # REFRESH MATERIALIZED VIEW ... WHERE ... lock ordering
 #
+# Reported on -hackers by Vellaipandiyan: "I wonder whether overlapping
+# refreshes could still encounter deadlock scenarios around UPSERT conflicts."
+# Adam Brusselback confirmed that the locking SELECT had no ORDER BY, so "two
+# overlapping refreshes could lock the existing rows in different physical orders
+# and deadlock", and said the next patch would give it "a deterministic ORDER BY
+# on the unique key columns".  That ORDER BY is not in the tree yet, and would
+# not resolve the permutation below in any case -- see the note further down.
+#
 # The non-concurrent partial refresh locks the matview rows matching its
 # predicate with "SELECT 1 FROM matview WHERE (predicate) FOR UPDATE", and those
 # locks are held until the refreshing transaction ends.  Nothing establishes a
