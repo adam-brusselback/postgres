@@ -16,7 +16,7 @@ checks AS (
   -- Every workload the suite defines either produced rows or was deliberately
   -- skipped.  'recursive' produced none in six consecutive runs and nothing
   -- said so; the sweep reported success each time.
-  SELECT 1 AS ord, 'workloads present' AS check,
+  SELECT 1 AS ord, 'workloads present' AS "check",
          (SELECT count(*) FROM bench_workload)::text || ' defined, ' ||
          (SELECT count(DISTINCT workload) FROM r)::text || ' measured' AS detail,
          (SELECT count(DISTINCT workload) FROM r) =
@@ -67,8 +67,8 @@ checks AS (
          ' missing or zero',
          NOT EXISTS (SELECT 1 FROM r WHERE full_ms IS NULL OR full_ms <= 0)
 )
-SELECT CASE WHEN ok THEN 'pass' ELSE 'FAIL' END AS "",
-       check, detail
+SELECT CASE WHEN ok THEN 'pass' ELSE 'FAIL' END AS result,
+       "check", detail
   FROM checks ORDER BY ord;
 
 SELECT CASE

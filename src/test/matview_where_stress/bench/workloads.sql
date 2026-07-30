@@ -109,6 +109,17 @@ INSERT INTO bench_workload VALUES
  'bucket', '(:scale/1000)',
  $$bucket = :k$$, $$bucket = ANY(:arraylit)$$, $$bucket BETWEEN :k AND :k + :span - 1$$),
 
+-- Sweep this one at a single (shape, span) and no more.  The predicate cannot
+-- push into the recursive term, so every partial refresh evaluates the whole
+-- closure and then filters it: measured across scope 1 and scope 29, and across
+-- all three predicate shapes, the latency is 1147-1246 ms -- one constant, and
+-- the spread is noise.  Sweeping seven combinations measures it seven times, at
+-- roughly four minutes each because reaching thirty refreshes at 0.8 tps takes
+-- forty seconds a measurement.
+--
+-- Keep the workload.  It is the shape where a partial refresh is worst, which
+-- is worth being able to state, and it starts measuring something the moment
+-- push-down into the recursive term exists.
 (8,'recursive','predicate may not push into the recursive term at all',
  $$CREATE TABLE edge(child int, parent int, primary key(child,parent));
    INSERT INTO edge SELECT g, g/2 FROM generate_series(1,:scale) g;

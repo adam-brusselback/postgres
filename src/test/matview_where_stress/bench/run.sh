@@ -182,9 +182,12 @@ for w in $(list "$WORKLOADS"); do
        settle                       # bloat from the previous combination is
                                     # not an input to this one
        BEST_TPS=0; BEST_LAT=; BEST_TXN=0
+       # Carried across repeats: the first one discovers how long this
+       # combination needs to reach MINTXN, and resetting it per repeat made
+       # every repeat re-walk the same ladder from 5s.
+       t=$TIME
        i=0; while [ $i -lt "$REPEAT" ]; do
          i=$((i+1))
-         t=$TIME
          # A measurement is only as good as the number of refreshes it saw.
          # At --time 5 the recursive workload got four, and four samples
          # reported to two decimal places looks exactly like four thousand.
@@ -202,7 +205,7 @@ for w in $(list "$WORKLOADS"); do
              break; fi
            t=$(( t * MINTXN / (N > 0 ? N : 1) + 1 ))
            [ "$t" -gt "$MAXTIME" ] && t=$MAXTIME
-           echo "   extend $w $shape span=$span $form: $N txns in ${TIME}s, retrying at ${t}s"
+           echo "   extend $w $shape span=$span $form: $N txns, retrying at ${t}s"
          done
          [ -n "$T" ] || continue
          if [ "$(echo "$T > $BEST_TPS" | bc -l 2>/dev/null || echo 1)" = 1 ]; then

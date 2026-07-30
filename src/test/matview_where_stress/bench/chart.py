@@ -94,6 +94,24 @@ def label_of(r):
     return f"{r['workload']} · {r['predshape']} span {r['span']}"
 
 
+# A normalised cost this far above 1 cannot share a log axis with values near
+# 1 without compressing them into a few pixels.  Splitting is stated on the
+# page, with the separated values printed in full -- an outlier that is quietly
+# dropped and an outlier that is quietly rescaled are both lies about the data.
+OUTLIER = 1000
+
+
+def split_outliers(rows):
+    by_wl = {}
+    for r in rows:
+        by_wl.setdefault(r['workload'], []).append(r)
+    main, aside = [], []
+    for rs in by_wl.values():
+        lo = min(min(r['spi_norm'], r['qt_norm']) for r in rs)
+        (aside if lo > OUTLIER else main).extend(rs)
+    return main, aside
+
+
 # ------------------------------------------------------------------ charts --
 
 def chart_dumbbell(rows):
@@ -255,6 +273,45 @@ def corr(a, b):
     return num / den if den else 0.0
 
 
+def render_aside(aside):
+    """Whatever could not share the axis, printed rather than hidden."""
+    if not aside:
+        return ''
+    wl = sorted({r['workload'] for r in aside})
+    lo = min(min(r['spi_norm'], r['qt_norm']) for r in aside)
+    hi = max(max(r['spi_norm'], r['qt_norm']) for r in aside)
+    ms = sorted(r['spi_ms'] for r in aside)
+    rows_html = ''.join(
+        f"<tr><td class=\"mono\">{esc(r['workload'])}</td>"
+        f"<td class=\"mono\">{esc(r['predshape'])} {r['span']}</td>"
+        f"<td class=\"n\">{r['scope_rows']:,}</td>"
+        f"<td class=\"n\">{r['spi_norm']:,.0f}&times;</td>"
+        f"<td class=\"n\">{r['qt_norm']:,.0f}&times;</td>"
+        f"<td class=\"n\">{r['spi_ms']:,.0f}</td>"
+        f"<td class=\"n\">{r['qt_ms']:,.0f}</td></tr>"
+        for r in sorted(aside, key=lambda r: (r['predshape'], r['span'])))
+    return f"""
+  <section class="panel">
+    <h2>{esc(', '.join(wl))}, which is off the scale above and stays off it</h2>
+    <p class="read">Between {lo:,.0f}&times; and {hi:,.0f}&times; a full
+      rebuild&rsquo;s per-row cost &mdash; more than three decades above
+      everything else, which is why it is printed here instead of compressing
+      the chart above into a few pixels. The predicate cannot push into the
+      recursive term, so every partial refresh evaluates the whole closure and
+      then filters it. That makes the latency a constant: {min(ms):,.0f} to
+      {max(ms):,.0f} ms whether the predicate selects one row or twenty-nine.
+      Swept at three combinations rather than seven for that reason &mdash;
+      the other four would re-measure the same number. It becomes worth
+      sweeping properly if push-down into the recursive term is ever
+      implemented.</p>
+    <div class="tablewrap"><table><thead><tr>
+      <th>workload</th><th>shape / span</th><th class="n">scope rows</th>
+      <th class="n">spi &times;full</th><th class="n">querytree &times;full</th>
+      <th class="n">spi ms</th><th class="n">querytree ms</th>
+    </tr></thead><tbody>{rows_html}</tbody></table></div>
+  </section>"""
+
+
 def build(rows, label):
     pcts = sorted(r['pct'] for r in rows)
     n = len(rows)
@@ -264,7 +321,9 @@ def build(rows, label):
                    [r['pct'] for r in rows])
     r_total = corr([r['spi_ms'] for r in rows],
                    [r['spi_ms'] - r['qt_ms'] for r in rows])
-    norms = [r['spi_norm'] for r in rows]
+    main, aside = split_outliers(rows)
+    aside_html = render_aside(aside)
+    norms = [r['spi_norm'] for r in main]
     pays = sum(1 for r in rows if r['spi_ms'] < r['full_ms'])
     meta = rows[0]
     min_txns = min(min(r['spi_txns'] or 0, r['qt_txns'] or 0) for r in rows)
@@ -301,9 +360,11 @@ def build(rows, label):
         assertions=esc(meta['assertions']),
         sync=esc(meta['sync']), clients=meta['clients'],
         r_scope=f'{r_scope:+.2f}', r_total=f'{r_total:+.2f}',
-        chart_db=chart_dumbbell(rows),
-        chart_curve=chart_cost_curve(rows),
+        chart_db=chart_dumbbell(main),
+        chart_curve=chart_cost_curve(main),
         chart_wl=chart_by_workload(rows),
+        aside=aside_html,
+        norm_hi_main=f'{max(r["spi_norm"] for r in main):,.0f}',
         table=''.join(table))
 
 
@@ -449,7 +510,7 @@ TEMPLATE = """<title>Partial refresh: Query tree vs generated SQL</title>
   <div class="kpis">
     <div class="kpi"><div class="v sm">{norm_lo}&times; &ndash;
       {norm_hi}&times;</div>
-      <div class="k">what a partial refresh costs per row</div></div>
+      <div class="k">per-row cost, excluding recursive</div></div>
     <div class="kpi"><div class="v">{pays}<span
       style="color:var(--muted);font-size:19px"> / {n}</span></div>
       <div class="k">faster than a full rebuild outright</div></div>
@@ -489,6 +550,8 @@ TEMPLATE = """<title>Partial refresh: Query tree vs generated SQL</title>
       <span><i class="sw"></i>querytree</span>
     </div>
   </section>
+
+  {aside}
 
   <section class="panel">
     <h2>What the Query tree saves, by workload</h2>

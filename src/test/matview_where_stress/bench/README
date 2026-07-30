@@ -21,7 +21,13 @@ worth it if it isolates something none of these do.
   nonkey       predicate on an indexed NON-key column -- the shape whose
                disjoint scopes are supposed to refresh in parallel
   timerange    range predicate over buckets: large scope, bare form
-  recursive    the predicate may not push into the recursive term at all
+  recursive    the predicate may not push into the recursive term at all.
+               Sweep one combination only: every partial refresh evaluates the
+               whole closure and then filters, so latency is a constant --
+               1147-1246 ms across scope 1, scope 29 and all three predicate
+               shapes -- and the other six combinations re-measure it at four
+               minutes each.  It starts saying something new if push-down into
+               the recursive term is ever implemented.
 
 Sweep axes: --scales --groups --spans --forms --shapes --clients --overlap
 --mutate --sync.  Give any of them a comma-separated list.
