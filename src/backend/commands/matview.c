@@ -44,6 +44,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
+#include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -1428,6 +1429,15 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	/* Execute: lock matching rows, then run the refresh CTE. */
 	if (matview_execute_spi_plan(cacheEntry->lockPlan, params, false) < 0)
 		elog(ERROR, "SPI_execute_plan failed during lock acquisition");
+
+	/*
+	 * The two statements take separate snapshots, so a base-table change that
+	 * commits here is invisible to the locking step above and visible to the
+	 * refreshing step below.  The window is microseconds wide in practice; the
+	 * injection point lets a test land inside it deterministically.  See
+	 * src/test/modules/injection_points/specs/matview-where-snapshot.spec.
+	 */
+	INJECTION_POINT("matview-where-locked", NULL);
 
 	if (matview_execute_spi_plan(cacheEntry->refreshPlan, params, false) < 0)
 		elog(ERROR, "SPI_execute_plan failed during refresh");

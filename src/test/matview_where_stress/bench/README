@@ -38,6 +38,23 @@ vs_full_per_row * scope_rows < mv_rows; report.sql prints that verdict.
 Three things that will otherwise bite you
 -----------------------------------------
 
+0. `make clean` AFTER EVERY `configure`.  This tree is configured without
+   --enable-depend, so `autodepend` is empty in src/Makefile.global and no
+   .deps files are generated.  make therefore has no idea that any .o depends
+   on pg_config.h: change a configure flag, rebuild, and it relinks the stale
+   objects and reports success.  The binary is new, its contents are not.
+
+   This has produced two silently wrong builds here -- an "-O2" build that was
+   still -O0 with assertions on and benchmarked identically to the debug one,
+   and an "--enable-injection-points" build whose server answered "injection
+   points are not supported by this build".  Both said "configured / built /
+   installed".
+
+   Verify, do not assume.  `SHOW debug_assertions` for cassert, and
+   `find src/backend -name '*.o' -newer src/include/pg_config.h | wc -l`
+   should be ~893 after a configure change, not 1.  Or configure the tree
+   with --enable-depend once and stop having to think about it.
+
 1. RECORD THE BUILD.  bench_result stores pg_version and debug_assertions and
    run.sh warns when assertions are on.  A -O0 --enable-cassert number is not
    comparable with a -O2 one -- not even as a ratio.  Both were tried here and
