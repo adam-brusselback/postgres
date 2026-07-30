@@ -159,14 +159,22 @@ it.
 Four mutations, each the kind of change a performance pass would plausibly
 make, against every gate in the tree:
 
-| mutation | regress | isolation | oracle | A5 stress | a3 gap |
-|---|---|---|---|---|---|
-| M1 · drop `ORDER BY` from the row-locking `SELECT` | pass | pass | pass | **pass** | pass |
-| M2 · drop `ORDER BY` from `new_data` | pass | pass | pass | pass | pass |
-| M3 · remove the row-locking `SELECT` entirely | pass | **FAIL** | pass | pass | pass |
-| M4 · `new_data` `NOT MATERIALIZED` | pass | pass | pass | pass | pass |
+| mutation | regress | isolation | oracle | A5 stress | a3 gap | verdict |
+|---|---|---|---|---|---|---|
+| M1 · drop `ORDER BY` from the row-locking `SELECT` | pass | pass | pass | **FAIL** after the fix below | pass | caught |
+| M2 · drop `ORDER BY` from `new_data` | pass | pass | pass | pass | pass | **uncovered** |
+| M3 · remove the row-locking `SELECT` entirely | pass | **FAIL** | pass | pass | pass | caught |
+| M4 · `new_data` `NOT MATERIALIZED` | pass | pass | pass | pass | pass | **benign, nothing to catch** |
 
-Three of four are invisible. Reading across:
+M4 is not a coverage gap. `NOT MATERIALIZED` inlines the CTE but keeps everything
+in one statement, so base-table reads still share one snapshot and both
+references see the same rows — it costs a second scan and changes nothing else.
+Verified by driving the real `REFRESH` with a concurrent base-table insert
+landing before it: pristine and mutated trees both produce the correct row
+(`3|999`, zero divergence) and neither deadlocks. So the honest count is **one
+genuinely uncovered mutation, M2**, not three.
+
+Reading across the rest:
 
 - **`regress` cannot see any of it.** All 22 tests are single-session; none of
   these mutations changes a single-session result.
@@ -189,15 +197,44 @@ M1's silence was the useful result. A test that passes both with and without
 the fix it was written for is worse than no test, because the tracker was
 counting it as the red assertion for A5.
 
-Still missing, and needed before any optimisation work:
+### This is expressible in the built-in suites
 
-1. an isolation spec for the `new_data` snapshot hazard (M4) — the
-   `a3-split-gap.sh` scenario driven through the real `REFRESH` rather than
-   hand-written SQL;
-2. a gate for insert-order lock ordering (M2) — the locking `SELECT` only
-   covers rows that already exist, so rows the refresh *inserts* take their
-   locks in `new_data` order;
-3. `a3-split-gap.sh` promoted from a demonstration to a test.
+The gap is not a limitation of PostgreSQL's test infrastructure — it is a gap in
+what has been written. Three built-in mechanisms, in ascending power:
+
+1. **`isolationtester`** already covers anything expressible as step-at-a-time
+   interleaving, and two specs here use it. What it cannot do is hold two
+   sessions simultaneously *mid-statement*, which is exactly what M1 and M2
+   need, because a partial refresh takes all its row locks inside one statement.
+
+2. **Injection points** remove that limitation, and they are already in this
+   tree: `src/test/modules/injection_points`, with **ten isolation specs**
+   using them — including `heap_lock_update.spec` and `repack.spec`, which are
+   the same class of problem (an intra-statement race in a heap-rewriting
+   command). An `INJECTION_POINT()` between the row-locking `SELECT` and the
+   CTE lets a spec park session A mid-refresh while session B acts, so M1 and
+   M2 become deterministic isolation tests rather than a probabilistic shell
+   loop. Requires `--enable-injection-points`, and the specs live under
+   `src/test/modules/injection_points/specs/`, which `make check-world` runs.
+
+3. **TAP tests** (`--enable-tap-tests`) can drive genuine parallelism via
+   `background_psql`, which is what the stress reproducer does by hand. This is
+   the fallback if a hazard resists being pinned to a single injection point.
+
+So `src/test/matview_where_stress/run.sh` should not ship as a shell script at
+all. Its logic belongs in an injection-point isolation spec, where it is
+deterministic, runs under the standard suites, and does not depend on winning a
+race often enough to notice.
+
+Still to write, before any optimisation work:
+
+1. an injection-point isolation spec for lock ordering, covering **both** M1 and
+   M2 — the locking `SELECT` only covers rows that already exist, so rows the
+   refresh *inserts* take their locks in `new_data` order and nothing tests that;
+2. `a3-split-gap.sh` promoted from a demonstration to a test — it currently
+   hand-writes two-statement SQL against a plain table rather than driving the
+   real `REFRESH`, which is why it missed M4 (correctly, as it turns out, but it
+   would also have missed a real version of that hazard).
 
 ---
 
