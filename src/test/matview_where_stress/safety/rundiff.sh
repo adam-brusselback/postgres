@@ -4,11 +4,21 @@
 #
 #   ./rundiff.sh [PORT] [DB] [FORM_A] [FORM_B]
 #
-# Defaults to bare against concurrently, which are the two implementations that
-# exist today.  When the Query-tree path lands behind its GUC, these two
-# arguments become the two settings and nothing else changes -- which is the
-# point of building and calibrating it now rather than on the first day of
-# Phase 2.  See diff_driver.sql.
+# FORM_A and FORM_B are any two of:
+#
+#   bare          match/merge
+#   concurrently  direct modification, GUC left as the session has it
+#   spi           direct modification from the view's deparsed SQL text
+#   querytree     direct modification from the view's Query tree
+#
+# Defaults to bare against concurrently, which is the pair this harness was
+# calibrated on.  The Phase 2 comparison is
+#
+#   ./rundiff.sh 5610 postgres spi querytree
+#
+# one implementation of direct modification against the other.  Building and
+# calibrating it before the second implementation existed is the point; see
+# diff_driver.sql.
 #
 # Kept out of run.sh deliberately: calibrate.sh compares against a recorded
 # vector of that script's output, and quietly adding rows to it would invalidate

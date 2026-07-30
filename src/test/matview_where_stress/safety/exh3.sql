@@ -108,7 +108,38 @@ INSERT INTO probe_exh VALUES
      FROM generate_series(1,12) i
    UNION ALL SELECT format('UPDATE b SET bcol=NULL WHERE id=%s',i),
           format('a = %s AND (bcol IS NULL OR bcol = %s)',i%3,i%4)
-     FROM generate_series(1,12) i$$);
+     FROM generate_series(1,12) i$$),
+
+-- Every predicate in cases 1-21 compares numbers.  That is not a property of
+-- the feature, it is an accident of how the corpus was written, and it hid a
+-- real bug: the transformed WHERE clause never had collations assigned, which a
+-- deparse does not notice because the text goes back through the parser and
+-- gets them the second time.  Executing that tree directly failed on "tag =
+-- 'hot'" with "could not determine which collation to use", and the whole
+-- corpus stayed green through it.  So: a text key and a text predicate, in both
+-- the equality and the range form -- each of which resolves a collation, and
+-- the range one at run time rather than only at plan time.
+--
+-- Every mutation is paired with a predicate covering the group the mutated row
+-- is in.  A first draft was not, and moved rows between groups with a fixed
+-- range predicate, so most mutations landed outside the refresh's scope and the
+-- case diverged 9 times while claiming to be SAFE.  That is the same mistake
+-- case 19 made, and the label is not the thing to change: a case whose
+-- mutations fall outside its own predicate is not testing what it says.
+('22','text_key','text key, equality and range predicates that need a collation','SAFE',
+ $$CREATE TABLE b(id int primary key, tag text, v int);
+   INSERT INTO b SELECT x, 't' || (x%4), x*10 FROM generate_series(1,12) x;$$,
+ $$SELECT tag, sum(v) AS total FROM b GROUP BY tag$$, '(tag)',
+ $$SELECT format('UPDATE b SET v=%s WHERE id=%s',v,i),
+          format($q$tag = 't%s'$q$,i%4)
+     FROM generate_series(1,12) i, unnest(ARRAY[0,99]) v
+   UNION ALL SELECT format('DELETE FROM b WHERE id=%s',i),
+                   format($q$tag = 't%s'$q$,i%4)
+     FROM generate_series(1,12) i
+   UNION ALL SELECT format('UPDATE b SET v=%s WHERE id=%s',v,i),
+                   $q$tag > 't1'$q$
+     FROM generate_series(1,12) i, unnest(ARRAY[0,99]) v
+    WHERE i % 4 > 1$$);
 
 -- Case 20 declares a second unique index, so it carries nine values where the
 -- cases above carry eight.  A multi-row VALUES list has to be uniform, so it

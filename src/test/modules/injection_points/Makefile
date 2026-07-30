@@ -22,7 +22,8 @@ ISOLATION = basic \
 	    syscache-update-pruned \
 	    wait_cleanup \
 	    heap_lock_update \
-	    matview-where-snapshot
+	    matview-where-snapshot \
+	    matview-where-prune-gap
 
 # some isolation tests require wal_level=replica
 ISOLATION_OPTS = --temp-config $(top_srcdir)/src/test/modules/injection_points/extra.conf

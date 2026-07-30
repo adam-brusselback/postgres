@@ -5,18 +5,20 @@
 -- any divergence is a rewrite bug, localised to one mutation, with no need to
 -- reason about whether the old behaviour was correct.
 --
--- The new implementation does not exist yet, so this cannot be instantiated
--- that way today.  What it CAN be instantiated as is the pair that already
--- exists -- the bare form (match/merge) against CONCURRENTLY (direct
--- modification) -- which are two genuinely different implementations of one
--- contract, and which the contract file states must agree (Promise 7).
+-- Four form names, which is three comparisons worth having:
 --
--- That matters for more than symmetry.  A harness built now and verified now
--- is a harness that works on the first day of Phase 2; a harness written
--- against an implementation that does not exist yet is a harness nobody has
--- seen catch anything, which is the defect this directory keeps finding.  When
--- the Query-tree path lands, the two form strings below become the two GUC
--- settings and nothing else here changes.
+--   bare          match/merge, the non-CONCURRENTLY spelling
+--   concurrently  direct modification, whatever the GUC currently says
+--   spi           direct modification from the view's deparsed SQL text
+--   querytree     direct modification from the view's Query tree
+--
+-- bare vs concurrently is the pair that existed before Phase 2 and is what
+-- this harness was verified on.  spi vs querytree is what it was built for:
+-- one implementation against the other, so any divergence is a rewrite bug
+-- localised to a single mutation, with no need to argue about which of the two
+-- was right.  A harness written against an implementation that did not exist
+-- yet would have been a harness nobody had seen catch anything, which is the
+-- defect this directory keeps finding; this one was calibrated first.
 --
 -- Note what this sees that the oracle does not.  The oracle compares each form
 -- against a FULL refresh, so a bug present in both forms, or one that makes a
@@ -33,13 +35,24 @@ CREATE OR REPLACE FUNCTION run_diff(p_id text, p_a text, p_b text) RETURNS text
 LANGUAGE plpgsql AS $fn$
 DECLARE
   c probe_exh; m record; n bigint;
-  conc_a text; conc_b text;
+  conc_a text; conc_b text; qt_a text; qt_b text;
   tot int := 0; bad int := 0; ea int := 0; eb int := 0;
   fm text; fp text; fd bigint;
 BEGIN
   SELECT * INTO c FROM public.probe_exh WHERE id = p_id;
-  conc_a := CASE WHEN p_a = 'concurrently' THEN 'CONCURRENTLY ' ELSE '' END;
-  conc_b := CASE WHEN p_b = 'concurrently' THEN 'CONCURRENTLY ' ELSE '' END;
+
+  IF p_a NOT IN ('bare','concurrently','spi','querytree')
+     OR p_b NOT IN ('bare','concurrently','spi','querytree') THEN
+    RAISE EXCEPTION 'unknown refresh form: % / %', p_a, p_b;
+  END IF;
+
+  conc_a := CASE WHEN p_a = 'bare' THEN '' ELSE 'CONCURRENTLY ' END;
+  conc_b := CASE WHEN p_b = 'bare' THEN '' ELSE 'CONCURRENTLY ' END;
+
+  -- Only the two named forms move the GUC; 'concurrently' leaves whatever the
+  -- session already had, so an outer PGOPTIONS setting still means something.
+  qt_a := CASE p_a WHEN 'querytree' THEN 'on' WHEN 'spi' THEN 'off' END;
+  qt_b := CASE p_b WHEN 'querytree' THEN 'on' WHEN 'spi' THEN 'off' END;
 
   FOR m IN EXECUTE 'SELECT * FROM (' || c.mutspace || ') s(mut, pred)' LOOP
     tot := tot + 1;
@@ -68,10 +81,16 @@ BEGIN
       -- shape -- direct modification collides on a non-arbiter index where
       -- match/merge does not.
       BEGIN
+        IF qt_a IS NOT NULL THEN
+          EXECUTE 'SET matview_partial_refresh_querytree = ' || qt_a;
+        END IF;
         EXECUTE 'REFRESH MATERIALIZED VIEW ' || conc_a || 'probe.mv_a WHERE ' || m.pred;
       EXCEPTION WHEN OTHERS THEN ea := ea + 1;
       END;
       BEGIN
+        IF qt_b IS NOT NULL THEN
+          EXECUTE 'SET matview_partial_refresh_querytree = ' || qt_b;
+        END IF;
         EXECUTE 'REFRESH MATERIALIZED VIEW ' || conc_b || 'probe.mv_b WHERE ' || m.pred;
       EXCEPTION WHEN OTHERS THEN eb := eb + 1;
       END;

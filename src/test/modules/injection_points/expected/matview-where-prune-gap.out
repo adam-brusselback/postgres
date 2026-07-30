@@ -1,0 +1,34 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_wide s2_add s2_narrow s2_wake s1_noop s2_detach s3_state
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_wide: REFRESH MATERIALIZED VIEW CONCURRENTLY mvgap WHERE tag = 'hot'; <waiting ...>
+step s2_add: INSERT INTO mvgap_base VALUES (9, 'hot', 90);
+step s2_narrow: REFRESH MATERIALIZED VIEW CONCURRENTLY mvgap WHERE id = 9;
+step s2_wake: SELECT injection_points_wakeup('matview-where-source-materialized');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_wide: <... completed>
+step s1_noop: 
+step s2_detach: SELECT injection_points_detach('matview-where-source-materialized');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step s3_state: SELECT id, tag, v FROM mvgap ORDER BY id;
+id|tag | v
+--+----+--
+ 1|hot |10
+ 2|hot |20
+ 3|cold|30
+ 9|hot |90
+(4 rows)
+

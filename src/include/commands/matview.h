@@ -21,6 +21,14 @@
 #include "utils/relcache.h"
 
 
+/*
+ * Build a partial refresh's source rows from the view's Query tree instead of
+ * from its deparsed SQL text.  Scaffolding: it exists so that the two
+ * implementations can be compared against each other at run time while the
+ * rewrite is in progress, and goes away with the text path.
+ */
+extern PGDLLIMPORT bool matview_partial_refresh_querytree;
+
 extern void SetMatViewPopulatedState(Relation relation, bool newstate);
 
 extern ObjectAddress ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,

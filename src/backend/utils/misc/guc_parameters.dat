@@ -1975,6 +1975,14 @@
   max => 'MAX_KILOBYTES',
 },
 
+{ name => 'matview_partial_refresh_querytree', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Builds a partial refresh from the view query tree rather than from its SQL text.',
+  long_desc => 'Both settings must produce the same materialized view contents; this exists so the two can be compared while the query-tree implementation is being developed.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'matview_partial_refresh_querytree',
+  boot_val => 'false',
+},
+
 { name => 'max_active_replication_origins', type => 'int', context => 'PGC_POSTMASTER', group => 'REPLICATION_SUBSCRIBERS',
   short_desc => 'Sets the maximum number of active replication origins.',
   variable => 'max_active_replication_origins',

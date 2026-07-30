@@ -30,16 +30,20 @@
 #include "commands/tablespace.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
+#include "executor/tstoreReceiver.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "optimizer/optimizer.h"
 #include "parser/parse_clause.h"
 #include "parser/parse_coerce.h"
+#include "parser/parse_collate.h"
 #include "parser/parse_expr.h"
 #include "parser/parse_relation.h"
 #include "rewrite/rewriteHandler.h"
+#include "rewrite/rewriteManip.h"
 #include "storage/lmgr.h"
 #include "tcop/tcopprot.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -48,10 +52,23 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/queryenvironment.h"
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/tuplestore.h"
+
+
+/* See matview.h.  Branch-local scaffolding for the Query-tree rewrite. */
+bool		matview_partial_refresh_querytree = false;
+
+/*
+ * Name the materialised source rows are registered under for the SQL that
+ * upserts and prunes.  Both halves read it, and both read the same tuplestore,
+ * which is what makes them agree about which rows the view produces (A3).
+ */
+#define MATVIEW_SOURCE_ENR_NAME	"new_data"
 
 
 typedef struct
@@ -85,6 +102,13 @@ typedef struct MatViewPartialRefreshCache
 								 * clauses can be textually identical and still
 								 * need different plans */
 
+	bool		querytree;		/* was matview_partial_refresh_querytree set
+								 * when these plans were built?  The two paths
+								 * generate different SQL -- one evaluates the
+								 * view inline, the other reads it from a
+								 * registered tuplestore -- so a plan built for
+								 * one is wrong for the other */
+
 	/* The cached plans */
 	SPIPlanPtr	lockPlan;		/* SELECT FOR UPDATE */
 	SPIPlanPtr	refreshPlan;	/* Fused CTE: Evaluate -> Upsert -> Delete */
@@ -117,7 +141,9 @@ static uint64 refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 									 int save_sec_context, char *whereClauseStr,
 									 ParamListInfo params);
 static uint64 refresh_by_direct_modification(Oid matviewOid, Oid relowner,
-											 int save_sec_context, char *whereClauseStr,
+											 int save_sec_context,
+											 Query *dataQuery, Node *qual,
+											 char *whereClauseStr,
 											 ParamListInfo params);
 static void refresh_by_heap_swap(Oid matviewOid, Oid OIDNewHeap, char relpersistence);
 static bool is_usable_unique_index(Relation indexRel);
@@ -130,7 +156,8 @@ static void matview_build_upsert_clause(Relation matviewRel, Oid arbiterOid,
 static void OpenMatViewIncrementalMaintenance(Oid relid);
 static void CloseMatViewIncrementalMaintenance(void);
 static int	matview_execute_spi(const char *command, ParamListInfo params, bool read_only);
-static int	matview_execute_spi_plan(SPIPlanPtr plan, ParamListInfo params, bool read_only);
+static int	matview_execute_spi_plan(SPIPlanPtr plan, ParamListInfo params,
+									 Snapshot snapshot, bool read_only);
 static char *get_matview_view_query(Oid matviewOid);
 static void InitMatViewCache(void);
 static void InvalidateMatViewCache(Datum arg, Oid relid);
@@ -269,6 +296,17 @@ transformRefreshWhereClause(Oid relid, Node *whereClause, ParamListInfo params,
 	result = coerce_to_boolean(pstate, result, "WHERE");
 
 	/*
+	 * Finish the expression off the way transformStmt() would.  For a long
+	 * time the only thing done with this tree was to deparse it, and a deparse
+	 * does not look at collations, so an unresolved one was invisible: the
+	 * text went back through the parser, which assigned them properly the
+	 * second time round.  Anything that executes the tree directly needs them
+	 * assigned here, or a predicate as ordinary as "tag = 'hot'" fails with
+	 * "could not determine which collation to use".
+	 */
+	assign_expr_collations(pstate, result);
+
+	/*
 	 * The predicate is evaluated with the matview owner's privileges, so a
 	 * caller who merely holds MAINTAIN could otherwise reach objects it has no
 	 * rights on.  A leakproof predicate cannot leak the owner's data nor do
@@ -352,16 +390,23 @@ matview_execute_spi(const char *command, ParamListInfo params, bool read_only)
 
 /*
  * Helper to execute Prepared SPI Plans with optional parameters.
+ *
+ * Pass InvalidSnapshot to let SPI take its own snapshot, which is what a
+ * statement standing on its own wants.  Pass one to run the statement under a
+ * snapshot the caller has already used for something else that has to agree
+ * with it.
  */
 static int
-matview_execute_spi_plan(SPIPlanPtr plan, ParamListInfo params, bool read_only)
+matview_execute_spi_plan(SPIPlanPtr plan, ParamListInfo params,
+						 Snapshot snapshot, bool read_only)
 {
+	Datum	   *argvalues = NULL;
+	char	   *nulls = NULL;
+	int			res;
+
 	if (params && params->numParams > 0)
 	{
-		Datum	   *argvalues;
-		char	   *nulls;
 		int			i;
-		int			res;
 
 		argvalues = (Datum *) palloc(params->numParams * sizeof(Datum));
 		nulls = (char *) palloc(params->numParams * sizeof(char));
@@ -373,18 +418,21 @@ matview_execute_spi_plan(SPIPlanPtr plan, ParamListInfo params, bool read_only)
 			argvalues[i] = prm->value;
 			nulls[i] = prm->isnull ? 'n' : ' ';
 		}
+	}
 
+	if (snapshot == InvalidSnapshot)
 		res = SPI_execute_plan(plan, argvalues, nulls, read_only, 0);
+	else
+		res = SPI_execute_snapshot(plan, argvalues, nulls,
+								   snapshot, InvalidSnapshot,
+								   read_only, false, 0);
 
+	if (argvalues != NULL)
 		pfree(argvalues);
+	if (nulls != NULL)
 		pfree(nulls);
 
-		return res;
-	}
-	else
-	{
-		return SPI_execute_plan(plan, NULL, NULL, read_only, 0);
-	}
+	return res;
 }
 
 /*
@@ -626,8 +674,8 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	if (qual && concurrent && !skipData)
 	{
 		processed = refresh_by_direct_modification(matviewOid, relowner,
-												   save_sec_context, qual_str,
-												   params);
+												   save_sec_context, dataQuery,
+												   qual, qual_str, params);
 	}
 
 	/*
@@ -1077,6 +1125,156 @@ InitMatViewCache(void)
 }
 
 /*
+ * matview_build_source_query
+ *
+ * Build the Query producing the rows the matview should hold inside the scope
+ * of the predicate: the view's own query, filtered by the predicate, ordered
+ * by the arbiter index's key columns.
+ *
+ * The predicate filters the OUTPUT of the view query, so the view query goes
+ * into a subquery RTE and the predicate becomes the outer WHERE.  Attaching it
+ * to dataQuery with AddQual() instead -- which is the obvious thing to reach
+ * for, since the rewriter pushes quals into views that way -- would put it in
+ * the view's own WHERE clause, evaluated before grouping, windowing and
+ * DISTINCT.  That is a different answer for every matview that aggregates, and
+ * for one over a window function it is not even a well-formed question.  The
+ * text implementation wrapped the view in a subselect for the same reason.
+ *
+ * The predicate's Vars were resolved against the matview relation, so they
+ * carry matview attribute numbers.  A matview's columns are its view query's
+ * non-junk target entries in order, and a matview cannot have a dropped column
+ * (ALTER MATERIALIZED VIEW ... DROP COLUMN is rejected), so those attribute
+ * numbers already address the subquery's output columns.  Only the RTE they
+ * point at has to be the right one, which is why the subquery is placed at
+ * varno 1 like the matview it replaces.
+ */
+static Query *
+matview_build_source_query(Relation matviewRel, Query *dataQuery, Node *qual,
+						   int nkeyatts, const int16 *keyattnums)
+{
+	ParseState *pstate = make_parsestate(NULL);
+	ParseNamespaceItem *nsitem;
+	Query	   *sourceQuery = makeNode(Query);
+	Node	   *sourceQual = copyObject(qual);
+	List	   *sortlist = NIL;
+	int			i;
+
+	nsitem = addRangeTableEntryForSubquery(pstate,
+										   copyObject(dataQuery),
+										   makeAlias(RelationGetRelationName(matviewRel),
+													 NIL),
+										   false,	/* not LATERAL */
+										   true);	/* in FROM clause */
+	addNSItemToQuery(pstate, nsitem, true, false, true);
+
+	/* The predicate's Vars say varno 1; this has to be what they mean. */
+	Assert(nsitem->p_rtindex == 1);
+
+	sourceQuery->commandType = CMD_SELECT;
+	sourceQuery->canSetTag = true;
+
+	/* SELECT *, which for this RTE is exactly the matview's columns. */
+	sourceQuery->targetList = expandNSItemAttrs(pstate, nsitem, 0, false, -1);
+
+	/*
+	 * Order by the arbiter key.  Two overlapping refreshes have to insert the
+	 * rows they both produce in the same order or they deadlock on each
+	 * other's speculative insertions (A5/P3); the rows leave here in that
+	 * order and stay in it, because what reads them back is a plain scan of
+	 * the tuplestore they were written to.
+	 */
+	for (i = 0; i < nkeyatts; i++)
+	{
+		int			attnum = keyattnums[i];
+		TargetEntry *tle = list_nth_node(TargetEntry, sourceQuery->targetList,
+										 attnum - 1);
+		SortBy	   *sortby = makeNode(SortBy);
+
+		/* is_usable_unique_index() rejects expression and system columns */
+		Assert(attnum > 0 && tle->resno == attnum);
+
+		sortby->node = (Node *) tle->expr;
+		sortby->sortby_dir = SORTBY_DEFAULT;
+		sortby->sortby_nulls = SORTBY_NULLS_DEFAULT;
+		sortby->useOp = NIL;
+		sortby->location = -1;
+
+		sortlist = addTargetToSortList(pstate, tle, sortlist,
+									   sourceQuery->targetList, sortby);
+	}
+
+	sourceQuery->rtable = pstate->p_rtable;
+	sourceQuery->rteperminfos = pstate->p_rteperminfos;
+	sourceQuery->jointree = makeFromExpr(pstate->p_joinlist, sourceQual);
+	sourceQuery->sortClause = sortlist;
+
+	/*
+	 * The predicate was analysed against a different ParseState, so this one
+	 * has not seen whatever is in it.  Aggregates and window functions are
+	 * rejected outright by transformRefreshWhereClause() and by
+	 * EXPR_KIND_WHERE respectively, but a sub-SELECT is allowed and the
+	 * rewriter must be told it is there.
+	 */
+	sourceQuery->hasSubLinks = checkExprHasSubLink(sourceQual);
+
+	free_parsestate(pstate);
+
+	return sourceQuery;
+}
+
+/*
+ * matview_materialize_source
+ *
+ * Run the source query under the given snapshot and collect its rows into
+ * tupstore.  Returns the number of rows collected.
+ *
+ * This is the same sequence the full refresh uses in
+ * refresh_matview_datafill(); the difference is only where the rows go.
+ */
+static double
+matview_materialize_source(Query *sourceQuery, ParamListInfo params,
+						   Snapshot snapshot, Tuplestorestate *tupstore)
+{
+	List	   *rewritten;
+	PlannedStmt *plan;
+	QueryDesc  *queryDesc;
+	DestReceiver *dest;
+	double		processed;
+
+	AcquireRewriteLocks(sourceQuery, true, false);
+	rewritten = QueryRewrite(sourceQuery);
+
+	/* A SELECT should never rewrite to more or less than one SELECT. */
+	if (list_length(rewritten) != 1)
+		elog(ERROR, "unexpected rewrite result for REFRESH MATERIALIZED VIEW");
+	sourceQuery = linitial_node(Query, rewritten);
+
+	CHECK_FOR_INTERRUPTS();
+
+	plan = pg_plan_query(sourceQuery, NULL, CURSOR_OPT_PARALLEL_OK, params,
+						 NULL);
+
+	dest = CreateDestReceiver(DestTuplestore);
+	SetTuplestoreDestReceiverParams(dest, tupstore, CurrentMemoryContext,
+									false, NULL, NULL);
+
+	queryDesc = CreateQueryDesc(plan, "REFRESH MATERIALIZED VIEW",
+								snapshot, InvalidSnapshot,
+								dest, params, NULL, 0);
+
+	ExecutorStart(queryDesc, 0);
+	ExecutorRun(queryDesc, ForwardScanDirection, 0);
+	processed = (double) queryDesc->estate->es_processed;
+	ExecutorFinish(queryDesc);
+	ExecutorEnd(queryDesc);
+	FreeQueryDesc(queryDesc);
+
+	dest->rDestroy(dest);
+
+	return processed;
+}
+
+/*
  * refresh_by_direct_modification
  *
  * This modifies the materialized view in-place without creating a temporary
@@ -1094,6 +1292,22 @@ InitMatViewCache(void)
  *    the results into the matview, and deletes rows that no longer match
  *    the predicate (via anti-join against the fresh query output).
  *
+ * With matview_partial_refresh_querytree set, step 2 changes shape: the view
+ * is evaluated from its Query tree into a tuplestore, which is registered as
+ * an ephemeral named relation and read by the same fused statement in place of
+ * the CTE.  The view's SQL text disappears from the generated statement, and
+ * with it every hazard that came from re-parsing deparsed SQL in a different
+ * naming environment than the one it was written in.
+ *
+ * Both halves of the fused statement then read one physically materialised
+ * tuplestore rather than one materialised CTE, so they still cannot disagree
+ * about which rows the view produces (A3).  The whole of step 2, evaluation
+ * and DML alike, runs under one snapshot -- taken here rather than by SPI --
+ * because otherwise the view would be evaluated at one point in time and the
+ * rows it is compared against read at a later one, and a key inserted in
+ * between by an overlapping refresh would be pruned as though the view had
+ * stopped producing it.
+ *
  * To avoid rebuilding the SQL and re-preparing the SPI plans on every call,
  * we cache both plans in a session-level hash table keyed by matview OID.
  *
@@ -1101,7 +1315,8 @@ InitMatViewCache(void)
  */
 static uint64
 refresh_by_direct_modification(Oid matviewOid, Oid relowner,
-							   int save_sec_context, char *whereClauseStr,
+							   int save_sec_context, Query *dataQuery,
+							   Node *qual, char *whereClauseStr,
 							   ParamListInfo params)
 {
 	Relation	matviewRel;
@@ -1113,6 +1328,10 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	uint64		result_processed = 0;
 	int			old_depth;
 	Oid			old_relid;
+	bool		use_querytree = matview_partial_refresh_querytree;
+	int			nkeyatts = 0;
+	int16	   *keyattnums = NULL;
+	Tuplestorestate *sourceStore = NULL;
 
 	matviewRel = table_open(matviewOid, NoLock);
 
@@ -1173,9 +1392,14 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	 * and the WHERE clause string perfectly matches.  We also ensure
 	 * whereClauseStr is not NULL to prevent a strcmp segfault if a previous
 	 * compilation failed midway.
+	 *
+	 * The plans are also specific to which implementation built them, and that
+	 * can change between two refreshes of the same matview in one session
+	 * while the two are being compared against each other.
 	 */
 	if (found &&
 		cacheEntry->uniqueIndexOid == uniqueIndexOid &&
+		cacheEntry->querytree == use_querytree &&
 		cacheEntry->whereClauseStr != NULL &&
 		whereClauseStr != NULL &&
 		strcmp(cacheEntry->whereClauseStr, whereClauseStr) == 0 &&
@@ -1204,6 +1428,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		cacheEntry->whereClauseStr = NULL;
 		cacheEntry->nargs = 0;
 		cacheEntry->argtypes = NULL;
+		cacheEntry->querytree = use_querytree;
 		cacheEntry->invalid = false;
 	}
 
@@ -1214,6 +1439,40 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	PG_TRY();
 	{
 	SPI_connect();
+
+	/*
+	 * Register the relation the fused statement will read its source rows
+	 * from.  It has to exist before the statement is parsed, and the rows have
+	 * to be collected after the locking step rather than before it, so the
+	 * tuplestore is registered empty here and filled further down.  Nothing
+	 * reads it in between.
+	 */
+	if (use_querytree)
+	{
+		Relation	indexRel = index_open(uniqueIndexOid, AccessShareLock);
+		Form_pg_index indexStruct = indexRel->rd_index;
+		EphemeralNamedRelation enr;
+		int			i;
+
+		nkeyatts = indexStruct->indnkeyatts;
+		keyattnums = (int16 *) palloc(nkeyatts * sizeof(int16));
+		for (i = 0; i < nkeyatts; i++)
+			keyattnums[i] = indexStruct->indkey.values[i];
+		index_close(indexRel, AccessShareLock);
+
+		sourceStore = tuplestore_begin_heap(false, false, work_mem);
+
+		enr = (EphemeralNamedRelation) palloc0(sizeof(EphemeralNamedRelationData));
+		enr->md.name = MATVIEW_SOURCE_ENR_NAME;
+		enr->md.reliddesc = InvalidOid;
+		enr->md.tupdesc = CreateTupleDescCopy(RelationGetDescr(matviewRel));
+		enr->md.enrtype = ENR_NAMED_TUPLESTORE;
+		enr->md.enrtuples = Max(matviewRel->rd_rel->reltuples, 0);
+		enr->reldata = sourceStore;
+
+		if (SPI_register_relation(enr) != SPI_OK_REL_REGISTER)
+			elog(ERROR, "could not register source rows for partial refresh");
+	}
 
 	/* Prepare plans if we don't have valid cached ones. */
 	if (cacheEntry->lockPlan == NULL || cacheEntry->refreshPlan == NULL)
@@ -1239,7 +1498,14 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		matview_name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
 												  RelationGetRelationName(matviewRel));
 		matview_alias = quote_identifier(RelationGetRelationName(matviewRel));
-		view_sql = get_matview_view_query(matviewOid);
+
+		/*
+		 * The deparse is the thing this rewrite exists to remove: it renders
+		 * the view as SQL text that then has to be re-parsed in whatever
+		 * naming environment the refresh happens to run in.  On the Query-tree
+		 * path nothing asks for it.
+		 */
+		view_sql = use_querytree ? NULL : get_matview_view_query(matviewOid);
 
 		if (params && params->numParams > 0)
 		{
@@ -1380,52 +1646,45 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 
 		resetStringInfo(&buf);
 
-		if (has_non_key_cols)
-		{
-			appendStringInfo(&buf,
-							 "WITH new_data AS MATERIALIZED ( "
-							 "  SELECT * FROM (%s) %s WHERE (%s) ORDER BY %s "
-							 "), "
-							 "upsert AS ( "
-							 "  INSERT INTO %s SELECT * FROM new_data "
-							 "  ON CONFLICT (%s) DO UPDATE SET %s "
-							 "  RETURNING 1 "
-							 "), "
-							 "pruned AS ( "
-							 "  DELETE FROM %s mv WHERE (%s) AND NOT EXISTS ( "
-							 "    SELECT 1 FROM new_data nd WHERE %s"
-							 "  ) RETURNING 1 "
-							 ") "
-							 "SELECT (SELECT pg_catalog.count(*) FROM upsert) "
-							 "     + (SELECT pg_catalog.count(*) FROM pruned)",
-							 view_sql, matview_alias, whereClauseStr,
-							 conflict_cols.data,
-							 matview_name, conflict_cols.data, set_clause.data,
-							 matview_name, whereClauseStr, join_clause.data);
-		}
+		/*
+		 * Where the source rows come from.  Both spellings give the fused
+		 * statement one "new_data" that the upsert and the prune each read,
+		 * and that both see identically: a CTE the planner is told to
+		 * materialise, or a tuplestore that was materialised before the
+		 * statement started.
+		 */
+		if (use_querytree)
+			appendStringInfoString(&buf, "WITH ");
 		else
-		{
 			appendStringInfo(&buf,
 							 "WITH new_data AS MATERIALIZED ( "
 							 "  SELECT * FROM (%s) %s WHERE (%s) ORDER BY %s "
-							 "), "
-							 "upsert AS ( "
-							 "  INSERT INTO %s SELECT * FROM new_data "
-							 "  ON CONFLICT (%s) DO NOTHING "
-							 "  RETURNING 1 "
-							 "), "
-							 "pruned AS ( "
-							 "  DELETE FROM %s mv WHERE (%s) AND NOT EXISTS ( "
-							 "    SELECT 1 FROM new_data nd WHERE %s"
-							 "  ) RETURNING 1 "
-							 ") "
-							 "SELECT (SELECT pg_catalog.count(*) FROM upsert) "
-							 "     + (SELECT pg_catalog.count(*) FROM pruned)",
+							 "), ",
 							 view_sql, matview_alias, whereClauseStr,
-							 conflict_cols.data,
-							 matview_name, conflict_cols.data,
-							 matview_name, whereClauseStr, join_clause.data);
-		}
+							 conflict_cols.data);
+
+		appendStringInfo(&buf,
+						 "upsert AS ( "
+						 "  INSERT INTO %s SELECT * FROM new_data "
+						 "  ON CONFLICT (%s) DO ",
+						 matview_name, conflict_cols.data);
+
+		if (has_non_key_cols)
+			appendStringInfo(&buf, "UPDATE SET %s ", set_clause.data);
+		else
+			appendStringInfoString(&buf, "NOTHING ");
+
+		appendStringInfo(&buf,
+						 "  RETURNING 1 "
+						 "), "
+						 "pruned AS ( "
+						 "  DELETE FROM %s mv WHERE (%s) AND NOT EXISTS ( "
+						 "    SELECT 1 FROM new_data nd WHERE %s"
+						 "  ) RETURNING 1 "
+						 ") "
+						 "SELECT (SELECT pg_catalog.count(*) FROM upsert) "
+						 "     + (SELECT pg_catalog.count(*) FROM pruned)",
+						 matview_name, whereClauseStr, join_clause.data);
 
 		cacheEntry->refreshPlan = SPI_prepare(buf.data, nargs, argtypes);
 		if (cacheEntry->refreshPlan == NULL)
@@ -1435,6 +1694,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		/* Save cache metadata in a long-lived context. */
 		oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
 		cacheEntry->uniqueIndexOid = uniqueIndexOid;
+		cacheEntry->querytree = use_querytree;
 		cacheEntry->whereClauseStr = pstrdup(whereClauseStr);
 		cacheEntry->nargs = nargs;
 		if (nargs > 0)
@@ -1447,7 +1707,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		MemoryContextSwitchTo(oldcxt);
 
 		pfree(matview_name);
-		pfree(view_sql);
+		if (view_sql != NULL)
+			pfree(view_sql);
 		pfree(buf.data);
 		pfree(conflict_cols.data);
 		pfree(set_clause.data);
@@ -1458,7 +1719,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 
 
 	/* Execute: lock matching rows, then run the refresh CTE. */
-	if (matview_execute_spi_plan(cacheEntry->lockPlan, params, false) < 0)
+	if (matview_execute_spi_plan(cacheEntry->lockPlan, params,
+								 InvalidSnapshot, false) < 0)
 		elog(ERROR, "SPI_execute_plan failed during lock acquisition");
 
 	/*
@@ -1470,7 +1732,43 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	 */
 	INJECTION_POINT("matview-where-locked", NULL);
 
-	if (matview_execute_spi_plan(cacheEntry->refreshPlan, params, false) < 0)
+	if (use_querytree)
+	{
+		Query	   *sourceQuery;
+		Snapshot	snapshot;
+
+		/*
+		 * One snapshot for the whole of step 2.  SPI would otherwise take its
+		 * own for the DML, leaving the view evaluated as of one moment and the
+		 * rows it is compared against read as of a later one; a key another
+		 * refresh inserted in the gap would then be pruned as though the view
+		 * no longer produced it.  The fused CTE never had that gap because
+		 * evaluation and DML were one statement, and this keeps it that way.
+		 */
+		CommandCounterIncrement();
+		PushCopiedSnapshot(GetTransactionSnapshot());
+		snapshot = GetActiveSnapshot();
+
+		sourceQuery = matview_build_source_query(matviewRel, dataQuery, qual,
+												 nkeyatts, keyattnums);
+		matview_materialize_source(sourceQuery, params, snapshot, sourceStore);
+
+		/*
+		 * The rows are computed; the statement that compares the matview
+		 * against them has not run yet.  Whether anything can be observed in
+		 * between is the whole question this path has to answer, so give a
+		 * test somewhere deterministic to stand.
+		 */
+		INJECTION_POINT("matview-where-source-materialized", NULL);
+
+		if (matview_execute_spi_plan(cacheEntry->refreshPlan, params,
+									 snapshot, false) < 0)
+			elog(ERROR, "SPI_execute_plan failed during refresh");
+
+		PopActiveSnapshot();
+	}
+	else if (matview_execute_spi_plan(cacheEntry->refreshPlan, params,
+									  InvalidSnapshot, false) < 0)
 		elog(ERROR, "SPI_execute_plan failed during refresh");
 
 	/*
@@ -1488,6 +1786,9 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		if (!isnull)
 			result_processed = (uint64) DatumGetInt64(d);
 	}
+
+	if (sourceStore != NULL)
+		tuplestore_end(sourceStore);
 
 	SPI_finish();
 	}

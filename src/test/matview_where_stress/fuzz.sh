@@ -30,6 +30,21 @@
 #           different snapshots and the older one can commit last -- a lost
 #           update, seen as the total going DOWN.  Signal: any decrease.
 #
+# There is a half of P1 that serial structurally cannot reach, and it is worth
+# knowing rather than discovering later.  serial only ever UPDATEs, so every key
+# it touches already exists in the matview and every overlapping refresh is made
+# to wait on the locking SELECT.  A key the matview does not hold yet locks
+# nothing, so a refresh creating one runs unordered beside a wider refresh over
+# the same scope -- and a prune that reads the matview at a different moment
+# than it computed its rows will delete it.
+#
+# An insert-driven mode for that was written and measured against a build with
+# the bug deliberately present.  It reported a clean run: the window is
+# microseconds wide and the violation needs two commits inside it, so chance
+# does not land there.  It was deleted rather than kept as a detector that has
+# been watched not to detect.  The gate is deterministic instead --
+# injection_points/specs/matview-where-prune-gap.spec.
+#
 # Why a decrease and not a final comparison: after the writers stop, any further
 # refresh repairs the matview, so a converge-at-the-end check cannot see this
 # class at all.  The violation is only visible while it is happening, which is
