@@ -222,6 +222,36 @@ it fails when the matview is wrong, and only then — which is the property that
 matters, and it is strictly better than a gate that fails when the matview is
 right but built differently.
 
+### 1.1c Calibrate the fuzzer against every bug already known
+
+A fuzzer nobody has seen catch anything is the same defect as a test that cannot
+fail, one level up. Before it is trusted to guard a rewrite it has to be shown to
+find the bugs that are already understood.
+
+There is a ready-made corpus: every fix in `ISSUES.md` and every mutation from
+B17. Re-apply each, one at a time, and record whether the fuzzer finds it and
+how long it took.
+
+    A3   split the fused CTE                    must find
+    A4   drop ON CONFLICT from the diff insert  must find
+    A5   drop ORDER BY from the locking SELECT  must find
+    B4   arbiter NULL handling on the anti-join must find
+    B6   arbitrate on the wrong unique index    must find
+    M1   drop ORDER BY, locking SELECT          must find
+    M2   drop ORDER BY, new_data                must find
+    M3   remove the locking SELECT              must find
+    M6   lock after the CTE instead of before   must find
+
+Anything on that list the fuzzer misses is a gap in its generators — probably a
+shape it never builds, a predicate form it never emits, or a concurrency pattern
+it never schedules — and it should be fixed before moving on. The time-to-find
+for each is also the calibration for the exit criterion: if the slowest known bug
+takes twenty minutes to surface, "clean for five minutes" means nothing.
+
+Expect some misses. A6, A7, B5 and B9 are privilege behaviour and B14 is a
+use-after-free; a data-correctness fuzzer will not see any of them, and that is
+fine — it says which coverage has to stay static rather than being folded in.
+
 ### 1.2 Move structural invariants from tests into the code
 
 The `pg_stat_statements` block asserts things that are genuinely load-bearing —
@@ -400,6 +430,17 @@ it is measurable, not a matter of taste.
 **3.5 Re-run the on-list benchmark.** The numbers Adam posted describe v1.
 Everything since has moved, in both directions.
 
+## Phase 3 is a loop, not a pass
+
+Optimise, run the fuzzer, run the static gates, measure. Any divergence stops
+the loop and gets minimised into a static test before anything else proceeds.
+Exit when the candidate list is exhausted or the remaining items are not worth
+their risk — not when the numbers look good, which is a different question.
+
+Each iteration ends with a `bench_result` row under a new run label, so the
+whole optimisation history is diffable afterwards rather than being a memory of
+what seemed faster.
+
 ## Method, which has bitten twice already
 
 - **`make clean` after every `configure`.** This tree has `autodepend` empty, so
@@ -414,3 +455,67 @@ Everything since has moved, in both directions.
   was corrected.
 - **Settle between measurements.** Sweep position otherwise correlates with
   accumulated bloat and whatever is measured last looks worst.
+
+---
+
+# Phase 4 — Crystallise the shipped suite
+
+The fuzzer is a development instrument and does not ship. What ships is the
+static suite it produced, against whatever implementation actually landed.
+
+- Every minimised fuzzer finding becomes a regression test or an isolation spec,
+  each with a comment saying what it is guarding and, where relevant, which
+  reviewer raised it.
+- The property gates get re-derived against the final implementation: P2's spec
+  re-verified, P3's no-deadlock test in place, P1's `Assert()` sited where the
+  final code establishes the guarantee.
+- Every test that only existed to guard the old mechanism is deleted, not
+  carried forward. `ISSUES.md`'s Disposition column already says which.
+- **Both build systems.** `parallel_schedule` and `isolation_schedule` are read
+  by autoconf *and* meson, so regress and isolation tests need registering once.
+  Module specs are not — `src/test/modules/injection_points/meson.build` lists
+  them individually and has to be edited alongside the `Makefile`. This was
+  missed once already for `matview-where-snapshot`.
+- Delete `src/test/matview_where_stress/` — the whole directory, including the
+  fuzzer, the benchmark suite and these notes.
+
+# Phase 5 — Review pass
+
+Read the patch as a reviewer would, before a reviewer does.
+
+- **Correctness re-read**, with the fuzzer no longer available as a crutch:
+  locking, error paths, memory contexts, what happens on `ERROR` at each stage.
+- **Style**: `pgindent`, `typedefs.list` for any new struct, comment conventions,
+  `ereport` with the right `errcode` and a `errhint` where the cause is not
+  obvious — B9's bare "relation does not exist" is the outstanding one.
+- **Scope discipline**: anything not needed for this feature comes out.
+- **Commit splitting**: the fixes should be reviewable independently of the
+  implementation change, which means several commits with self-contained
+  messages, not one large one.
+
+# Phase 6 — Final performance regression check
+
+A full benchmark run against the final tree, compared to the run label from the
+end of Phase 3. The review pass changes code; changed code changes performance.
+This is the check that nothing regressed while being tidied.
+
+Also the point at which the numbers stop being working notes and become
+evidence, so this run is the one worth keeping: full sweep, every workload, the
+build recorded, normalised against a full rebuild so it is comparable on someone
+else's machine.
+
+# Phase 7 — Patch and the -hackers response
+
+- Rebase onto current master and re-run everything.
+- **Per-reviewer replies.** Dharin (A1, A2, A9), Vellaipandiyan (A5, A8, A9),
+  Zsolt (A6, A7), Kirk (the wide-row case), Nico (the recursive case). Each
+  raised something specific and each is owed a specific answer, including where
+  the answer is "you were right and here is the measurement".
+- **The independently-found items** get their own section — B1 through B17 are
+  not on the thread, and several are more serious than what is.
+- **The benchmark material from Phase 6** goes on-list. Note that the numbers
+  Adam posted originally describe v1 and have to be superseded explicitly rather
+  than quietly.
+- **The open questions get asked rather than hidden**: the two-implementation
+  question, blast radius handling, scope-drift semantics. A patch that names its
+  unresolved design decisions gets better review than one that buries them.
