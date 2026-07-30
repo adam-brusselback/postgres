@@ -141,9 +141,13 @@ REFRESH MATERIALIZED VIEW [ CONCURRENTLY ] <replaceable class="parameter">name</
       in the condition, which cannot be pushed down.
      </para>
      <para>
-      Because a partial refresh costs roughly an order of magnitude more per row
-      than a full rebuild does, refreshing more than about a tenth of a
-      materialized view is usually slower than rebuilding it outright.
+      A partial refresh costs several times more per row than a full rebuild
+      does, so beyond some fraction of the materialized view rebuilding it
+      outright is faster.  The two forms differ here: with
+      <literal>CONCURRENTLY</literal> the crossover is around a tenth of the
+      materialized view, and without it around a quarter.  Both figures depend
+      on the defining query and on how many indexes the materialized view
+      carries, so measure rather than assume.
      </para>
      <para>
       The <literal>WHERE</literal> clause cannot contain volatile functions or
