@@ -122,15 +122,59 @@ def pristine():
                           capture_output=True, text=True, check=True).stdout
 
 
+def variants():
+    """Every file content this script is capable of having written."""
+    base = pristine()
+    out = {base}
+    for _, _, _, edits in MUTATIONS.values():
+        s = base
+        for old, new in edits:
+            if old in s:
+                s = s.replace(old, new, 1)
+        out.add(s)
+    return out
+
+
+def refuse_if_uncommitted():
+    """Do not overwrite work that is not in HEAD and is not ours.
+
+    Defining pristine as HEAD is what keeps this honest, and it has a sharp
+    edge: every apply and every restore overwrites the file wholesale, so an
+    uncommitted edit to matview.c is destroyed by the next restore without a
+    word.  That happened -- two Assert()s were written, a mutation was tested
+    against the contract file, the restore afterwards deleted them, and the
+    suites that ran green afterwards were green because there was nothing left
+    to check.  Silent, and indistinguishable from success.
+
+    The check cannot be "is the file dirty", because mid-run it always is: the
+    harnesses apply a mutation and then restore.  It is "is the dirt something
+    this script wrote".  Anything else is someone's work in progress.
+    """
+    try:
+        current = open(TARGET).read()
+    except FileNotFoundError:
+        return
+    if current not in variants():
+        sys.exit(f'{TARGET} has uncommitted changes that are not one of this '
+                 "script's mutations,\nand every mutation here overwrites it "
+                 'from HEAD.  Commit them first, or pass --force to discard '
+                 'them.')
+
+
 def main():
-    if len(sys.argv) != 2:
+    args = [a for a in sys.argv[1:] if a != '--force']
+    force = '--force' in sys.argv
+    if len(args) != 1:
         sys.exit(__doc__)
-    name = sys.argv[1]
+    name = args[0]
 
     if name == '--list':
         for k, (issue, needs, desc, _) in sorted(MUTATIONS.items()):
             print(f'{k:9} {issue:4} {needs:7} {desc}')
         return
+
+    if not force:
+        refuse_if_uncommitted()
 
     src = pristine()
 

@@ -155,11 +155,31 @@ while the implementation inserts in lock order. An implementation that acquires
 the locks separately, in order, and then inserts in any order satisfies P3 and
 fails Test 16.
 
-The property-level version is the one already written for P2's cousin:
-`matview_where_stress/run.sh` drives two concurrent refreshes over overlapping
-*existing* rows and asserts no deadlock. The same shape over overlapping *new*
-keys tests P3 directly. Write that during Phase 1; keep Test 16 only until it
-exists, and only as a cheap smoke test with a comment saying it is a proxy.
+**Done, deterministically, which was not the expected outcome.**
+`matview-where-insertorder.spec`. The plan assumed P3 would need a
+probabilistic reproducer, because provoking the deadlock needs two refreshes
+in flight at once and isolationtester drives one step at a time — the same
+constraint that pushed `matview-where-lockorder` into reading `xmax` instead.
+
+The way through is that the deadlock does not have to be provoked; the *order*
+has to be observed, and for inserted rows there is an observable that does not
+depend on the rows existing yet. A refresh that reaches a key another
+transaction has speculatively inserted waits on that transaction, and
+`pg_blocking_pids()` names it. So pin the two ends of the key range in separate
+sessions, one key each, send a refresh covering both, and ask which end it
+stopped on. That is the order it started from.
+
+    with ORDER BY on new_data   blocked_by = pin_lo
+    without it                  blocked_by = pin_hi   (heap order, descending)
+
+Verified both ways: under M2 the answer flips, so it is a detector and not a
+decoration. It asserts the order the locks were actually taken in rather than
+the physical order of the resulting rows, so the implementation Test 16 gets
+wrong — lock separately in order, then insert in any order — passes it, which
+is the whole point of replacing Test 16.
+
+Test 16 is now redundant; kept as a cheap single-session smoke test, marked for
+deletion at Phase 4.
 
 ## What to build before Phase 2 starts
 
@@ -386,6 +406,40 @@ says "this implementation delivers P1"; the deleted test said "this
 implementation delivers P1 *by writing a CTE*". The first survives any
 mechanism; the second forbids all but one.
 
+**Done, and smaller than the heading promises.** Two assertions went in, both
+preconditions rather than restatements of the SQL:
+
+    Assert(conflict_cols.len > 0);   /* an order exists to impose (A5, P3) */
+    Assert(join_clause.len > 0);     /* the prune has a condition */
+
+What is *not* asserted is the P1 invariant itself, and the reason belongs here
+rather than in a footnote. There is nothing at build time to look at: whether
+the upsert and the prune see one evaluation is a property of how the statement
+executes, and 1.1b already establishes that a correct implementation has no
+window in which the difference is observable. An `Assert()` that pattern-matched
+the generated text for `MATERIALIZED` would be the `pg_stat_statements` block
+again, in C, with the same defect — red against a correct rewrite.
+
+So P1's gates stay where 1.1b put them: `fuzz.sh`'s `serial` mode, which catches
+M3 and M6 at 45 and 55 events, and differential mode when it exists. The
+assertions cover the preconditions that any implementation needs; the fuzzer
+covers the behaviour.
+
+Verified against a `--enable-cassert` build (`rebuild.sh --full ...
+--enable-cassert`), which the working `-O2` build does not have: assertions
+report `on`, the suites are green with them live, and — separately, because the
+two are not the same claim — `Assert(conflict_cols.len > 0)` was made to fail on
+purpose and does: `TRAP: failed Assert("conflict_cols.len > 0")`.
+
+That last step caught a mistake that had already invalidated the first one.
+`mutations.py` defines pristine as `git show HEAD:`, so it overwrites matview.c
+wholesale — and the restore after an unrelated mutation test deleted both
+assertions before they had ever been committed. The suites that ran green
+afterwards were green because there was nothing left to check, which is exactly
+what success looks like. `mutations.py` now refuses to overwrite matview.c
+unless its current contents are one of the variants that script itself can
+write; anything else is someone's work in progress and needs `--force`.
+
 ### 1.3 Write down the contract as one black-box file
 
 The feature's promises are currently spread across 16 regression tests, four
@@ -401,6 +455,32 @@ executable, implementation-blind assertions:
 - the rowcount reported is the number of rows changed
 
 That file is the acceptance criterion for Phase 2.
+
+**Done:** `src/test/regress/sql/matview_where_contract.sql`. Six promises in
+one session — scope matches the view, out-of-scope rows untouched, rows leaving
+and entering the scope, a no-op refresh is a no-op, both forms agree — with the
+concurrency promises cross-referenced to the specs that hold them, so the
+contract reads in one place even though it executes in two.
+
+Two of the seven promises originally written did not survive contact:
+
+- **The rowcount promise could not fail here.** `pg_regress` does not echo
+  command tags, so three refreshes with three different answers produced three
+  identical blanks and the check passed vacuously. It is only observable
+  through `pg_stat_statements`, where it already lives. Removed, with the
+  reason recorded in the file — a check that cannot fail is the defect this
+  whole phase exists to find, and writing one while writing the rules against
+  it is worth admitting to.
+
+- **The no-op promise passed with the bug present.** It did two `CONCURRENTLY`
+  refreshes and one bare one, then counted. Under B4 the concurrent pair took
+  the matview from 3 rows to 7 — and the bare refresh, which compares whole
+  rows, repaired it before the count ran. The check was measuring the repair.
+  Counting after each form instead makes it fail under B4, verified.
+
+Both were found by running the file against a mutation rather than by reading
+it. Neither is visible on inspection: one looks like a test and the other looks
+like a stronger test.
 
 ### 1.4 Close the two gaps the oracle structurally cannot see
 

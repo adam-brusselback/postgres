@@ -1328,6 +1328,37 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		index_close(indexRel, AccessShareLock);
 
 		/*
+		 * Preconditions for the guarantees this function has to deliver.
+		 *
+		 * Two overlapping refreshes must take the rows they share in the same
+		 * order, both for rows the matview already holds and for rows they
+		 * each insert; otherwise they deadlock.  That was reported on -hackers
+		 * (A5) and both halves are gated by isolation specs -- see
+		 * matview-where-lockorder and matview-where-insertorder.
+		 *
+		 * Whatever produces the ordering, it needs an order to produce.  Both
+		 * take it from the arbiter index's key columns, so an empty
+		 * conflict_cols means no deterministic order exists to impose, and the
+		 * ON CONFLICT target is empty as well.  Assert the precondition rather
+		 * than the SQL: a check that the generated text contains "ORDER BY"
+		 * would pin one way of ordering and go red against any other, which is
+		 * the defect that made the pg_stat_statements block unkeepable.
+		 *
+		 * The anti-join condition is the prune's half of the same contract --
+		 * it decides which rows the view no longer produces, and an empty one
+		 * would delete the whole scope.
+		 *
+		 * Note what is deliberately NOT asserted here: that the upsert and the
+		 * prune see a single evaluation of the view query (A3).  That is a
+		 * property of how the statement executes, not of anything visible at
+		 * build time, and a correct implementation has no window in which the
+		 * difference can be observed.  Its gates are the differential oracle
+		 * and fuzz.sh's serial mode; see PLAN.md 1.1b.
+		 */
+		Assert(conflict_cols.len > 0);
+		Assert(join_clause.len > 0);
+
+		/*
 		 * Prepare the row-locking statement.  This acquires FOR UPDATE locks
 		 * on matview rows matching the WHERE clause to serialize concurrent
 		 * partial refreshes on overlapping rows.

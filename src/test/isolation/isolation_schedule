@@ -132,3 +132,4 @@ test: pub-concurrent-drop
 test: matview-where-serialize
 test: matview-where-deadlock
 test: matview-where-lockorder
+test: matview-where-insertorder

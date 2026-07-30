@@ -627,10 +627,18 @@ DROP TABLE mv_multi2_base;
 -- implementation that acquires the locks separately, in order, and then inserts
 -- in any order satisfies the property and fails this test.
 --
--- The property-level replacement is two concurrent refreshes over overlapping
--- new keys, asserting no deadlock -- the shape matview_where_stress/run.sh
--- already uses for existing rows.  Keep this until that exists, as a cheap
--- smoke test.  See src/test/matview_where_stress/PLAN.md.
+-- The property-level replacement now exists: matview-where-insertorder.spec
+-- pins the two ends of the key range in separate sessions and asks, through
+-- pg_blocking_pids(), which end a covering refresh stopped on.  That names the
+-- order the refresh actually took its speculative-insertion locks in, without
+-- assuming insertion order and lock order are the same thing -- so the
+-- separately-locking implementation described above passes it, as it should.
+-- Verified as a detector: with the ORDER BY removed from new_data, blocked_by
+-- flips from pin_lo to pin_hi.
+--
+-- This test is now redundant with that one and is kept only as a cheap
+-- single-session smoke test.  Delete it at Phase 4.
+-- See src/test/matview_where_stress/PLAN.md.
 --
 
 CREATE TABLE mv_iord_base (id int primary key, tag text, v int);
