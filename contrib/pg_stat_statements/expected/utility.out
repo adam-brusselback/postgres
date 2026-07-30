@@ -761,6 +761,67 @@ SELECT calls, rows, query FROM pg_stat_statements
      1 |    2 | REFRESH MATERIALIZED VIEW pgss_pr_matv WHERE a >= 9
 (3 rows)
 
+--
+-- Structural assertions on what a partial refresh actually issues.
+--
+-- Found here, not on the -hackers thread.  With track = 'all',
+-- pg_stat_statements sees the statements the refresh runs internally, so the
+-- shape of the implementation becomes observable through the real command
+-- rather than through a hand-written analogy of it.  That matters because an
+-- analogy drifts silently when the implementation changes, which is exactly
+-- what a performance pass does.
+--
+-- These three assertions cover, between them, every structural property the
+-- correctness fixes depend on:
+--
+--   two nested statements   splitting the fused CTE into upsert-then-prune
+--                           makes it three, and reopens a consistency gap of
+--                           the same family as A3 (see
+--                           matview_where_stress/safety/a3-split-gap.sh)
+--   ordered locking SELECT  A5: without ORDER BY, two overlapping refreshes
+--                           lock in different orders and deadlock
+--   fused, materialised CTE A3: one materialised new_data is what stops the
+--                           upsert and the prune disagreeing about which rows
+--                           exist
+--
+-- Disposition: keep.  This is the only gate that pins the implementation's
+-- shape, as opposed to its behaviour, and it is the one a restructuring for
+-- performance has to answer to.
+--
+SET pg_stat_statements.track = 'all';
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
+ t 
+---
+ t
+(1 row)
+
+REFRESH MATERIALIZED VIEW CONCURRENTLY pgss_pr_matv WHERE a <= 3;
+SELECT count(*) AS nested_statements
+  FROM pg_stat_statements WHERE NOT toplevel;
+ nested_statements 
+-------------------
+                 2
+(1 row)
+
+SELECT query ~ 'ORDER BY .* FOR UPDATE' AS locking_select_is_ordered
+  FROM pg_stat_statements
+ WHERE NOT toplevel AND query LIKE 'SELECT%FOR UPDATE';
+ locking_select_is_ordered 
+---------------------------
+ t
+(1 row)
+
+SELECT query ~ 'new_data AS MATERIALIZED' AS new_data_is_materialised,
+       query ~ 'upsert AS' AND query ~ 'pruned AS' AS upsert_and_prune_are_fused,
+       query ~ 'ORDER BY' AS new_data_is_ordered
+  FROM pg_stat_statements
+ WHERE NOT toplevel AND query LIKE 'WITH new_data%';
+ new_data_is_materialised | upsert_and_prune_are_fused | new_data_is_ordered 
+--------------------------+----------------------------+---------------------
+ t                        | t                          | t
+(1 row)
+
+RESET pg_stat_statements.track;
 DROP MATERIALIZED VIEW pgss_pr_matv;
 DROP TABLE pgss_pr_base;
 SELECT pg_stat_statements_reset() IS NOT NULL AS t;

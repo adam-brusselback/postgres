@@ -236,6 +236,36 @@ assumed to work. B17 is closed.
 | `matview-where-lockorder.spec` (isolation) | the locking `SELECT` orders by the arbiter key | M1 · drop that `ORDER BY` | **fails in 60 ms**; the `locked` column inverts from rows 1-5 to rows 6-10 |
 | `matview_where` Test 16 (regress) | `new_data` orders by the arbiter key | M2 · drop that `ORDER BY` | **fails**; insert order goes `{11..20}` → `{20..11}` |
 | `matview-where-snapshot.spec` (injection points) | the row locks are held **before** the CTE runs | M6 · move the locking `SELECT` after the CTE | **fails**; the overlapping refresh stops reporting `<waiting ...>` |
+| `pg_stat_statements` `utility` | the *shape* of what a refresh issues | M4 · `new_data NOT MATERIALIZED` | **fails**; `new_data_is_materialised` flips to `f` |
+
+### On the fourth gate, and why an analogy was not good enough
+
+`a3-split-gap.sh` demonstrates that splitting the fused CTE reopens a
+consistency gap, but it hand-writes the two-statement SQL against a plain table
+— it never runs `REFRESH`. That is fine as a demonstration and useless as a
+regression gate: the analogy drifts silently the moment the implementation it is
+imitating changes, which is precisely what a performance pass does.
+
+The split hazard also cannot be tested behaviourally on unsplit code. It needs a
+concurrent write landing *between* the upsert and the prune, and on the current
+implementation those are one statement — there is no "between" to inject into. A
+test asserting that hazard could only exist on code that already has the bug.
+
+What is testable is the *structure*, through the real command. With
+`pg_stat_statements.track = 'all'`, the statements a refresh issues internally
+become visible, so the implementation's shape can be asserted directly:
+
+    nested_statements          2      splitting the CTE makes it 3
+    locking_select_is_ordered  t      A5's ORDER BY
+    new_data_is_materialised   t      A3's single evaluation
+    upsert_and_prune_are_fused t      A3's single statement
+    new_data_is_ordered        t      insert-order locking
+
+That is white-box, and deliberately so. Every one of those properties exists
+because a correctness fix depends on it, and each has a comment in the test
+saying which. M4 is the case that proves the gate earns its place: it is
+behaviourally benign — verified — so no behavioural test can catch it, yet it
+removes the guarantee A3 rests on. Only the structural assertion sees it.
 
 Two things went wrong on the way to these and are worth not repeating.
 
