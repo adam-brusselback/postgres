@@ -73,6 +73,15 @@ step s2_move   { UPDATE mvsnap_base SET grp = 1 WHERE id = 4;
 step s2_wake   { SELECT injection_points_wakeup('matview-where-locked'); }
 step s2_detach { SELECT injection_points_detach('matview-where-locked'); }
 
+# Overlapping refresh, issued while s1 is parked.  This is the part that makes
+# the spec a detector rather than a characterisation: it can only block if s1 is
+# already holding the row locks by the time it reaches the injection point.
+# Move the locking SELECT after the CTE -- a plausible "save a round trip"
+# reordering -- and this step stops waiting, which is precisely the A3 window
+# reopening.
+session s2b
+step s2b_ref   { REFRESH MATERIALIZED VIEW CONCURRENTLY mvsnap WHERE grp = 1; }
+
 session s3
 # What the matview holds afterwards, against what a full refresh would give.
 step s3_state  { SELECT id, grp, v FROM mvsnap ORDER BY id; }
@@ -85,4 +94,7 @@ step s3_truth  { REFRESH MATERIALIZED VIEW mvsnap;
 # correct.  The two need not agree -- a partial refresh only promises to make
 # its own scope right -- but whatever the answer is, it is now pinned, and a
 # change to the two-statement structure has to change this file to land.
-permutation s1_ref s2_move s2_wake s1_noop s2_detach s3_state s3_truth
+# s1 parks holding row locks on grp = 1.  s2b_ref must wait for them.  s2_move
+# then commits a base change neither statement of s1 has seen in full, s2_wake
+# releases s1, and the state observations pin what that produces.
+permutation s1_ref s2b_ref s2_move s2_wake s1_noop s2_detach s3_state s3_truth

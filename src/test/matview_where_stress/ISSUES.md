@@ -226,15 +226,34 @@ all. Its logic belongs in an injection-point isolation spec, where it is
 deterministic, runs under the standard suites, and does not depend on winning a
 race often enough to notice.
 
-Still to write, before any optimisation work:
+### The three gates, and what each was proved to catch
 
-1. an injection-point isolation spec for lock ordering, covering **both** M1 and
-   M2 — the locking `SELECT` only covers rows that already exist, so rows the
-   refresh *inserts* take their locks in `new_data` order and nothing tests that;
-2. `a3-split-gap.sh` promoted from a demonstration to a test — it currently
-   hand-writes two-statement SQL against a plain table rather than driving the
-   real `REFRESH`, which is why it missed M4 (correctly, as it turns out, but it
-   would also have missed a real version of that hazard).
+All three are written and each was verified by failing under a mutation, not
+assumed to work. B17 is closed.
+
+| gate | property | mutation | result |
+|---|---|---|---|
+| `matview-where-lockorder.spec` (isolation) | the locking `SELECT` orders by the arbiter key | M1 · drop that `ORDER BY` | **fails in 60 ms**; the `locked` column inverts from rows 1-5 to rows 6-10 |
+| `matview_where` Test 16 (regress) | `new_data` orders by the arbiter key | M2 · drop that `ORDER BY` | **fails**; insert order goes `{11..20}` → `{20..11}` |
+| `matview-where-snapshot.spec` (injection points) | the row locks are held **before** the CTE runs | M6 · move the locking `SELECT` after the CTE | **fails**; the overlapping refresh stops reporting `<waiting ...>` |
+
+Two things went wrong on the way to these and are worth not repeating.
+
+**The obvious lock-order design cannot work.** A third session probing each end
+with a competing refresh cannot be ordered to terminate: whichever probe
+succeeds holds a row the blocked refresh still needs, so the permutation stalls
+in one of the two cases. The first version did exactly that and hung for 720
+seconds under M1 — a far worse failure than a diff. Reading `xmax` off the heap
+works because the observer takes no lock anyone wants.
+
+**The first snapshot spec was a characterisation test that could not fail.** It
+parked a refresh at the injection point, landed a base change, and pinned the
+resulting state — and passed identically under M6, because the CTE runs after
+the injection point either way and so sees the change either way. Adding an
+overlapping refresh that must block while the first is parked turned it into a
+detector: that step can only wait if the locks are already held when the
+injection point is reached, which is exactly the A3 property. The lesson from
+the A5 reproducer applies to tests you just wrote, not only to old ones.
 
 ---
 
