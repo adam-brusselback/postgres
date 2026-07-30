@@ -11,10 +11,11 @@
 # than around the code that currently delivers it.
 #
 #   p2      P2, deterministic lock order over EXISTING rows.
-#           Two sessions refresh the same rows through predicates that plan
+#           N sessions refresh the same rows through two predicates that plan
 #           differently -- an index scan ascending and a sequential scan over
-#           rows inserted in descending order.  Without a common order the two
-#           take the same locks in opposite orders.  Signal: deadlock.
+#           rows inserted in descending order, alternated across the sessions.
+#           Without a common order, adjacent sessions take the same locks in
+#           opposite orders.  Signal: deadlock.
 #
 #   p3      P3, deterministic lock order over INSERTED rows.
 #           Same shape, but the rows are absent from the matview so the refresh
@@ -22,7 +23,7 @@
 #           speculative insertions of the same key.  Signal: deadlock.
 #
 #   serial  Overlapping refreshes serialize (what A3's FOR UPDATE is for).
-#           A writer drives the base monotonically upward while two sessions
+#           A writer drives the base monotonically upward while N sessions
 #           refresh the same scope.  If the refreshes serialize, each one takes
 #           its snapshot after the previous commits, so the matview's total over
 #           the scope can only ever rise.  If they do not, two can compute from
@@ -48,7 +49,7 @@ MODES=${*:-p2 p3 serial}
 ITER=${ITER:-40}
 ROWS=${ROWS:-40000}
 HOT=${HOT:-3000}
-SPIN=${SPIN:-300}
+REFRESHERS=${REFRESHERS:-4}
 
 WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT
@@ -70,9 +71,9 @@ say() { printf '%s\n' "$*"; }
 setup() {
     $PSQL -v ON_ERROR_STOP=1 >/dev/null <<SQL || exit 2
 DROP MATERIALIZED VIEW IF EXISTS fz_mv;
-DROP TABLE IF EXISTS fz_base, fz_viol;
-DROP PROCEDURE IF EXISTS fz_write(int);
-DROP PROCEDURE IF EXISTS fz_watch(int);
+DROP TABLE IF EXISTS fz_base, fz_viol, fz_stop, fz_stat;
+DROP PROCEDURE IF EXISTS fz_write();
+DROP PROCEDURE IF EXISTS fz_watch();
 CREATE TABLE fz_base (id int PRIMARY KEY, tag text, v bigint);
 INSERT INTO fz_base
   SELECT g, CASE WHEN g <= $HOT THEN 'hot' ELSE 'cold' END, g
@@ -99,8 +100,13 @@ check_plans() {
 deadlocks_in() { grep -c 'deadlock detected' "$1" 2>/dev/null || true; }
 
 # ------------------------------------------------------------------- p2 ----
+# More sessions, not more iterations.  Measured under M1: ITER=40 over two
+# sessions found 4 deadlocks, ITER=150 over the same two found 1 -- the rate is
+# per run, not per refresh, because two sessions settle into lockstep and stop
+# overlapping in the way that deadlocks.  Adding sessions breaks the lockstep;
+# lengthening the run does not.
 mode_p2() {
-    say "== p2: lock order over existing rows ($ITER refreshes x 2 sessions)"
+    say "== p2: lock order over existing rows ($REFRESHERS sessions x $ITER)"
     setup
     check_plans || { say "  SKIP"; return 0; }
 
@@ -112,18 +118,30 @@ mode_p2() {
         i=$((i + 1))
     done
 
-    $PSQL -f "$WORKDIR/a.sql" > "$WORKDIR/a.out" 2>&1 &
-    pa=$!
-    $PSQL -f "$WORKDIR/b.sql" > "$WORKDIR/b.out" 2>&1 &
-    pb=$!
-    wait $pa $pb
+    # Alternate the two predicates across the sessions, so every adjacent pair
+    # scans in opposite orders.
+    pp=''
+    j=1
+    while [ "$j" -le "$REFRESHERS" ]; do
+        f=$([ $((j % 2)) -eq 1 ] && echo a || echo b)
+        $PSQL -f "$WORKDIR/$f.sql" > "$WORKDIR/p2-$j.out" 2>&1 &
+        pp="$pp $!"
+        j=$((j + 1))
+    done
+    wait $pp
 
-    d=$(( $(deadlocks_in "$WORKDIR/a.out") + $(deadlocks_in "$WORKDIR/b.out") ))
+    d=0
+    j=1
+    while [ "$j" -le "$REFRESHERS" ]; do
+        d=$(( d + $(deadlocks_in "$WORKDIR/p2-$j.out") ))
+        j=$((j + 1))
+    done
+
     if [ "$d" -gt 0 ]; then
-        say "  FAIL: $d of $((ITER * 2)) refreshes deadlocked"
+        say "  FAIL: $d of $((ITER * REFRESHERS)) refreshes deadlocked"
         fail=1
     else
-        say "  ok: no deadlocks in $((ITER * 2)) refreshes"
+        say "  ok: no deadlocks in $((ITER * REFRESHERS)) refreshes"
     fi
 }
 
@@ -166,36 +184,47 @@ SQL
 
 # --------------------------------------------------------------- serial ----
 mode_serial() {
-    say "== serial: overlapping refreshes serialize ($SPIN polls)"
+    say "== serial: overlapping refreshes serialize ($REFRESHERS sessions x $ITER)"
     setup
 
     $PSQL -v ON_ERROR_STOP=1 >/dev/null <<SQL || exit 2
 CREATE TABLE fz_viol(t timestamptz, prev bigint, cur bigint);
+CREATE TABLE fz_stop(x bool);
+CREATE TABLE fz_stat(polls bigint);
 
--- Drives the scope monotonically upward.  COMMIT per iteration so each refresh
--- has a distinct, newer state to observe.
-CREATE OR REPLACE PROCEDURE fz_write(n int) LANGUAGE plpgsql AS \$\$
+-- Both of these run until the refreshers are finished rather than for a fixed
+-- count, and that is not a detail.  With a fixed count the writer ran out long
+-- before the refreshes did, so most of the run raced over a base nobody was
+-- changing -- where no lost update is possible even under a mutation that
+-- guarantees them.  Measured: M6 detected in 1 run out of 4.  Driving the
+-- writer for the whole window is what makes the detector a gate rather than a
+-- coin flip.
+CREATE OR REPLACE PROCEDURE fz_write() LANGUAGE plpgsql AS \$\$
 BEGIN
-  FOR i IN 1..n LOOP
+  LOOP
     UPDATE fz_base SET v = v + 1 WHERE id <= $HOT;
     COMMIT;
+    EXIT WHEN EXISTS (SELECT 1 FROM fz_stop);
   END LOOP;
 END \$\$;
 
 -- COMMIT before each read, or the whole loop runs on one snapshot and sees
 -- nothing move.  A decrease means an older snapshot committed after a newer
 -- one: the refreshes did not serialize.
-CREATE OR REPLACE PROCEDURE fz_watch(n int) LANGUAGE plpgsql AS \$\$
-DECLARE last bigint := -1; cur bigint;
+CREATE OR REPLACE PROCEDURE fz_watch() LANGUAGE plpgsql AS \$\$
+DECLARE last bigint := -1; cur bigint; n bigint := 0;
 BEGIN
-  FOR i IN 1..n LOOP
+  LOOP
     COMMIT;
     SELECT coalesce(sum(v), 0) INTO cur FROM fz_mv WHERE id <= $HOT;
     IF cur < last THEN
       INSERT INTO fz_viol VALUES (clock_timestamp(), last, cur);
     END IF;
     last := cur;
+    n := n + 1;
+    EXIT WHEN EXISTS (SELECT 1 FROM fz_stop);
   END LOOP;
+  INSERT INTO fz_stat VALUES (n);
 END \$\$;
 SQL
 
@@ -206,14 +235,29 @@ SQL
         i=$((i + 1))
     done
 
-    $PSQL -c "CALL fz_write($ITER);"  > "$WORKDIR/w.out"  2>&1 &  pw=$!
-    $PSQL -c "CALL fz_watch($SPIN);"  > "$WORKDIR/m.out"  2>&1 &  pm=$!
-    $PSQL -f "$WORKDIR/r.sql"         > "$WORKDIR/r1.out" 2>&1 &  p1=$!
-    $PSQL -f "$WORKDIR/r.sql"         > "$WORKDIR/r2.out" 2>&1 &  p2=$!
-    wait $pw $pm $p1 $p2
+    $PSQL -c "CALL fz_write();" > "$WORKDIR/w.out" 2>&1 &  pw=$!
+    $PSQL -c "CALL fz_watch();" > "$WORKDIR/m.out" 2>&1 &  pm=$!
+
+    rp=''
+    j=1
+    while [ "$j" -le "$REFRESHERS" ]; do
+        $PSQL -f "$WORKDIR/r.sql" > "$WORKDIR/r$j.out" 2>&1 &
+        rp="$rp $!"
+        j=$((j + 1))
+    done
+    wait $rp
+
+    # Refreshers are done; release the writer and the watcher.
+    $PSQL -c "INSERT INTO fz_stop VALUES (true)" >/dev/null 2>&1
+    wait $pw $pm
 
     v=$($PSQL -Atc "SELECT count(*) FROM fz_viol")
-    d=$(( $(deadlocks_in "$WORKDIR/r1.out") + $(deadlocks_in "$WORKDIR/r2.out") ))
+    d=0
+    j=1
+    while [ "$j" -le "$REFRESHERS" ]; do
+        d=$(( d + $(deadlocks_in "$WORKDIR/r$j.out") ))
+        j=$((j + 1))
+    done
 
     if [ "${v:-0}" -gt 0 ]; then
         say "  FAIL: $v lost updates (matview total went backwards)"
@@ -223,7 +267,7 @@ SQL
         say "  FAIL: $d refreshes deadlocked"
         fail=1
     else
-        say "  ok: no lost updates over $SPIN polls"
+        say "  ok: no lost updates ($($PSQL -Atc 'SELECT polls FROM fz_stat') polls)"
     fi
 }
 

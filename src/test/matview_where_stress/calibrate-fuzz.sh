@@ -22,7 +22,7 @@ PORT=${PORT:-5610}
 DB=${DB:-postgres}
 PREFIX=${PREFIX:-/home/user/pgsql-opt}
 ITER=${ITER:-40}
-SPIN=${SPIN:-400}
+REFRESHERS=${REFRESHERS:-4}
 
 MUTS=${*:-M1 M2 M3 M6}
 
@@ -30,7 +30,7 @@ printf '%-8s %-5s %-9s %6s  %s\n' MUT ISSUE VERDICT SECS 'MODE THAT FIRED'
 printf '%s\n' '---------------------------------------------------------------'
 
 run_fuzz() {
-    su pgtest -c "PSQL_BIN=$PREFIX/bin/psql ITER=$ITER SPIN=$SPIN \
+    su pgtest -c "PSQL_BIN=$PREFIX/bin/psql ITER=$ITER REFRESHERS=$REFRESHERS \
         $DIR/fuzz.sh $PORT $DB" > "$1" 2>&1
 }
 

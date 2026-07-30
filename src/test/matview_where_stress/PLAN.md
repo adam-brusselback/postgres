@@ -296,6 +296,83 @@ requires knowing which those are, and right now the fuzzer does not cover Test
 11 (B4) — it only does since case 19 — or Test 15 (B6) at all. Any deletion
 list has to be derived from a calibration run, not from reading the tests.
 
+#### Measured, against the concurrent fuzzer
+
+`fuzz.sh`, the instrument for the four the oracle cannot see. Three modes, each
+aimed at a guarantee rather than at the code that currently delivers it:
+`p2` and `p3` drive two sessions through predicates that plan differently — an
+index scan against a sequential scan over rows stored in descending order — over
+existing rows and over rows the refresh has to insert, and watch for deadlock.
+`serial` drives the base monotonically upward under concurrent refreshes and
+watches for the matview's total over the scope going *down*, which is a lost
+update and means the refreshes did not serialize.
+
+| mutation | issue | mode that fires | verdict | signal |
+|---|---|---|---|---|
+| M1 · drop `ORDER BY`, locking `SELECT` | A5 | `p2` | **CAUGHT** 92s | 76 of 160 deadlocked |
+| M2 · drop `ORDER BY`, `new_data` | P3 | `p3` | **CAUGHT** 81s | 40 of 80 deadlocked |
+| M3 · remove the locking `SELECT` | A3 | `serial` | **CAUGHT** 44s | 45 lost updates |
+| M6 · lock after instead of before | A3 | `serial` | **CAUGHT** 49s | 55 lost updates |
+| *pristine* | — | — | **QUIET** 39s | — |
+
+Each is caught by the mode aimed at it and by no other. That specificity is the
+useful part: `p2` stays quiet under M2, `p3` stays quiet under M1, and both stay
+quiet under M3 and M6, where removing the locking altogether leaves nothing to
+deadlock on. M3's signal reads exactly 6000 — two increments across 3000 rows —
+which is what a stale snapshot committing last looks like.
+
+**M2 closes B17's open item.** It was recorded there as the single genuinely
+uncovered mutation, caught by no gate in the tree.
+
+#### Catching it once is not the same as being a gate
+
+A mutation caught in one run can still be missed in the next, and a gate that
+misses is worse than no gate because it is believed. So each detection was
+repeated six times, counting not just whether it fired but how hard.
+
+| mutation | mode | rate | events per run |
+|---|---|---|---|
+| M1 | `p2` | 6/6 | 1 1 1 1 4 1 |
+| M2 | `p3` | 6/6 | 40 40 40 40 39 40 |
+| M3 | `serial` | 6/6 | 24 25 24 25 27 29 |
+| M6 | `serial` | 6/6 | 28 28 28 26 33 25 |
+
+Never missed in 24 runs — but read the M1 row, not the rate column. One event
+means the catch hangs on a single scheduling coincidence, and a detector that
+reports a clean run when the coincidence does not happen is exactly the failure
+this table exists to find. It is why the repeat pass is worth its runtime: the
+one-shot calibration showed M1 CAUGHT and said nothing about how narrowly.
+
+Those numbers are from *before* the `p2` change described below; the final
+figures are in the calibration table above. Two rounds of tuning got there, and
+both are worth recording, because the parameter that looked obvious was the
+wrong one each time.
+
+**`serial` was a coin flip.** The writer and watcher ran for a fixed count and
+finished long before the refreshers, so most of each run raced over a base
+nobody was changing — where no lost update is possible even under a mutation
+that guarantees them. Measured rate for M6: **3 of 6**, 1–2 events when it fired.
+Driving both until the refreshers finish took it to 6/6 at 25–33 events.
+
+**`p2` did not respond to a longer run at all.** Under M1, `ITER=40` across two
+sessions found 4 deadlocks and `ITER=150` across the same two found **1**. The
+rate is per run, not per refresh: two sessions settle into lockstep and stop
+overlapping in the way that deadlocks, so a longer run mostly adds refreshes
+that cannot fail. Sessions are the lever instead —
+
+    2 sessions    1 of 80    (1%)
+    4 sessions   77 of 160  (48%)
+    6 sessions  173 of 240  (72%)
+
+so the default is 4, and pristine stays quiet at that width.
+
+The common thread is worth stating because it will recur in Phase 3. Neither
+detector was wrong about *what* to observe — both invariants were right and both
+did fire. They were wrong about *when* and *how widely*, and a detector that is
+live for only part of the window, or that lets its sessions fall into step,
+reports a clean run for the same reason a correct implementation does. "Ran
+longer" is the intuitive knob and it was the useless one in both cases.
+
 ### 1.2 Move structural invariants from tests into the code
 
 The `pg_stat_statements` block asserts things that are genuinely load-bearing —
