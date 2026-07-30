@@ -2,9 +2,9 @@
 
 Branch-local. Not part of the patch.
 
-Three phases, in this order and for this reason: the tests are what let the
+Seven phases. The first three are the substance -- the tests are what let the
 implementation change safely, and the implementation change is what makes the
-performance work worth doing. Doing them in any other order means optimising
+performance work worth doing -- and the rest carry it to a posted patch. Doing them in any other order means optimising
 code that is about to be replaced, or replacing code with no way to tell whether
 it still behaves.
 
@@ -85,12 +85,15 @@ survives; shape does not.
 
 | what | why it survives |
 |---|---|
-| the safety oracle, 2792 mutations | mutates base data, refreshes, diffs against a full refresh — never looks at how the refresh is done |
+| the safety oracle, 3176 mutations | mutates base data, refreshes, diffs against a full refresh — never looks at how the refresh is done |
 | the benchmark suite | same, and it becomes the before/after measurement |
 | `matview_where` Tests 1–15 | behavioural: INCLUDE columns, NULL keys, drift, multiple unique indexes, lock levels |
 | `matview_where_privs` Tests 2, 3 | scoped maintenance exemption; `PG_TRY` restoring the flag |
 | `matview-where-serialize.spec` | readers never block; overlapping refreshes serialize; disjoint ones do not |
 | `matview-where-deadlock.spec` | characterisation of cross-statement deadlock |
+| `matview-where-insertorder.spec` | P3, via `pg_blocking_pids()` — added in Phase 1 |
+| `matview_where_contract.sql` | the promises, stated with no reference to the implementation — added in Phase 1 |
+| `fuzz.sh`, `safety/rundiff.sh` | concurrency and cross-implementation gates; probabilistic, and deleted at Phase 4 |
 
 **Action: none.** Run them before and after every step of Phase 2. They must not
 change. If one of them changes, the rewrite altered semantics.
@@ -126,9 +129,9 @@ otherwise is punishing correct work.
 
 | property | what must hold | current mechanism (one way to satisfy it) | is the gate property-level? |
 |---|---|---|---|
-| **P1 — single evaluation** | the upsert and the prune agree about which rows the view produces | one `MATERIALIZED` CTE | **no** — the `pg_stat_statements` block matches on the literal text `new_data AS MATERIALIZED` |
+| **P1 — single evaluation** | the upsert and the prune agree about which rows the view produces | one `MATERIALIZED` CTE | **not deterministically, and it cannot be** — a correct implementation has no observable window (1.1b). Gated by `fuzz.sh`'s `serial` mode, which catches M3 and M6 at 45 and 55 events. The `pg_stat_statements` block matched the literal text and is to be deleted |
 | **P2 — deterministic lock order, existing rows** | two overlapping refreshes lock the rows they share in the same order | `ORDER BY` on the locking `SELECT` | **yes** — `matview-where-lockorder.spec` observes *which rows are locked* via `xmax`, and says nothing about how the order was achieved |
-| **P3 — deterministic lock order, inserted rows** | two refreshes inserting the same new keys do not deadlock | `ORDER BY` inside `new_data` | **no** — Test 16 reads ctid order, a proxy that only holds while insertion order and lock order are the same thing |
+| **P3 — deterministic lock order, inserted rows** | two refreshes inserting the same new keys do not deadlock | `ORDER BY` inside `new_data` | **yes, since Phase 1** — `matview-where-insertorder.spec` reads which session a covering refresh blocked on via `pg_blocking_pids()`, which names the order the locks were taken in and not the order the rows landed in. Test 16's ctid proxy is retained only as a smoke test |
 
 P2 is the model. It was arrived at by accident — the direct probe was
 unorderable, so it fell back to observing state — but the accident produced the
@@ -187,7 +190,7 @@ deletion at Phase 4.
 
 Today the oracle compares a partial refresh against a full refresh. During the
 rewrite it can do something far stronger: **compare the old implementation
-against the new one, over the same 2792 mutations.**
+against the new one, over the same 3176 mutations.**
 
 Keep both paths reachable behind a developer GUC for the duration of the
 rewrite. For each mutation, run it under old and under new and diff the
@@ -764,9 +767,12 @@ static suite it produced, against whatever implementation actually landed.
 - Every minimised fuzzer finding becomes a regression test or an isolation spec,
   each with a comment saying what it is guarding and, where relevant, which
   reviewer raised it.
-- The property gates get re-derived against the final implementation: P2's spec
-  re-verified, P3's no-deadlock test in place, P1's `Assert()` sited where the
-  final code establishes the guarantee.
+- The property gates get re-derived against the final implementation. All three
+  exist as of Phase 1: P2's spec and P3's spec both re-verified against the new
+  code, and P1's gates re-run — noting that P1 has no `Assert()` and is not
+  going to get one, because there is nothing at build time to inspect (1.2). Its
+  gate is `fuzz.sh`'s `serial` mode, which is why the fuzzer outlives the
+  implementation work by one phase.
 - Every test that only existed to guard the old mechanism is deleted, not
   carried forward. `ISSUES.md`'s Disposition column says which — but several
   entries are *conditional*, and the conditions have to be read as fired or not
@@ -778,6 +784,10 @@ static suite it produced, against whatever implementation actually landed.
   | A5 · `run.sh`, "delete with this directory" | Phase 4 | fires here |
   | B1/B2 · cache tests, "delete if the plan cache goes away" | Phase 2.1 removes most of the cache's reason to exist | **read at Phase 2 exit**, not before |
   | B9 · Test 13 search_path half | settled: the restriction stays | **resolved** — keep, add an `errhint` |
+  | Test 16 · ctid order, "keep until the property-level version exists" | `matview-where-insertorder.spec` landed in Phase 1 | **fired** — delete here |
+  | `pg_stat_statements` structural block, "delete at the start of Phase 2" | Phase 2 opening | fires before the first line of the rewrite, not after |
+  | `matview-where-snapshot`, "delete when the premise goes" | the rewrite fusing the lock into one plan | **read at Phase 2 exit** |
+  | `matview_where_privs` Test 1, "rewrite if the predicate runs as the invoker" | Phase 2's privilege model | **read at Phase 2 exit** — it inverts rather than lapsing, so it must be rewritten, not regenerated |
 
   A conditional disposition nobody re-reads is how Test 14 came to sit in the
   tree for a dozen commits announcing that a swap which had already landed was

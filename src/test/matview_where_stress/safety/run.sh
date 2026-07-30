@@ -10,8 +10,8 @@
 #       carries the planner-signal measurement (residual qual / InitPlan).
 #
 #   exhaustive (exh*.sql + exh_driver.sql)
-#       ~18 (view, predicate) pairs, each run against its complete single-row
-#       mutation space over a 12-row base table.  ~2800 refresh cycles.
+#       21 (view, predicate) pairs, each run against its complete single-row
+#       mutation space over a 12-row base table.  1588 per form, 3176 total.
 #
 # The oracle is the same in both: mutate, partial refresh, snapshot, full
 # refresh, symmetric difference.  A non-empty difference is a counterexample.

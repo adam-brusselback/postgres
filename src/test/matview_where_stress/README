@@ -5,13 +5,14 @@ This directory is NOT part of any test schedule and is not wired into either
 build system.  Delete it before posting the patch to -hackers.  It holds the
 things that do not belong in the patch itself:
 
-  PLAN.md       Scoped work in three phases: what the tests need before the
-                implementation can change safely, the change itself (string-built
-                SQL through SPI -> Query trees), and the performance work that
-                only makes sense afterwards.  Read this second.
+  PLAN.md       Seven phases: what the tests need before the implementation can
+                change safely, the change itself (string-built SQL through SPI
+                -> Query trees), the performance work that only makes sense
+                afterwards, and the path from there to a posted patch.  Read
+                this second.  Phase 1 is complete; Phase 2 is next.
 
   ISSUES.md     Review items, split into those raised on the -hackers thread
-                (A1-A9) and those found separately (B1-B17), each mapped to the
+                (A1-A9) and those found separately (B1-B18), each mapped to the
                 test that covers it.  Start here.
 
   SAFETY.md     Which predicates are safe, established by differential testing
@@ -24,10 +25,6 @@ things that do not belong in the patch itself:
                 it.  Intended to feed the documentation and the design
                 discussion.
 
-  safety/       The differential safety oracle.  See below.
-
-  run.sh        The lock-ordering stress reproducer.  See below.
-
 All timings in these files come from a -O2 build with assertions off unless they
 say otherwise.  An earlier revision quoted debug-build numbers under the caveat
 "treat ratios as transferable"; that caveat did not hold, and several ratios
@@ -35,54 +32,79 @@ moved materially when re-measured.  Do not add a timing here without recording
 which build produced it.
 
 
-safety/ -- the differential oracle
-----------------------------------
+The instruments
+---------------
 
-    safety/run.sh [PGPORT] [PGDATABASE]        # PSQL_BIN=... to choose a psql
+Four of these are detectors and two are the scaffolding that makes them
+trustworthy.  Every detector here has been shown to fail against a bug it is
+meant to catch; that is the entry requirement, not a nicety.  Several of them
+did not, at first, and looked exactly like working tests.
 
-For each (view shape, predicate, mutation): build the matview, mutate the base
-data, partial refresh, snapshot, full refresh, symmetric difference.  A
-non-empty difference is a counterexample -- proof that the predicate is unsafe
-for that view.  An empty one is evidence, not proof.
+  safety/run.sh       The single-session differential oracle.  For each (view
+                      shape, predicate, mutation): mutate the base, partial
+                      refresh, snapshot, full refresh, symmetric difference.
+                      21 exhaustive shapes over a 12-row base table -- 1588
+                      mutations per refresh form, 3176 in total -- plus 42
+                      single-shot triples carrying the planner-signal
+                      measurement.  Answers "is this predicate safe".
 
-Two harnesses share the oracle.  The single-shot one covers 42 (view, predicate,
-mutation) triples and also records what the planner did with the predicate.  The
-exhaustive one takes 18 (view, predicate) pairs and runs each against its
-complete single-row mutation space over a 12-row base table -- about 2800
-refresh cycles.  Both refresh forms are run for every case, and they have agreed
-on every shape so far.
+  safety/rundiff.sh   Differential mode.  Two identical matviews, one refreshed
+                      each way, diffed against each other.  Answers "do two
+                      implementations agree", which is a different question:
+                      both forms can be identically wrong on an unsafe shape and
+                      this stays quiet, correctly.  Today it compares the bare
+                      form against CONCURRENTLY; in Phase 2 the same harness
+                      compares old against new.
 
-It found the use-after-free that is now B14 before it answered any question
-about predicates.
+  fuzz.sh             The concurrent fuzzer, and the only thing here that can
+                      see a bug needing two sessions.  Three modes: p2 and p3
+                      for lock ordering over existing and inserted rows, serial
+                      for whether overlapping refreshes actually serialize.
+                      Probabilistic, and deleted at Phase 4.
+
+  run.sh              The original A5 lock-ordering reproducer.  Superseded by
+                      fuzz.sh's p2 mode, kept because it is the script the
+                      -hackers thread refers to.
+
+  mutations.py        Re-introduces known bugs one at a time, defined as edits
+                      to `git show HEAD:` rather than to a copy kept somewhere.
+                      It refuses to overwrite matview.c if the working copy is
+                      not one of the variants it can itself produce -- it once
+                      silently deleted two uncommitted assertions, and the
+                      suites that ran green afterwards were green because there
+                      was nothing left to check.
+
+  rebuild.sh          Rebuilds and then proves the rebuild happened, by asking
+                      the running server what it was compiled with.  autodepend
+                      is empty in this tree, so a configure change relinks stale
+                      objects and exits 0; that produced two silently wrong
+                      builds before this existed.  A .c change needs --source;
+                      a flag change needs --full, which runs make clean.
+
+  calibrate.sh        Measures which known bugs the oracle detects, against a
+  calibrate-fuzz.sh   recorded pristine vector rather than a hand-written list
+                      of shapes to check.  The list that existed before this did
+                      omit the one shape whose behaviour was unexplained.
 
 
-run.sh -- the lock-ordering reproducer
---------------------------------------
+What the calibration says
+-------------------------
 
-    ./run.sh [PGPORT] [PGHOST] [PGDATABASE]
+    A4  drop ON CONFLICT                 CAUGHT   oracle, via errs
+    B4  anti-join NULL handling          CAUGHT   oracle, both NULLable shapes
+    B6  wrong unique index               CAUGHT   oracle, via errs
+    M1  drop ORDER BY, locking SELECT    CAUGHT   fuzz.sh p2
+    M2  drop ORDER BY, new_data          CAUGHT   fuzz.sh p3
+    M3  remove the locking SELECT        CAUGHT   fuzz.sh serial
+    M6  lock after instead of before     CAUGHT   fuzz.sh serial
+    M4  NOT MATERIALIZED                 MISSED   verified benign; nothing to catch
 
-Defaults: port 5432, host /tmp, database postgres.  Requires psql on PATH.
+The oracle misses all four concurrency mutations and always will: it is
+single-session, and a lock-ordering bug needs a second session to be a bug in.
+That is the measurement that says fuzz.sh has to exist, not a defect in the
+oracle.  Two of the three data bugs were invisible until the corpus grew a shape
+for them (a NULLable key, and two unique indexes), and both misses presented as
+clean runs.
 
-This reproduces A5's non-deterministic variant, which cannot be expressed as an
-isolation spec.  The row-locking step of refresh_by_direct_modification() locks
-the rows its predicate selects; with no ORDER BY it locks them in whatever order
-the plan produces, so two concurrent refreshes with different plans over
-overlapping rows deadlock.  Driving that needs both statements simultaneously
-mid-scan, which isolationtester cannot arrange -- it steps one session at a
-time.
-
-The script builds a matview whose physical row order is the reverse of its key
-order, then runs two sessions in parallel: one whose predicate the planner
-satisfies with an index scan (ascending key order), and one whose predicate
-forces a sequential scan (descending key order).  It exits non-zero and prints a
-count if any deadlock is detected.
-
-A5 is now FIXED -- the locking SELECT and the CTE both ORDER BY the arbiter key
--- so this script should exit zero on the current tree.  It is kept as a
-regression guard for the life of this branch.  On the tree as originally posted,
-roughly half the refreshes aborted.
-
-The ORDER BY fixes only this variant.  For the cross-statement variant, in
-src/test/isolation/specs/matview-where-deadlock.spec, it does not help:
-ordering within one statement says nothing about the order of separate
-statements.
+The oracle also found the use-after-free that is now B14, before it answered any
+question about predicates.

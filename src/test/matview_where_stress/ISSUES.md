@@ -9,9 +9,10 @@ been mentioned there. Each row names the test that covers it, so a fix shows up
 as that test turning green.
 
 **All of these are now fixed unless marked otherwise, and the whole suite is
-green** — regress 248/248, isolation 133/133, pg_stat_statements 16/16, verified
-on both a `-O0 --enable-cassert` and a `-O2` build. The State column records what
-happened.
+green** — regress 249/249, isolation 135/135, injection_points 11/11,
+pg_stat_statements 16/16, most recently on a `-O2 --enable-cassert` build with
+the two `Assert()`s in `refresh_by_direct_modification()` live. The State column
+records what happened.
 
 The **Disposition** column says whether a test is worth leaving in the tree once
 its issue is fixed, or is scaffolding to remove then. The reasoning for each is
@@ -68,7 +69,7 @@ The safety harness crashed the server twice, both times on the same call:
     DETAIL:  Failed process was running: SELECT run_exh('proj_nonkey_union','concurrently')
 
 Only the `CONCURRENTLY` form, which is the only one that uses these cached
-plans. It has not reproduced since — three full harness runs, ~2800 refresh
+plans. It has not reproduced since — three full harness runs of the corpus as it then stood, ~2800 refresh
 cycles each, are clean before *and* after the fix — so **the crash is evidence
 that something is wrong, not evidence that this was it**. What justifies the fix
 is the code, which is wrong by construction whether or not it can be made to
