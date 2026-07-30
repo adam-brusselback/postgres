@@ -96,6 +96,64 @@ reclaimed. Behaviour is unchanged: all 36 harness shape-runs return identical
 verdicts before and after, and regress 248/248, isolation 133/133 and
 pg_stat_statements 16/16 are green.
 
+### On B9, and why the thread settles it
+
+Adam's own answer on the privilege escalation is the decisive fact:
+
+> There's one plan, executed under one userid.  I can't run the (<view
+> definition>) subquery as the owner and the WHERE (<predicate>) as the invoker,
+> SPI executes the whole statement in whatever security context is active when
+> it runs.  **So the predicate runs as the owner.**
+
+A caller-supplied `search_path` combined with owner-context execution is the
+CVE-2018-1058 shape exactly, and it is why `RestrictSearchPath()` exists and is
+already used for `REFRESH`, index builds and maintenance commands generally.
+Opening the path up would hand an unprivileged caller control over name
+resolution inside a statement running as the matview's owner — reopening, by a
+different route, the hole A6 closes.
+
+Dharin's note on the thread points the same way rather than against it:
+
+> the regression script has a comment "Subqueries -> Error" but the expected
+> output shows no error for the **schema-qualified** subquery.
+
+That is a complaint about the *comment*, not about the requirement — and he
+found the escape hatch (qualify the names) without prompting. The requirement is
+discoverable; what is not discoverable is *why* an unqualified name fails, since
+today it surfaces as a bare `relation "f" does not exist`.
+
+So: keep `RestrictSearchPath()`, document that predicates must schema-qualify
+and say that it is a consequence of the predicate running as the owner, and give
+the error an `errhint` pointing at qualification rather than leaving the user to
+guess.
+
+### On the fused CTE, and whether it can be split for speed
+
+It cannot. Two plain statements measured 1.5× cheaper than the fused CTE
+(20.7 vs 32.0 µs), but splitting reopens a consistency gap of the same family as
+A3 — not the original `DELETE`→`INSERT` one, a second one that the fusion is
+what closes. Demonstrated directly:
+
+    matview and base both hold (1,10) (2,20) (3,30); base row 3 is then deleted,
+    so a refresh over id 1..3 should prune it.  A concurrent session re-inserts
+    base row 3 as (3,999) partway through the refresh.
+
+    two statements:  mv row 3 = 30   <- stale, and neither statement corrects it
+    fused CTE:       mv row 3 = 999  <- correct
+
+At `READ COMMITTED` each statement takes its own snapshot, so the upsert sees a
+base without row 3 and skips it, and the prune then sees a base *with* row 3 and
+declines to delete it. The stale row survives both. The fused CTE computes
+`new_data` once and has no such window. The `SELECT ... FOR UPDATE` does not
+help: it locks matview rows, and the interfering write is to the base table.
+
+That closes the largest of the scope-1 overheads. The `ORDER BY` inside
+`new_data` (13%) is a separate question and is not obviously removable either:
+the locking `SELECT` only covers matview rows that already exist and match the
+predicate, so rows the refresh *inserts* take their locks in `new_data` order
+and two concurrent refreshes inserting the same new keys could deadlock without
+it.
+
 ---
 
 ## B. Not mentioned on the thread
@@ -110,7 +168,7 @@ pg_stat_statements 16/16 are green.
 | B6 | With more than one unique index, `direct_mod` can collide on a non-arbiter index and reject a row set that both the full and the concurrent refresh accept | `matview_where` Test 15 | **DOCUMENTED LIMITATION** — direct modification cannot; the bare form can | keep |
 | B7 | Cache entries are never invalidated or freed — no relcache callback, no `HASH_REMOVE`. Leaks saved plans for dropped matviews, and underlies B1–B3 | none | **FIXED** by the relcache callback | n/a |
 | B8 | Rowcount handed to `SetQueryCompletion()` is `SPI_processed` after the fused CTE, whose top statement is the `DELETE` — so `pg_stat_statements` sees deletions only | `contrib/pg_stat_statements` `utility` | **FIXED** — both forms report rows written; they differ because match/merge applies a change as delete+insert | keep |
-| B9 | The predicate is analyzed under `RestrictSearchPath()`, so callers must schema-qualify everything | `matview_where` Test 13 (first half); `safety/cases2.sql` case `dim_change_fixed` | **OPEN, and upgraded from cosmetic.** The safety work showed that the *correct* predicate for a change to a joined dimension table is `id IN (SELECT id FROM f WHERE did = $1)` — a sub-select over a base table. Unqualified, that fails with `ERROR: relation "f" does not exist`. The feature's own correctness story depends on a predicate form the restriction makes awkward | revisit with A6 — becomes an assertion of new behaviour if the path opens up, or moves to the docs if it stays restricted |
+| B9 | The predicate is analyzed under `RestrictSearchPath()`, so callers must schema-qualify everything | `matview_where` Test 13 (first half); `safety/cases2.sql` case `dim_change_fixed` | **RESOLVED — keep the restriction.** It is load-bearing, not incidental; see below. What changes is the documentation and the error message, not the behaviour | keep the test as an assertion of the documented requirement |
 | B10 | The volatility check is a weaker guarantee than the patch claims — a STABLE wrapper around a VOLATILE body passes, which is how both A6 and B5 work | covered indirectly by A6 / B5 | Worth a doc note either way | n/a |
 | B11 | Index opened `AccessShareLock` at `matview.c:1063`, closed `NoLock` at `:1126`, with no comment saying the lock is meant to be held (unlike `:1466`) | none | Cosmetic | n/a |
 | B12 | `opt_refresh_where_clause` duplicates the existing `where_clause` production; its `ereport` has no `parser_errposition()` | none | Cosmetic | n/a |
