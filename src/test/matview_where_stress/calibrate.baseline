@@ -30,6 +30,8 @@ selfjoin_parent|bare|12|0
 selfjoin_parent|concurrently|12|0
 share_of_total|bare|35|0
 share_of_total|concurrently|35|0
+text_key|bare|0|0
+text_key|concurrently|0|0
 topn|bare|16|0
 topn|concurrently|16|0
 two_ukeys|bare|0|0

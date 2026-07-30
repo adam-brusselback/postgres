@@ -49,7 +49,7 @@ Run at two resolutions:
 | harness | shapes | runs | what it is for |
 |---|---|---|---|
 | single-shot | 42 | 84 | wide coverage, plus the planner-signal measurement |
-| exhaustive | 21 | 3176 | the *complete* single-row mutation space per shape |
+| exhaustive | 22 | 3272 | the *complete* single-row mutation space per shape |
 
 The exhaustive space, for a 12-row base table, is: every row set to each of
 4–5 values in the domain, every row deleted, every row moved to every group,
@@ -309,7 +309,7 @@ Close to it, and mostly out of parts that already exist. Four conditions:
 
 Conditions 1–4 held on every safe case here and rejected every unsafe one that
 is not a coverage failure. That is not a soundness proof; it is 42 shapes and
-3176 mutations without a counterexample. Coverage (§5) is outside what any
+3272 mutations without a counterexample. Coverage (§5) is outside what any
 `REFRESH`-time check can see, because the command is not told what changed.
 
 ### Is that check cheap enough for a row-level trigger?

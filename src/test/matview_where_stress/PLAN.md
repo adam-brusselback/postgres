@@ -85,7 +85,7 @@ survives; shape does not.
 
 | what | why it survives |
 |---|---|
-| the safety oracle, 3176 mutations | mutates base data, refreshes, diffs against a full refresh — never looks at how the refresh is done |
+| the safety oracle, 3272 mutations | mutates base data, refreshes, diffs against a full refresh — never looks at how the refresh is done |
 | the benchmark suite | same, and it becomes the before/after measurement |
 | `matview_where` Tests 1–15 | behavioural: INCLUDE columns, NULL keys, drift, multiple unique indexes, lock levels |
 | `matview_where_privs` Tests 2, 3 | scoped maintenance exemption; `PG_TRY` restoring the flag |
@@ -197,7 +197,7 @@ deletion at Phase 4.
 
 Today the oracle compares a partial refresh against a full refresh. During the
 rewrite it can do something far stronger: **compare the old implementation
-against the new one, over the same 3176 mutations.**
+against the new one, over the same 3272 mutations.**
 
 Keep both paths reachable behind a developer GUC for the duration of the
 rewrite. For each mutation, run it under old and under new and diff the
@@ -620,9 +620,53 @@ supported, the write side is not.
 
 ## 2.1 The read side — low risk, high payoff
 
+**Done** — `9a5195b`, behind `matview_partial_refresh_querytree`, off by
+default so `safety/rundiff.sh spi querytree` can compare the two.
+
 Replace `pg_get_viewdef()` → text → SPI with `copyObject(dataQuery)` +
 `AddQual(predicate)`. The relcache copy must not be scribbled on, hence the
 copy.
+
+**`AddQual()` was the wrong tool and this plan was wrong to name it.** It
+attaches the predicate to the view's *own* `WHERE` clause, which is evaluated
+before grouping, windowing and `DISTINCT` — a different answer for every matview
+that aggregates, and not even a well-formed question for one over a window
+function. The predicate filters the view's **output**, so the view goes in a
+subquery RTE and the predicate becomes the outer `WHERE`. That is what the text
+version was doing all along, spelled `SELECT * FROM (viewdef) mv WHERE (pred)`;
+the plan read the SQL as though the subselect were incidental.
+
+Two more things only became visible once the tree was executed rather than
+printed:
+
+- **The transformed predicate had no collations assigned.**
+  `transformRefreshWhereClause()` never called `assign_expr_collations()`, and
+  nothing noticed, because a deparse does not look at collations and the text
+  went back through the parser which assigned them the second time round.
+  Executing the tree fails on `tag = 'hot'`. The corpus could not see it either:
+  every predicate in all 21 shapes compared numbers. Shape 22 `text_key` closes
+  that, and is a detector — with the fix reverted it errors on all 48 of its
+  mutations and nothing else in the corpus moves.
+
+- **Evaluating the view separately from the DML opens a window the fused CTE did
+  not have.** A refresh whose scope contains a key the matview does not hold yet
+  locks nothing on the locking `SELECT`, so it runs unordered beside a wider
+  refresh over the same scope. If the wider one reads the matview at a later
+  moment than it computed its rows, that key is in one and not the other, and
+  the prune deletes a row the base still produces. Both now run under one
+  snapshot, taken in `refresh_by_direct_modification()` rather than by SPI.
+  Gated by `injection_points/specs/matview-where-prune-gap.spec`, demonstrated
+  failing with the snapshot split and passing with it shared.
+
+  The fuzzer could not gate this, and the attempt is worth recording. `serial`
+  mode only ever `UPDATE`s, so every key it touches already exists and every
+  overlapping refresh is serialized by the lock — structurally unable to reach
+  it. An insert-driven mode was written and measured against a build with the
+  bug deliberately present: **clean run**. The window is microseconds wide and
+  the violation needs two commits inside it. The mode was deleted rather than
+  kept as a detector that has been watched not to detect. Third time the
+  intuitive instrument has been the wrong one; the pattern is that a window
+  needs an injection point, and a rate needs a fuzzer.
 
 This alone removes, by construction rather than by fix:
 
@@ -654,6 +698,21 @@ the current design in place.
 **(c) Drive `ModifyTable` directly.** Most control, most work, and the least
 like anything else in `matview.c`.
 
+### 2.3 The predicate — the last piece of text
+
+The `WHERE` clause is already a parsed node tree by the time
+`refresh_by_direct_modification()` sees it; it is deparsed to text only because
+SPI needs a string, and it is rendered twice — into the locking `SELECT` and
+into the prune's `DELETE`. Once (a) lands there is no reason for either.
+
+This is also what forces the rule that a non-leakproof predicate requires
+ownership (A6, `matview_where_privs` Test 1): the predicate runs inside a
+statement executed as the matview owner, so a caller holding only `MAINTAIN`
+could otherwise read the owner's data through it. Whether removing the deparse
+changes that is a **separate question** and must not be settled as a side effect
+— see 2.4. The disposition on Test 1 says it inverts rather than lapsing, and
+must be rewritten rather than regenerated.
+
 **The open design question that gates this choice:** A3's fix depends on the
 upsert and the prune being *one statement over one materialised `new_data`* —
 proven necessary in `safety/a3-split-gap.sh`, where splitting them leaves a
@@ -661,7 +720,30 @@ stale row that neither statement corrects. Any option that separates view
 evaluation from DML has to preserve that guarantee by some other means. That
 question should be answered before choosing, not during.
 
-## 2.3 What this phase does not change
+### The question is answered, and (b) has already been built
+
+Separating them preserves A3 **if and only if** the DML runs under the snapshot
+the evaluation used, and 2.1 establishes that by measurement rather than by
+argument — `matview-where-prune-gap.spec` fails with the snapshot split and
+passes with it shared. So the guarantee is not "one statement"; it is "one
+snapshot, and one physical set of source rows". A tuplestore read twice
+delivers both, and delivers the second more strongly than a `MATERIALIZED` CTE
+did, because the materialisation is real rather than a planner hint.
+
+2.1 therefore shipped (b) as its landing point: the source rows are registered
+as an ephemeral named relation and the existing fused upsert-and-prune SQL reads
+that instead of its CTE. What is still generated text is short and fixed —
+relation and column identifiers, and the predicate.
+
+**The decision is to go on to (a) anyway: no generated SQL at all.** (b) is the
+waypoint, not the destination. That means the `INSERT ... ON CONFLICT` and the
+`DELETE` become `Query` trees, with arbiter-index inference done by hand, and
+2.3 below stops deparsing the predicate as well. The cost is exactly the review
+risk named above — nothing in core outside `analyze.c` builds an upsert — and
+the differential harness is what makes it checkable: every step is compared
+against the text path over all 22 shapes before it lands.
+
+## 2.4 What this phase does not change
 
 It does not settle the two-implementation question (whether `CONCURRENTLY`
 should select a different *algorithm*), and it should not try to. That is a
@@ -795,6 +877,8 @@ static suite it produced, against whatever implementation actually landed.
   | `pg_stat_statements` structural block, "delete at the start of Phase 2" | Phase 2 opening | **fired** — deleted before the first line of the rewrite, not after |
   | `matview-where-snapshot`, "delete when the premise goes" | the rewrite fusing the lock into one plan | **read at Phase 2 exit** |
   | `matview_where_privs` Test 1, "rewrite if the predicate runs as the invoker" | Phase 2's privilege model | **read at Phase 2 exit** — it inverts rather than lapsing, so it must be rewritten, not regenerated |
+  | `matview_partial_refresh_querytree` GUC + the text path it selects | the fuzzer's exit criterion, not "the new path looks finished" | **fires here** — delete the GUC (`guc_parameters.dat`, the `commands/matview.h` declaration, the `guc_tables.c` include), the text branch, and the two `SET` lines in `matview-where-prune-gap.spec`. Losing it also loses `rundiff.sh`'s old-vs-new mode, which is why it is the last thing to go |
+  | `matview-where-prune-gap.spec`, "delete if the seam closes" | an implementation with no separate evaluation step | **read at Phase 2 exit** — the *property* is data loss and is not scaffolding; the injection point and the GUC are. If the seam closes, delete it and say why |
 
   A conditional disposition nobody re-reads is how Test 14 came to sit in the
   tree for a dozen commits announcing that a swap which had already landed was

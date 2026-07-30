@@ -12,7 +12,7 @@ things that do not belong in the patch itself:
                 this second.  Phase 1 is complete; Phase 2 is next.
 
   ISSUES.md     Review items, split into those raised on the -hackers thread
-                (A1-A9) and those found separately (B1-B18), each mapped to the
+                (A1-A9) and those found separately (B1-B20), each mapped to the
                 test that covers it.  Start here.
 
   SAFETY.md     Which predicates are safe, established by differential testing
@@ -43,8 +43,8 @@ did not, at first, and looked exactly like working tests.
   safety/run.sh       The single-session differential oracle.  For each (view
                       shape, predicate, mutation): mutate the base, partial
                       refresh, snapshot, full refresh, symmetric difference.
-                      21 exhaustive shapes over a 12-row base table -- 1588
-                      mutations per refresh form, 3176 in total -- plus 42
+                      22 exhaustive shapes over a 12-row base table -- 1636
+                      mutations per refresh form, 3272 in total -- plus 42
                       single-shot triples carrying the planner-signal
                       measurement.  Answers "is this predicate safe".
 
@@ -52,9 +52,10 @@ did not, at first, and looked exactly like working tests.
                       each way, diffed against each other.  Answers "do two
                       implementations agree", which is a different question:
                       both forms can be identically wrong on an unsafe shape and
-                      this stays quiet, correctly.  Today it compares the bare
-                      form against CONCURRENTLY; in Phase 2 the same harness
-                      compares old against new.
+                      this stays quiet, correctly.  The Phase 2 invocation is
+                      `rundiff.sh 5610 postgres spi querytree` -- the text
+                      implementation against the Query-tree one, selected by
+                      matview_partial_refresh_querytree.
 
   fuzz.sh             The concurrent fuzzer, and the only thing here that can
                       see a bug needing two sessions.  Three modes: p2 and p3
@@ -102,9 +103,23 @@ What the calibration says
 The oracle misses all four concurrency mutations and always will: it is
 single-session, and a lock-ordering bug needs a second session to be a bug in.
 That is the measurement that says fuzz.sh has to exist, not a defect in the
-oracle.  Two of the three data bugs were invisible until the corpus grew a shape
-for them (a NULLable key, and two unique indexes), and both misses presented as
-clean runs.
+oracle.  Three of the four data bugs were invisible until the corpus grew a
+shape for them -- a NULLable key, two unique indexes, and a text predicate
+needing a collation -- and every one of those misses presented as a clean run.
+
+    B19 unassigned collations           CAUGHT   oracle, shape 22 text_key
+
+Which instrument fits which failure is the thing this directory keeps having to
+relearn, and it comes down to one distinction:
+
+    a rate      -> fuzz.sh.  Run it enough times and it happens.
+    a window    -> an injection point.  It is microseconds wide; run it a
+                   million times and it still will not happen by chance.
+
+That was got wrong three times.  Most recently an insert-driven fuzzer mode was
+built for the prune-vs-insert window, measured against a build with the bug
+deliberately present, and reported a clean run; the deterministic gate for it is
+injection_points/specs/matview-where-prune-gap.spec.
 
 The oracle also found the use-after-free that is now B14, before it answered any
 question about predicates.
