@@ -25,15 +25,21 @@ import sys
 
 TARGET = 'src/backend/commands/matview.c'
 
-# (issue, needs, description, [(old, new), ...])
+# (issue, needs, description, [(old, new) or (old, new, occurrences), ...])
 #
 #   needs='data'    observable by one session: the matview contents end up wrong
 #   needs='concur'  observable only with two overlapping sessions
+#   needs='inject'  a quoting escape; observable by matview_where_inject
 MUTATIONS = {
     'A4': ('A4', 'data',
-           'drop ON CONFLICT from the diff insert (scope drift)', [
-               ('"  ON CONFLICT (%s) DO UPDATE SET %s "', '"  /*%s%s*/ "'),
-               ('"  ON CONFLICT (%s) DO NOTHING "', '"  /*%s*/ "'),
+           'drop ON CONFLICT from the upsert (scope drift)', [
+               ('"  ON CONFLICT (%s) DO ",', '"  /*%s*/ ",'),
+               ('\t\t\tappendStringInfo(&buf, "UPDATE SET %s ", set_clause.data);\n'
+                '\t\telse\n'
+                '\t\t\tappendStringInfoString(&buf, "NOTHING ");',
+                '\t\t\tappendStringInfo(&buf, "/*%s*/ ", set_clause.data);\n'
+                '\t\telse\n'
+                '\t\t\tappendStringInfoString(&buf, " ");'),
            ]),
 
     'B4': ('B4', 'data',
@@ -41,7 +47,7 @@ MUTATIONS = {
            '(duplicates NULL-keyed rows)', [
                ('anti_join_op = indexStruct->indnullsnotdistinct ?\n'
                 '\t\t\t"IS NOT DISTINCT FROM" : "=";',
-                'anti_join_op = "IS NOT DISTINCT FROM";'),
+                'anti_join_op = "IS NOT DISTINCT FROM";', 2),
            ]),
 
     'B6': ('B6', 'data',
@@ -90,15 +96,61 @@ MUTATIONS = {
 
     'M6': ('A3', 'concur',
            'lock after doing the work instead of before', [
-               ('\tif (matview_execute_spi_plan(cacheEntry->lockPlan, params, false) < 0)\n'
+               ('\tif (matview_execute_spi_plan(cacheEntry->lockPlan, params,\n'
+                '\t\t\t\t\t\t\t\t InvalidSnapshot, false) < 0)\n'
                 '\t\telog(ERROR, "SPI_execute_plan failed during lock acquisition");\n\n',
                 ''),
-               ('\tif (matview_execute_spi_plan(cacheEntry->refreshPlan, params, false) < 0)\n'
+               ('\telse if (matview_execute_spi_plan(cacheEntry->refreshPlan, params,\n'
+                '\t\t\t\t\t\t\t\t\t  InvalidSnapshot, false) < 0)\n'
                 '\t\telog(ERROR, "SPI_execute_plan failed during refresh");',
-                '\tif (matview_execute_spi_plan(cacheEntry->refreshPlan, params, false) < 0)\n'
-                '\t\telog(ERROR, "SPI_execute_plan failed during refresh");\n'
-                '\tif (matview_execute_spi_plan(cacheEntry->lockPlan, params, false) < 0)\n'
+                '\telse if (matview_execute_spi_plan(cacheEntry->refreshPlan, params,\n'
+                '\t\t\t\t\t\t\t\t\t  InvalidSnapshot, false) < 0)\n'
+                '\t\telog(ERROR, "SPI_execute_plan failed during refresh");\n\n'
+                '\tif (matview_execute_spi_plan(cacheEntry->lockPlan, params,\n'
+                '\t\t\t\t\t\t\t\t InvalidSnapshot, false) < 0)\n'
                 '\t\telog(ERROR, "SPI_execute_plan failed during lock acquisition");'),
+           ]),
+
+    # The Q mutations are a different kind, and the rule above -- every
+    # mutation is the undo of a fix that was actually made -- does not cover
+    # them.  Nothing here was ever broken: the quoting calls have been correct
+    # since the feature was written.
+    #
+    # They are admitted anyway, because the detector they calibrate exists for
+    # a defect that has not happened yet.  matview_where_inject guards the
+    # quoting through a rewrite that deletes the SQL it quotes into, and the
+    # plausible way to break it is for one of these calls to be dropped or
+    # forgotten during that rewrite.  A detector for a future regression cannot
+    # be calibrated against a past one, and the alternative -- ship it
+    # uncalibrated -- is the thing this directory keeps being burned by.
+    #
+    # What is NOT allowed is inventing a defect to make a detector look good.
+    # The distinction: each Q below is an edit someone could actually make by
+    # accident while doing the work that is planned.  If a mutation would not
+    # survive being described out loud as "and this is how it would happen",
+    # it does not belong here.
+    'Q1': ('-', 'inject',
+           'stop quoting the matview name on the direct-modification path', [
+               ('\t\tmatview_name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),\n'
+                '\t\t\t\t\t\t\t\t\t\t\t\t  RelationGetRelationName(matviewRel));',
+                '\t\tmatview_name = psprintf("%s.%s",\n'
+                '\t\t\t\t\t\t\t\tget_namespace_name(RelationGetNamespace(matviewRel)),\n'
+                '\t\t\t\t\t\t\t\tRelationGetRelationName(matviewRel));'),
+           ]),
+
+    'Q2': ('-', 'inject',
+           'stop quoting the matview name on the match/merge path', [
+               ('\tmatviewname = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),\n'
+                '\t\t\t\t\t\t\t\t\t\t\t RelationGetRelationName(matviewRel));',
+                '\tmatviewname = psprintf("%s.%s",\n'
+                '\t\t\t\t\t\t   get_namespace_name(RelationGetNamespace(matviewRel)),\n'
+                '\t\t\t\t\t\t   RelationGetRelationName(matviewRel));'),
+           ]),
+
+    'Q3': ('-', 'inject',
+           'stop quoting arbiter column names on the direct-modification path', [
+               ('\t\t\tquoted = quote_identifier(NameStr(attr->attname));',
+                '\t\t\tquoted = pstrdup(NameStr(attr->attname));', 2),
            ]),
 }
 
@@ -122,16 +174,40 @@ def pristine():
                           capture_output=True, text=True, check=True).stdout
 
 
+def apply_edits(src, edits, name):
+    """Apply one mutation's edits, insisting the code still looks as expected.
+
+    An edit is (old, new) for a pattern that must occur exactly once, or
+    (old, new, n) for one that must occur exactly n times and is replaced at
+    every one of them.
+
+    The count is checked, not assumed.  This used to be a plain replace(..., 1)
+    against a pattern nobody had confirmed was unique, and two of them were not:
+    B4's anti-join edit and Q3's column quoting each match two call sites, so
+    each was mutating one of them and leaving the other correct.  A mutation
+    that only half applies still produces a broken build and a plausible
+    calibration number, and nothing anywhere says which half was measured.
+    """
+    for edit in edits:
+        old, new = edit[0], edit[1]
+        want = edit[2] if len(edit) > 2 else 1
+        have = src.count(old)
+        if have != want:
+            sys.exit(f'{name}: expected {want} occurrence(s) of this pattern, '
+                     f'found {have} -- the code has moved:\n  {old[:70]}...')
+        src = src.replace(old, new)
+    return src
+
+
 def variants():
     """Every file content this script is capable of having written."""
     base = pristine()
     out = {base}
-    for _, _, _, edits in MUTATIONS.values():
-        s = base
-        for old, new in edits:
-            if old in s:
-                s = s.replace(old, new, 1)
-        out.add(s)
+    for name, (_, _, _, edits) in MUTATIONS.items():
+        try:
+            out.add(apply_edits(base, edits, name))
+        except SystemExit:
+            pass                # a rotted pattern is reported when applied
     return out
 
 
@@ -182,11 +258,7 @@ def main():
         if name not in MUTATIONS:
             sys.exit(f'unknown mutation {name}; try --list')
         issue, needs, desc, edits = MUTATIONS[name]
-        for old, new in edits:
-            if old not in src:
-                sys.exit(f'{name}: pattern not found, the code has moved:\n'
-                         f'  {old[:70]}...')
-            src = src.replace(old, new, 1)
+        src = apply_edits(src, edits, name)
 
     with open(TARGET, 'w') as f:
         f.write(src)

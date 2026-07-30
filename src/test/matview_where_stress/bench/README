@@ -35,8 +35,8 @@ from different machines or builds remain comparable to each other:
 The last column is the one to watch.  A partial refresh pays while
 vs_full_per_row * scope_rows < mv_rows; report.sql prints that verdict.
 
-Three things that will otherwise bite you
------------------------------------------
+Four things that will otherwise bite you
+----------------------------------------
 
 0. `make clean` AFTER EVERY `configure`.  This tree is configured without
    --enable-depend, so `autodepend` is empty in src/Makefile.global and no
@@ -72,9 +72,33 @@ Three things that will otherwise bite you
    a CHECKPOINT and a settle before bench_baseline(), or pin one baseline and
    reuse it across runs.
 
+4. START IT WITH detach.sh, NOT WITH `&`.  A sweep runs for tens of minutes,
+   which is longer than the shell that starts it is likely to live.  Three
+   sweeps were lost here before the cause was looked at rather than guessed at,
+   and the guesses -- out of memory, out of disk -- were both wrong: memory
+   peaked well under the limit, the filesystem was at 27%, and the postmaster
+   went on running throughout.  What died each time was the process tree of the
+   shell, and the run was in it.
+
+   detach.sh puts the run in its own session, so it is no longer reachable by a
+   signal aimed at the caller's process group.  This is what pg_ctl does for the
+   postmaster, and is why the postmaster survived while the benchmark did not.
+
+     ./detach.sh /tmp/bench.log --forms spi,querytree --label p21-O2
+
+   A sweep that dies anyway loses only the combinations it had not reached:
+   run.sh inserts into bench_result one row at a time rather than at the end,
+   and caches the full-rebuild baseline per (workload, scale, groups), so a
+   restart neither loses finished work nor re-pays for the baselines.
+
+   Do not run anything else on the box while a sweep is going.  Best-of-N
+   absorbs a brief disturbance, but an initdb or a compile in parallel with a
+   measurement is not brief.
+
 Files
 -----
   workloads.sql  the eight workloads, as data
   harness.sql    bench_result, bench_setup(), bench_baseline(), bench_scope_rows()
   run.sh         the driver; generates pgbench scripts and records results
+  detach.sh      starts run.sh in its own session so it outlives the caller
   report.sql     normalised cost, concurrency scaling, and a rebuild verdict
