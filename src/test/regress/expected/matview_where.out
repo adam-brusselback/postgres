@@ -6,9 +6,9 @@
 -- one says whether it came from that thread or was found separately, so that
 -- review items can be checked off against it.
 --
--- Where a test covers a defect that is still unfixed, its expected output
--- describes what the command should do, so the test fails until the defect is
--- fixed, and an XXX comment names the behaviour seen today.
+-- A test covering an unfixed defect has expected output describing what the
+-- command should do, so it fails until the defect is fixed, and an XXX comment
+-- names the behaviour seen today.  There are none left in this file.
 --
 -- Each also carries a Disposition line saying whether it is worth keeping in the
 -- tree once the defect is fixed, or is scaffolding to delete then.  Grep for
@@ -604,7 +604,8 @@ INSERT INTO mv_lock_base VALUES (1, 'one'), (2, 'two');
 CREATE MATERIALIZED VIEW mv_lock AS SELECT id, v FROM mv_lock_base;
 CREATE UNIQUE INDEX ON mv_lock(id);
 -- CONCURRENTLY must be the permissive form: writers are not blocked.
--- XXX currently true, because CONCURRENTLY still selects match/merge.
+-- Holds since the two strategies were swapped: CONCURRENTLY with a predicate
+-- selects direct modification, which touches rows rather than the whole table.
 BEGIN;
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_lock WHERE id = 1;
 SELECT bool_or(mode = 'ExclusiveLock') AS concurrently_blocks_writers
@@ -617,7 +618,8 @@ SELECT bool_or(mode = 'ExclusiveLock') AS concurrently_blocks_writers
 
 COMMIT;
 -- The bare form must be the conservative one: writers are blocked.
--- XXX currently false, because the bare form still selects direct modification.
+-- Holds for the same reason from the other side: the bare form with a predicate
+-- selects match/merge, which rewrites through a transient heap.
 BEGIN;
 REFRESH MATERIALIZED VIEW mv_lock WHERE id = 1;
 SELECT bool_or(mode = 'ExclusiveLock') AS bare_where_blocks_writers

@@ -8,8 +8,9 @@
 -- against it.
 --
 -- Every case covers a live defect.  The expected output describes what the
--- command should do, so they fail until the defect is fixed, and an XXX comment
--- names the behaviour seen today.
+-- command should do, so they fail until the defect is fixed.  All of them are
+-- now fixed; where the pre-fix behaviour says what the test is for, the comment
+-- on the case records it.
 --
 -- Where the correct outcome is "the statement is rejected", the statement is
 -- wrapped in a block that reports the SQLSTATE instead of letting the message
@@ -95,7 +96,6 @@ INSERT INTO public.matview_priv_target VALUES ('direct write');
 
 -- A predicate naming a function the caller could not usefully run itself must
 -- be refused.  42501 is insufficient_privilege.
--- XXX currently allowed.
 DO $$
 BEGIN
   EXECUTE 'REFRESH MATERIALIZED VIEW matview_priv_mv'
@@ -107,10 +107,9 @@ END $$;
 
 RESET ROLE;
 
--- Must be empty.
--- XXX currently holds one row per predicate evaluation: the refresh evaluates
--- the predicate three times, once for the row-locking SELECT, once for the
--- new_data CTE and once for the anti-join DELETE.
+-- Must be empty.  Before the fix this held one row per predicate evaluation,
+-- three of them: the row-locking SELECT, the new_data CTE and the anti-join
+-- DELETE each ran the caller's function with the owner's privileges.
 SELECT note, count(*) AS predicate_evaluations
   FROM matview_priv_target GROUP BY note;
 
@@ -172,7 +171,6 @@ SELECT count(*) AS victim_rows_before FROM matview_mw_victim;
 
 -- Reached through a predicate, the same write must still be refused.  42809 is
 -- wrong_object_type, which is what "cannot change materialized view" carries.
--- XXX currently allowed.
 DO $$
 BEGIN
   EXECUTE 'REFRESH MATERIALIZED VIEW matview_mw_driver'
@@ -182,8 +180,7 @@ EXCEPTION WHEN others THEN
   RAISE NOTICE 'refresh was rejected, SQLSTATE %', SQLSTATE;
 END $$;
 
--- Must be the two original rows.
--- XXX currently replaced by the row the predicate inserted.
+-- Must be the two original rows, not the one the predicate tried to insert.
 SELECT * FROM matview_mw_victim ORDER BY id;
 
 DROP FUNCTION matview_mw_pred(int);
@@ -231,14 +228,14 @@ REFRESH MATERIALIZED VIEW mv_leak WHERE id <= 2;
 \set VERBOSITY default
 
 -- Both of these must still be refused, and the contents must be unchanged.
--- XXX currently both succeed.
+-- Before the fix the maintenance exemption outlived the refresh and both
+-- succeeded.
 DELETE FROM mv_leak WHERE id = 1;
 INSERT INTO mv_leak (id, code, v) VALUES (42, 4242, 'injected');
 SELECT * FROM mv_leak ORDER BY id;
 
--- The exemption is not scoped to mv_leak either: every matview in the session
--- becomes writable, including one with no unique index at all.
--- XXX currently succeeds.
+-- Nor was the exemption scoped to mv_leak: every matview in the session became
+-- writable, including one with no unique index at all.  This must fail.
 CREATE MATERIALIZED VIEW mv_leak_other AS SELECT id, v FROM mv_leak_base;
 DELETE FROM mv_leak_other;
 SELECT count(*) AS other_rows_after_delete FROM mv_leak_other;

@@ -15,9 +15,11 @@
 -- MATERIALIZED VIEW" at all.  They were found by reviewing the cache against
 -- the plancache contract.
 --
--- Every case covers a live defect.  The expected output describes what the
--- command should do, so they fail until the defect is fixed, and an XXX comment
--- names the behaviour seen today.
+-- Every case here covered a live defect when it was written.  The expected
+-- output has always described what the command should do, so each failed until
+-- its defect was fixed; all of them are now fixed and the file is green.  Where
+-- the pre-fix behaviour is worth knowing -- because it says what the test is
+-- for -- the comment on the case says what used to happen.
 --
 -- Disposition: Tests 1 to 3 -- DELETE if the plan cache goes away.  All three
 -- exist only because plans are cached across statements and revalidated by
@@ -50,12 +52,7 @@ ALTER MATERIALIZED VIEW mv_c RENAME TO mv_c_renamed;
 UPDATE mv_c_base SET v = 'one-updated' WHERE id = 1;
 
 -- Must succeed and pick up the new value.
--- XXX currently errors: the cached plan still names the pre-rename relation.
--- The VERBOSITY guard keeps that failure to one line instead of also emitting
--- the generated statement.
-\set VERBOSITY terse
 REFRESH MATERIALIZED VIEW mv_c_renamed WHERE id = 1;
-\set VERBOSITY default
 SELECT * FROM mv_c_renamed ORDER BY id;
 
 --
@@ -75,12 +72,12 @@ CREATE UNIQUE INDEX ON mv_c(id);
 -- Refresh the *original* matview, by its current name.
 REFRESH MATERIALIZED VIEW mv_c_renamed WHERE id = 1;
 
--- XXX the refresh above reports success but does nothing here.
+-- The matview that was named is the one that moved.
 SELECT * FROM mv_c_renamed ORDER BY id;
 
--- XXX ... and writes to this unrelated matview instead, with data drawn from
--- the other matview's base table.  No lock and no MAINTAIN privilege check was
--- ever taken on mv_c.
+-- ... and this one, which merely took over the name, is untouched.  Before the
+-- fix the refresh wrote here instead, having taken no lock and no MAINTAIN
+-- privilege check on it.
 SELECT * FROM mv_c ORDER BY id;
 
 DROP MATERIALIZED VIEW mv_c;
@@ -113,8 +110,8 @@ SELECT pg_get_viewdef('mv_c2'::pg_catalog.regclass);
 
 REFRESH MATERIALIZED VIEW mv_c2 WHERE id = 1;
 
--- XXX currently filled from the decoy table rather than from the table the
--- view definition actually names.
+-- Filled from the table the view definition names, not from the one that took
+-- over its name.
 SELECT * FROM mv_c2 ORDER BY id;
 
 DROP MATERIALIZED VIEW mv_c2;
@@ -152,7 +149,9 @@ DO $$ BEGIN
   EXECUTE 'REFRESH MATERIALIZED VIEW mv_c3 WHERE id = $1' USING 4294967297::bigint;
 END $$;
 
--- XXX currently refreshes id = 1 instead of id = 4294967297.
+-- id = 4294967297 is the row that moved; id = 1 is untouched.  Before the fix
+-- the int8 argument was read through a plan expecting int4 and the low 32 bits
+-- selected row 1.
 SELECT * FROM mv_c3 ORDER BY id;
 
 -- The match/merge path builds its SQL fresh every time, so it is unaffected.
