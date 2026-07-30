@@ -681,3 +681,43 @@ SELECT * FROM mv_multi2 ORDER BY id;
 
 DROP MATERIALIZED VIEW mv_multi2;
 DROP TABLE mv_multi2_base;
+--
+-- Test 16: the refresh inserts new rows in arbiter-key order
+--
+-- Found here, not on the -hackers thread.  The row-locking SELECT only covers
+-- rows that ALREADY exist and match the predicate, so it says nothing about the
+-- order the refresh takes locks in for rows it INSERTS.  Those are ordered by
+-- the ORDER BY inside the fused CTE's new_data instead, and without it two
+-- concurrent refreshes inserting the same new keys can take their speculative
+-- insertion locks in opposite orders.
+--
+-- That ordering is observable without any concurrency: rows appended to the
+-- matview land in the heap in the order the upsert touched them, so their
+-- physical order is new_data's order.  Reading it back with ORDER BY ctid turns
+-- a concurrency property into a deterministic single-session assertion.
+--
+-- Disposition: keep.  It is the only gate on new_data's ORDER BY -- the
+-- isolation spec matview-where-lockorder covers the locking SELECT's ordering,
+-- and neither covers the other.
+--
+CREATE TABLE mv_iord_base (id int primary key, tag text, v int);
+INSERT INTO mv_iord_base SELECT g, 'old', g FROM generate_series(1, 10) g;
+CREATE MATERIALIZED VIEW mv_iord AS SELECT id, tag, v FROM mv_iord_base;
+CREATE UNIQUE INDEX ON mv_iord(id);
+-- Inserted descending, so the view query's heap order is the reverse of key
+-- order and an unordered new_data would feed the upsert in that reverse order.
+INSERT INTO mv_iord_base SELECT g, 'new', g FROM generate_series(20, 11, -1) g;
+ANALYZE mv_iord_base;
+ANALYZE mv_iord;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_iord WHERE tag = 'new';
+-- Must be ascending.  Drop the ORDER BY from new_data and this comes back
+-- {20,19,...,11}.
+SELECT array_agg(id ORDER BY ctid) AS insert_order
+  FROM mv_iord WHERE tag = 'new';
+          insert_order           
+---------------------------------
+ {11,12,13,14,15,16,17,18,19,20}
+(1 row)
+
+DROP MATERIALIZED VIEW mv_iord;
+DROP TABLE mv_iord_base;

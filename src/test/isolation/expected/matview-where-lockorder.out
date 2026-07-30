@@ -1,0 +1,24 @@
+Parsed test spec with 3 sessions
+
+starting permutation: pin_mid wide_ref obs_locked pin_commit wide_commit
+step pin_mid: REFRESH MATERIALIZED VIEW CONCURRENTLY mvlo WHERE id = 5;
+step wide_ref: REFRESH MATERIALIZED VIEW CONCURRENTLY mvlo WHERE tag = 'hot'; <waiting ...>
+step obs_locked: SELECT id, xmax <> '0'::xid AS locked
+                     FROM mvlo WHERE tag = 'hot' ORDER BY id;
+id|locked
+--+------
+ 1|t     
+ 2|t     
+ 3|t     
+ 4|t     
+ 5|t     
+ 6|f     
+ 7|f     
+ 8|f     
+ 9|f     
+10|f     
+(10 rows)
+
+step pin_commit: COMMIT;
+step wide_ref: <... completed>
+step wide_commit: COMMIT;
