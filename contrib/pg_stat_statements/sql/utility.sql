@@ -369,11 +369,12 @@ SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 -- Track the total number of rows affected by a partial
 -- REFRESH MATERIALIZED VIEW
 --
--- Reported nowhere yet; found while reviewing the WHERE clause patch.
--- refresh_by_direct_modification() reports SPI_processed from its fused CTE,
--- whose top-level statement is the anti-join DELETE, so rows that were upserted
--- are not counted.  A refresh that only deletes therefore reports a sensible
--- number while one that only updates reports zero.
+-- Both partial refresh forms report the number of rows they wrote to the
+-- matview.  The two forms reach the same end state by different means, so the
+-- counts differ for the same logical change: the diff/merge form used by the
+-- bare spelling applies a changed row as a delete plus an insert, while the
+-- upsert form used by CONCURRENTLY updates it in place.  Rows that simply
+-- disappear cost one write either way.
 --
 -- Disposition: keep.  This belongs with the rows-tracking cases above; the
 -- count is part of the command's contract, not scaffolding.
@@ -386,15 +387,16 @@ DELETE FROM pgss_pr_base WHERE a >= 9;
 
 SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
--- Three rows in scope, all three changed, so three rows are applied.
+-- diff/merge form: three changed rows are applied as 3 deletes + 3 inserts.
 REFRESH MATERIALIZED VIEW pgss_pr_matv WHERE a <= 3;
--- Two rows in scope, both gone from the source, so two rows are applied.
+-- ... and two vanished rows as 2 deletes.
 REFRESH MATERIALIZED VIEW pgss_pr_matv WHERE a >= 9;
+-- upsert form: the same changed rows are updated in place, so 3 writes.
+UPDATE pgss_pr_base SET b = 'x' WHERE a <= 3;
+REFRESH MATERIALIZED VIEW CONCURRENTLY pgss_pr_matv WHERE a <= 3;
 
--- XXX the first of these reports 0 rather than 3.  The second is only right by
--- accident: its work happens to be entirely deletion.
 SELECT calls, rows, query FROM pg_stat_statements
-  WHERE query LIKE 'REFRESH MATERIALIZED VIEW pgss_pr_matv%'
+  WHERE query LIKE 'REFRESH MATERIALIZED VIEW%pgss_pr_matv%'
   ORDER BY query COLLATE "C";
 
 DROP MATERIALIZED VIEW pgss_pr_matv;

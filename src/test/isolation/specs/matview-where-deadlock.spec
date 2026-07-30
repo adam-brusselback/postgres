@@ -5,14 +5,16 @@
 # Adam Brusselback confirmed that the locking SELECT had no ORDER BY, so "two
 # overlapping refreshes could lock the existing rows in different physical orders
 # and deadlock", and said the next patch would give it "a deterministic ORDER BY
-# on the unique key columns".  That ORDER BY is not in the tree yet, and would
-# not resolve the permutation below in any case -- see the note further down.
+# on the unique key columns".  That ORDER BY is now in the tree; it fixes the
+# single-statement variant but not the permutation below -- see the note further
+# down.
 #
-# The non-concurrent partial refresh locks the matview rows matching its
-# predicate with "SELECT 1 FROM matview WHERE (predicate) FOR UPDATE", and those
-# locks are held until the refreshing transaction ends.  Nothing establishes a
-# global order in which rows are locked, so two transactions that touch the same
-# rows in different orders deadlock.
+# The direct-modification path (CONCURRENTLY) locks the matview rows matching its
+# predicate with "SELECT 1 FROM matview WHERE (predicate) ORDER BY key FOR
+# UPDATE", and those locks are held until the refreshing transaction ends.  The
+# ORDER BY fixes the order within one statement, but says nothing about the order
+# of separate statements, so two transactions that issue several single-row
+# refreshes in opposite orders still deadlock.
 #
 # This spec covers the deterministic case: two transactions each issuing several
 # single-row partial refreshes in opposite orders, which is what a trigger-driven
@@ -58,14 +60,14 @@ teardown
 
 session s1
 setup            { BEGIN; }
-step s1_ref1     { REFRESH MATERIALIZED VIEW mvwd WHERE id = 1; }
-step s1_ref2     { REFRESH MATERIALIZED VIEW mvwd WHERE id = 2; }
+step s1_ref1     { REFRESH MATERIALIZED VIEW CONCURRENTLY mvwd WHERE id = 1; }
+step s1_ref2     { REFRESH MATERIALIZED VIEW CONCURRENTLY mvwd WHERE id = 2; }
 step s1_commit   { COMMIT; }
 
 session s2
 setup            { BEGIN; }
-step s2_ref2     { REFRESH MATERIALIZED VIEW mvwd WHERE id = 2; }
-step s2_ref1     { REFRESH MATERIALIZED VIEW mvwd WHERE id = 1; }
+step s2_ref2     { REFRESH MATERIALIZED VIEW CONCURRENTLY mvwd WHERE id = 2; }
+step s2_ref1     { REFRESH MATERIALIZED VIEW CONCURRENTLY mvwd WHERE id = 1; }
 step s2_commit   { COMMIT; }
 step s2_final    { SELECT id, v FROM mvwd ORDER BY id; }
 

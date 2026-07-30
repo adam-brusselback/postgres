@@ -1120,7 +1120,7 @@ CheckValidResultRel(ResultRelInfo *resultRelInfo, CmdType operation,
 										 NULL);
 			break;
 		case RELKIND_MATVIEW:
-			if (!MatViewIncrementalMaintenanceIsEnabled())
+			if (!MatViewIncrementalMaintenanceIsEnabled(RelationGetRelid(resultRel)))
 				ereport(ERROR,
 						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 						 errmsg("cannot change materialized view \"%s\"",
@@ -1257,7 +1257,7 @@ CheckValidRowMarkRel(Relation rel, RowMarkType markType)
 		case RELKIND_MATVIEW:
 			/* Allow referencing a matview, but not actual locking clauses */
 			if (markType != ROW_MARK_REFERENCE &&
-				!MatViewIncrementalMaintenanceIsEnabled())
+				!MatViewIncrementalMaintenanceIsEnabled(RelationGetRelid(rel)))
 				ereport(ERROR,
 						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 						 errmsg("cannot lock rows in materialized view \"%s\"",

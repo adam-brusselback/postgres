@@ -225,16 +225,22 @@ CREATE MATERIALIZED VIEW mv_drift AS SELECT * FROM mv_drift_base;
 CREATE UNIQUE INDEX ON mv_drift(id);
 -- Update Row 1 to collide with Row 2's category
 UPDATE mv_drift_base SET category_id = 200 WHERE id = 1;
--- Attempt to refresh using the NEW category value as the filter.
+-- Refresh using the NEW category value as the filter.
 -- The View still contains (1, 100).
 -- The Filter "category_id = 200" sees the NEW row (1, 200) in the base table.
--- The Filter "category_id = 200" does NOT see the OLD row (1, 100) in the View.
--- Result: The system thinks (1, 200) is a brand new row and tries to INSERT it.
--- This MUST fail with a Unique Constraint Violation on 'id' because (1, 100) was never deleted.
+-- The Filter "category_id = 200" does NOT see the OLD row (1, 100) in the View,
+-- so nothing deletes it and the fresh row collides with it on 'id'.
+-- Both refresh forms now resolve that collision in place instead of failing.
 \set VERBOSITY terse
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_drift WHERE category_id = 200;
-ERROR:  duplicate key value violates unique constraint "mv_drift_id_idx"
 \set VERBOSITY default
+SELECT * FROM mv_drift ORDER BY id;
+ id | category_id 
+----+-------------
+  1 |         200
+  2 |         200
+(2 rows)
+
 -- Correct usage: Scope must include BOTH the Old location (100) and New location (200)
 -- so the system sees the update as an update (or delete+insert).
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_drift WHERE category_id IN (100, 200);
@@ -467,15 +473,12 @@ DROP TABLE mv_null_base;
 -- Reported on -hackers by Adam Brusselback, who wrote that "both the
 -- direct-modification and match/merge paths resolve this by using an
 -- INSERT ... ON CONFLICT DO UPDATE step (or DO NOTHING if there are no non-key
--- columns) against the arbiter index".  Only the direct-modification path does;
--- refresh_by_match_merge()'s final insert is still a plain INSERT.
+-- columns) against the arbiter index".  Both now do.
 --
--- Test 7 above shows the match/merge path failing when a row drifts into the
--- predicate's scope.  This shows the direct-modification path resolving the
--- same case, so the two paths disagree on identical input.
+-- Note that CONCURRENTLY selects the direct-modification path and the bare
+-- spelling selects match/merge; this exercises both on the same input.
 --
--- Disposition: keep.  The two paths agreeing on the same input is an invariant,
--- and Test 7 will need its expected output updated at the same time.
+-- Disposition: keep.  The two paths agreeing on the same input is an invariant.
 --
 CREATE TABLE mv_drift2_base (id int primary key, category_id int);
 INSERT INTO mv_drift2_base VALUES (1, 100), (2, 200);
@@ -484,7 +487,7 @@ CREATE UNIQUE INDEX ON mv_drift2(id);
 -- Row 1 drifts from category 100 into category 200.  The predicate only sees
 -- the new location, so the stale row at the old location is not deleted.
 UPDATE mv_drift2_base SET category_id = 200 WHERE id = 1;
--- Direct modification absorbs the collision.
+-- match/merge (bare spelling) absorbs the collision.
 REFRESH MATERIALIZED VIEW mv_drift2 WHERE category_id = 200;
 SELECT * FROM mv_drift2 ORDER BY id;
  id | category_id 
@@ -493,14 +496,11 @@ SELECT * FROM mv_drift2 ORDER BY id;
   2 |         200
 (2 rows)
 
--- The same drift, this time handled by match/merge.  Must succeed too.
+-- The same drift through direct modification (CONCURRENTLY).
 UPDATE mv_drift2_base SET category_id = 300 WHERE id = 1;
--- XXX currently fails with a unique key violation on mv_drift2_id_idx, where
--- the direct-modification path above succeeded on identical input.
---
--- The VERBOSITY guard keeps that failure's diff to a single line: the CONTEXT
--- of a match/merge error names the transient tables, whose names are not
--- stable across runs.
+-- The VERBOSITY guard keeps any failure's diff to a single line: the CONTEXT of
+-- a match/merge error names the transient tables, whose names are not stable
+-- across runs.
 \set VERBOSITY terse
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_drift2 WHERE category_id = 300;
 \set VERBOSITY default
@@ -634,18 +634,17 @@ DROP TABLE mv_lock_base;
 --
 -- Not yet reported on -hackers; found while writing these tests.  Test 8 above
 -- covers a change that happens to arbitrate cleanly; this covers one that does
--- not.  The direct-modification path picks a single arbiter index, so a change
--- that a full or concurrent refresh applies cleanly can fail on a second index.
+-- not.
 --
--- Disposition: keep.  That a refresh accepts every row set a full refresh
--- accepts is an invariant, and it is easy to reintroduce by changing how the
--- arbiter index is chosen.
+-- The direct-modification path resolves collisions with ON CONFLICT against a
+-- single arbiter index, so a row set that needs a delete before an insert to
+-- satisfy a *second* unique index cannot be applied that way.  The diff/merge
+-- path deletes before inserting and has no such limit, so the bare spelling is
+-- the way to apply such a change.  This is a real capability difference between
+-- the two forms rather than something either can fix, and it belongs in the
+-- documentation.
 --
--- NB: while this case still fails, it must stay last in this file.  The error
--- escapes refresh_by_direct_modification() between
--- OpenMatViewIncrementalMaintenance() and its matching Close, leaving
--- matview_maintenance_depth above zero for the rest of the session.  See
--- matview_where_privs.sql, which tests that leak directly.
+-- Disposition: keep.  It pins which form can do what, and both halves matter.
 --
 CREATE TABLE mv_multi2_base (id int primary key, email text, uname text);
 INSERT INTO mv_multi2_base VALUES (1, 'a@example.com', 'ua'),
@@ -658,21 +657,21 @@ CREATE UNIQUE INDEX ON mv_multi2(uname);
 -- every unique index, so a refresh has no reason to fail.
 UPDATE mv_multi2_base SET email = CASE id WHEN 1 THEN 'b@example.com'
                                           ELSE 'a@example.com' END;
--- XXX currently fails: the upsert arbitrates on mv_multi2_email_idx and then
--- collides on mv_multi2_uname_idx.  See the note on the VERBOSITY guard above.
+-- Direct modification cannot: it arbitrates on mv_multi2_email_idx and then
+-- collides on mv_multi2_uname_idx.
 \set VERBOSITY terse
-REFRESH MATERIALIZED VIEW mv_multi2 WHERE id IN (1, 2);
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_multi2 WHERE id IN (1, 2);
+ERROR:  duplicate key value violates unique constraint "mv_multi2_uname_idx"
 \set VERBOSITY default
 SELECT * FROM mv_multi2 ORDER BY id;
  id |     email     | uname 
 ----+---------------+-------
-  1 | b@example.com | ua
-  2 | a@example.com | ub
+  1 | a@example.com | ua
+  2 | b@example.com | ub
 (2 rows)
 
--- The match/merge path deletes before inserting, so it already applies the
--- change; once the case above is fixed this is a no-op.
-REFRESH MATERIALIZED VIEW CONCURRENTLY mv_multi2 WHERE id IN (1, 2);
+-- The diff/merge form deletes before inserting, so it applies the change.
+REFRESH MATERIALIZED VIEW mv_multi2 WHERE id IN (1, 2);
 SELECT * FROM mv_multi2 ORDER BY id;
  id |     email     | uname 
 ----+---------------+-------

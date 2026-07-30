@@ -33,6 +33,6 @@ extern ObjectAddress RefreshMatViewByOid(Oid matviewOid, bool is_create, bool sk
 
 extern DestReceiver *CreateTransientRelDestReceiver(Oid transientoid);
 
-extern bool MatViewIncrementalMaintenanceIsEnabled(void);
+extern bool MatViewIncrementalMaintenanceIsEnabled(Oid relid);
 
 #endif							/* MATVIEW_H */

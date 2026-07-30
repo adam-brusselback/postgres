@@ -8,10 +8,10 @@
 # that concern overlapping refreshes.  The prose itself has not landed in the
 # docs yet, which remains an open review item.
 #
-# The non-concurrent partial refresh takes only RowExclusiveLock, and relies on
-# a "SELECT ... FOR UPDATE" over the rows matching the predicate to serialize
-# against other partial refreshes.  This spec pins down the three claims that
-# follow from that design:
+# With a WHERE clause, CONCURRENTLY selects the direct-modification path, which
+# takes only RowExclusiveLock and relies on a "SELECT ... FOR UPDATE" over the
+# rows matching the predicate to serialize against other partial refreshes.
+# This spec pins down the three claims that follow from that design:
 #
 #   - readers are never blocked;
 #   - two refreshes whose predicates cover overlapping existing rows serialize;
@@ -46,15 +46,15 @@ teardown
 session s1
 setup           { BEGIN; }
 step s1_change  { UPDATE mvw_base SET v = 'one-s1' WHERE id = 1; }
-step s1_ref1    { REFRESH MATERIALIZED VIEW mvw WHERE id = 1; }
+step s1_ref1    { REFRESH MATERIALIZED VIEW CONCURRENTLY mvw WHERE id = 1; }
 step s1_commit  { COMMIT; }
 
 session s2
 setup           { BEGIN; }
 # Overlaps s1's predicate: must wait for s1 to commit.
-step s2_ref1    { REFRESH MATERIALIZED VIEW mvw WHERE id = 1; }
+step s2_ref1    { REFRESH MATERIALIZED VIEW CONCURRENTLY mvw WHERE id = 1; }
 # Disjoint from s1's predicate: must not wait.
-step s2_ref2    { REFRESH MATERIALIZED VIEW mvw WHERE id = 2; }
+step s2_ref2    { REFRESH MATERIALIZED VIEW CONCURRENTLY mvw WHERE id = 2; }
 # Plain reads must never block, even mid-refresh.
 step s2_read    { SELECT id, v FROM mvw ORDER BY id; }
 step s2_commit  { COMMIT; }
