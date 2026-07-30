@@ -796,7 +796,31 @@ will have changed.
 
 ## What is already known
 
-A scope-1 refresh is **41.5 µs** (`-O2`), decomposed:
+Two apportionments, and they answer different questions.
+
+**Where a refresh's time goes, warm cache versus cold** (`-O2`, in-backend, 300
+scope-1 refreshes of `projection`, `pg_stat_statements.track = all`):
+
+| | warm cache | cold cache |
+|---|---|---|
+| whole refresh | 72 µs | 546 µs |
+| the fused upsert/prune statement | 26.0 µs | 26.0 µs |
+| the locking `SELECT` | 6.5 µs | 6.5 µs |
+| `pg_get_viewdef` (`pg_rewrite` lookup) | — | 6.6 µs |
+| everything else | ~39 µs | ~507 µs |
+
+"Everything else" is the C path: predicate parse analysis, the deparse, the
+arbiter-index scan, the cache probe, `SPI_connect`, and on the Query-tree path
+building and planning the source query. **SQL execution is half of a warm
+refresh and 6% of a cold one** — the target is the C path either way, and which
+one to attack depends entirely on 3.6.
+
+The Query-tree path is **28% faster in-backend** on the same measurement (244 µs
+against 342 µs, cold), against ~10% through pgbench, because a commit and a
+round trip per refresh dilute it.
+
+An older decomposition of the SQL alone, kept because the property argument
+below refers to it — a scope-1 refresh's **41.5 µs** of statement time:
 
 | component | µs | share |
 |---|---|---|
@@ -831,18 +855,42 @@ cheaper way to pay it is a legitimate optimisation; not paying it is not.
 
 ## Candidates, in rough order of expected value
 
-**3.1 B16 — the commit-per-refresh cliff.** 300 scope-1 refreshes in one
-transaction measure 82.8 µs each; the same refreshes one-transaction-each
-measure 970 µs. **~12×, unconfirmed.** The hypothesis worth testing first: a
-refresh writes to the matview, that write sends a relcache invalidation, and the
-next refresh's cache sweep discards the plans — so a drain process committing per
-refresh re-plans every time while a trigger inside one transaction never does.
-If it holds it affects every queue-and-drain pattern in `USE-CASES.md`, and
-Phase 2.1 may dissolve it outright.
+**3.1 B16 — the commit-per-refresh cliff. ANSWERED, and the hypothesis was
+wrong.** The proposed mechanism was that a refresh's own write invalidates the
+plan cache and the next refresh re-plans, so a drain committing per refresh
+pays for planning every time. Measured directly: 300 committed refreshes with a
+constant predicate call `pg_get_viewdef` **once**, not 300 times, so the plans
+survive commits and nothing re-plans. The 12× is the cost of committing — WAL,
+`XLogFlush`, the transaction itself — and it is not something this patch can
+optimise away. Close it and stop treating it as a lead.
 
-**3.2 Parameterise predicate `Const`s.** A literal predicate that varies per call
-costs **4.2×** because the cache is keyed on deparsed text. Identified, never
-built. Phase 2.1 changes the shape of this problem — possibly removes it.
+    -- the whole measurement, on a warm cache
+    printf 'REFRESH MATERIALIZED VIEW CONCURRENTLY bench.mv WHERE id = 1;\n%.0s' {1..300} > loop.sql
+    psql -f loop.sql
+    SELECT calls FROM pg_stat_statements WHERE query LIKE '%pg_rewrite%';   -- 1
+
+**3.2 Parameterise predicate `Const`s. The largest single number here, and the
+one the benchmark has been measuring without saying so.** The cache is keyed on
+the deparsed predicate text, so a literal that varies per call misses it every
+time. Re-measured on `-O2` after 2.1, in-backend, 300 scope-1 refreshes of
+`projection`:
+
+| predicate | per refresh | |
+|---|---|---|
+| varying literal — `WHERE id = 1`, `= 2`, … | 546 µs | misses every time |
+| constant literal — `WHERE id = 1` | 72 µs | hits |
+| bound parameter, varying value — `WHERE id = $1` | 67 µs | hits |
+
+**8×, not the 4.2× recorded before.** Two consequences, and the second is the
+awkward one:
+
+- A caller who binds a parameter already gets the fast path, because
+  `pg_get_expr` renders a `Param` as `$1` and the key is stable. A caller who
+  builds the predicate as text does not. Both are ordinary things to write.
+- **`bench/run.sh` interpolates `:k` client-side**, so every measurement in
+  every run recorded so far is on the miss path. The suite has been measuring
+  the 546 µs case exclusively and reporting it as the cost of a partial
+  refresh. Fix the benchmark before optimising against it — see 3.6.
 
 **3.3 Revisit the rowcount wrapper.** 4% for reporting, and B8 is being changed
 anyway to unify the count across both forms. Worth doing at the same time.
@@ -856,6 +904,52 @@ it is measurable, not a matter of taste.
 
 **3.5 Re-run the on-list benchmark.** The numbers Adam posted describe v1.
 Everything since has moved, in both directions.
+
+**3.6 The benchmark measures one predicate mode and does not say which.** See
+3.2. `run.sh` needs a `--predmode literal|param` axis and `bench_result` a
+column to record it, because the two differ by 8× and are both real. Nothing
+else in this list can be evaluated until this is fixed: a candidate that only
+helps the miss path will look like a triumph, and one that only helps the hit
+path will look like noise.
+
+**3.7 The source query is re-planned on every refresh (Query-tree path only).**
+`matview_materialize_source()` runs `AcquireRewriteLocks` → `QueryRewrite` →
+`pg_plan_query` per call, while the DML side beside it is plan-cached. This did
+not exist before 2.1 and is the obvious asymmetry it left behind. Cache the
+`PlannedStmt` in the same entry as the other two plans, under the same
+invalidation.
+
+**3.8 The predicate is deparsed on every refresh, for the cache key alone.**
+`deparseRefreshWhereClause()` runs `nodeToString()` + `pg_get_expr()` on every
+call including a hit, and the only consumer on the Query-tree path is
+`strcmp()` against the stored key. Compare the trees with `equal()`, or hash
+the `nodeToString()` and compare hashes, or key on the jumble. 2.3 removes the
+other reason the deparse exists, so these land together.
+
+**3.9 The arbiter index is re-derived on every refresh.** `RelationGetIndexList()`
+plus an `index_open()` per index, before the cache is even probed — and the
+result is then used as part of the cache key, so it cannot simply move inside
+the miss branch without a cheaper validity check.
+
+**3.10 `matview_cache_sweep()` walks the whole cache on every refresh.**
+`hash_seq_search()` over every entry to find the invalid ones, per call. Cheap
+at one entry and O(sessions' matviews) at scale. A counter of pending
+invalidations turns it into a branch.
+
+**3.11 The ENR claims the whole matview's row count.**
+`enr->md.enrtuples = matviewRel->rd_rel->reltuples` tells the planner that
+`new_data` holds every row of the matview when it holds only the scope — for a
+scope-1 refresh of a 100,000-row matview that is a hundred-thousand-fold
+overestimate, feeding the join and upsert plan choice. The true count is known
+after `matview_materialize_source()` returns, and the statement is prepared
+before that, so this is not a one-line fix — but it is a plan-quality defect
+and not merely a constant factor.
+
+**3.12 Fold the locking `SELECT` into the fused statement.** Two SPI executions
+per refresh; the lock is 6.5 µs of the 33 µs the SQL costs on a warm cache.
+Constrained hard by A3/P1/P2 — the lock has to be taken before the source rows
+are read, in arbiter-key order. Listed for completeness, not recommended: the
+risk is to the guarantees and the prize is small.
 
 ## Phase 3 is a loop, not a pass
 
