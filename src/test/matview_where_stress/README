@@ -5,8 +5,13 @@ This directory is NOT part of any test schedule and is not wired into either
 build system.  Delete it before posting the patch to -hackers.  It holds the
 things that do not belong in the patch itself:
 
+  PLAN.md       Scoped work in three phases: what the tests need before the
+                implementation can change safely, the change itself (string-built
+                SQL through SPI -> Query trees), and the performance work that
+                only makes sense afterwards.  Read this second.
+
   ISSUES.md     Review items, split into those raised on the -hackers thread
-                (A1-A9) and those found separately (B1-B15), each mapped to the
+                (A1-A9) and those found separately (B1-B17), each mapped to the
                 test that covers it.  Start here.
 
   SAFETY.md     Which predicates are safe, established by differential testing
