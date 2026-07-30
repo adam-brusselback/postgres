@@ -679,6 +679,43 @@ This alone removes, by construction rather than by fix:
 
 Five tracked items and one CVE-shaped hazard, deleted rather than patched.
 
+### 2.1b Measure here, and again after 2.2
+
+A deliberate pause between the two halves of the rewrite, so the second half
+can be compared against something rather than asserted about.
+
+**Performance.** `bench/run.sh --forms spi,querytree` measures both
+implementations *on one binary*, which removes build variance from the
+comparison — the thing that made the earlier debug-vs-`-O2` numbers
+untransferable. Start it from `bench/detach.sh`: a sweep outlives the shell that
+starts it only if it is put in its own session, and three sweeps were lost here
+before that was diagnosed rather than guessed at. The pre-2.2 sweep is labelled
+`p21-O2`; label the post-2.2 one to match.
+
+**Injection.** `matview_where_inject` (`608b3ad`) states the case for this whole
+phase as something checkable instead of something argued. There are three SQL
+generators, not one — the transient-heap fill and match/merge on the bare path,
+direct modification on the concurrent one — and between them they interpolate
+the schema and relation name, every column name, the deparsed predicate, the
+deparsed view body, and seven names they invent themselves. Each is driven with
+a value chosen to close the construct it lands in and start a new statement,
+against a canary table a successful escape would write to.
+
+Two things this cost, both worth remembering:
+
+- Every case runs all three implementations over one matview, and only the
+  first has work to do. Written naively, forms two and three read back form
+  one's answer and pass having executed nothing. The fix is to mutate the base
+  afresh before each form with a value carrying the iteration number, and read
+  the matview back after each.
+- The corpus that calibrates it had rotted: 2.1's own refactor moved the text
+  A4 and M6 mutate, and two other entries matched twice while being applied
+  once. ISSUES.md B23.
+
+Calibrate against `mutations.py Q1`, `Q2`, `Q3` — dropping a quoting call is
+how this regresses during 2.2, and a detector for a regression that has not
+happened yet cannot be calibrated against one that has.
+
 ## 2.2 The write side — the real work, and an open question
 
 Three options, none free:
