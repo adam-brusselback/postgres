@@ -50,4 +50,36 @@ INSERT INTO probe_exh VALUES
    UNION ALL SELECT format('DELETE FROM b WHERE id=%s',i), format('id = %s',i)
      FROM generate_series(1,12) i
    UNION ALL SELECT format('INSERT INTO b VALUES (%s,1,1)',100+i), format('id = %s',100+i)
+     FROM generate_series(1,12) i$$),
+
+-- Added after the 1.1c calibration run showed the oracle MISSING B4.
+--
+-- The miss was not a weak detector, it was a gap in the corpus: every other
+-- case here starts `id int primary key`, so no shape in the space had a
+-- NULLable unique key, and B4 is a bug that can only happen when one does.
+-- ON CONFLICT against a NULLS DISTINCT index never arbitrates a NULL key, so
+-- the upsert always inserts; whether the anti-join then removes the old row
+-- decides whether it duplicates.  That makes this the shape where "the upsert
+-- and the prune agree about which rows the view produces" -- P1 -- is
+-- decidable in a single session, which is rare and worth having.
+--
+-- `matview_where` Test 11 covers the same bug statically.  Until this case
+-- existed the fuzzer could not have replaced it, which is the kind of thing
+-- the calibration is meant to reveal before, not after, deleting a test.
+('19','nullable_key','projection with a NULLable unique key (the B4 shape)','SAFE',
+ $$CREATE TABLE b(id int primary key, k int, v int);
+   INSERT INTO b SELECT x, CASE WHEN x % 5 = 0 THEN NULL ELSE x % 4 END, x*10
+     FROM generate_series(1,12) x;$$,
+ $$SELECT k, sum(v) AS total FROM b GROUP BY k$$, '(k)',
+ $$SELECT format('UPDATE b SET v=%s WHERE id=%s',v,i),
+          CASE WHEN i%5 = 0 THEN 'k IS NULL' ELSE format('k = %s',i%4) END
+     FROM generate_series(1,12) i, unnest(ARRAY[0,99]) v
+   UNION ALL SELECT format('UPDATE b SET k=NULL WHERE id=%s',i),
+                   format('k = %s OR k IS NULL',i%4)
+     FROM generate_series(1,12) i
+   UNION ALL SELECT format('UPDATE b SET k=%s WHERE id=%s',nk,i),
+                   format('k = %s OR k = %s OR k IS NULL',i%4,nk)
+     FROM generate_series(1,12) i, generate_series(0,3) nk
+   UNION ALL SELECT format('DELETE FROM b WHERE id=%s',i),
+                   format('k = %s OR k IS NULL',i%4)
      FROM generate_series(1,12) i$$);

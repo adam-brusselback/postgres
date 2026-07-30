@@ -430,8 +430,11 @@ SELECT count(*) AS rows_initial FROM mv_null;
 -- The base table is not modified, so each of these must be a no-op.
 REFRESH MATERIALIZED VIEW mv_null WHERE id IS NULL;
 REFRESH MATERIALIZED VIEW mv_null WHERE id IS NULL;
--- Must still be 2.
--- XXX currently returns 4: each refresh duplicates the NULL-keyed row.
+-- Must still be 2, and is: the anti-join now takes its NULL handling from the
+-- arbiter index (B4), so the upsert and the anti-join agree that the
+-- NULL-keyed row is unchanged.  Before that fix this returned 4 -- one
+-- duplicate per refresh -- which is what the rest of this test is shaped
+-- around.
 SELECT count(*) AS rows_after_two_noop_refreshes FROM mv_null;
  rows_after_two_noop_refreshes 
 -------------------------------

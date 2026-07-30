@@ -70,7 +70,18 @@ INSERT INTO probe_exh VALUES
    UNION ALL SELECT format('DELETE FROM b WHERE id=%s',i), format('g = %s',i%4)
      FROM generate_series(1,12) i$$),
 
-('7','distincton','DISTINCT ON (k), pred on k','SAFE',
+-- NONDET, not SAFE.  The ORDER BY is a PARTIAL order: ties on ts within a k
+-- group are broken arbitrarily, so partial and full refresh may legitimately
+-- pick different rows and the difference is not a defect.  It diverges on
+-- exactly one mutation of 96 -- UPDATE b SET ts=6 WHERE id=10, which ties id=10
+-- with id=6 at (k=2, ts=6).  Case 13 distincton_total is this same view with
+-- id appended to the ORDER BY, and diverges zero times; that pair is the
+-- control showing the divergence is the partial order and nothing else.
+-- This is the B15 hazard: a non-deterministic view definition diverges between
+-- refresh forms.  It was labelled SAFE, and the gate list in checkall.sh
+-- happened to name distincton_total and not distincton, so the one shape that
+-- diverges was the one shape nothing checked.
+('7','distincton','DISTINCT ON (k), pred on k','NONDET',
  $$CREATE TABLE b(id int primary key, k int, ts int, v int);
    INSERT INTO b SELECT x, x%4, x, x*3 FROM generate_series(1,12) x;$$,
  $$SELECT DISTINCT ON (k) k, ts, v FROM b ORDER BY k, ts DESC$$, '(k)',
