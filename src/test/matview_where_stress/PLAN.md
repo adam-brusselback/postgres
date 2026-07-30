@@ -117,7 +117,7 @@ goes away."
 | what | why |
 |---|---|
 | `matview-where-snapshot.spec` | its premise is *two SPI statements with separate snapshots*. If the rewrite makes it one plan, the premise dissolves and the injection point moves or goes |
-| `pg_stat_statements` structural block | asserts the literal text of generated SQL. In an implementation that generates no SQL there is nothing to assert. **Delete; no replacement is possible** |
+| `pg_stat_statements` structural block | asserted the literal text of generated SQL. In an implementation that generates no SQL there is nothing to assert. **DELETED** in the Phase 2 opening commit, before the first line of the rewrite; no replacement is possible |
 | `matview_where_privs` Test 1 (A6) | the leakproof-or-ownership rule exists *only* because SPI runs one statement under one userid. If the rewrite allows the predicate to run as the invoker, this test's expectation inverts — which is a win, not a loss |
 
 ## Restate the requirements as properties, not as mechanisms
@@ -129,7 +129,7 @@ otherwise is punishing correct work.
 
 | property | what must hold | current mechanism (one way to satisfy it) | is the gate property-level? |
 |---|---|---|---|
-| **P1 — single evaluation** | the upsert and the prune agree about which rows the view produces | one `MATERIALIZED` CTE | **not deterministically, and it cannot be** — a correct implementation has no observable window (1.1b). Gated by `fuzz.sh`'s `serial` mode, which catches M3 and M6 at 45 and 55 events. The `pg_stat_statements` block matched the literal text and is to be deleted |
+| **P1 — single evaluation** | the upsert and the prune agree about which rows the view produces | one `MATERIALIZED` CTE | **not deterministically, and it cannot be** — a correct implementation has no observable window (1.1b). Gated by `fuzz.sh`'s `serial` mode, which catches M3 and M6 at 45 and 55 events. The `pg_stat_statements` block matched the literal text and has been deleted |
 | **P2 — deterministic lock order, existing rows** | two overlapping refreshes lock the rows they share in the same order | `ORDER BY` on the locking `SELECT` | **yes** — `matview-where-lockorder.spec` observes *which rows are locked* via `xmax`, and says nothing about how the order was achieved |
 | **P3 — deterministic lock order, inserted rows** | two refreshes inserting the same new keys do not deadlock | `ORDER BY` inside `new_data` | **yes, since Phase 1** — `matview-where-insertorder.spec` reads which session a covering refresh blocked on via `pg_blocking_pids()`, which names the order the locks were taken in and not the order the rows landed in. Test 16's ctid proxy is retained only as a smoke test |
 
@@ -149,6 +149,13 @@ is worse than no gate.
 M4, and M4 was only ever interesting because it removed the mechanism that
 happens to deliver P1 today. If P1 is delivered another way, M4 is not a
 regression and there is nothing to catch.
+
+**Done — first commit of Phase 2**, ahead of any change to `matview.c`. The
+rows-tracking case immediately above it is kept, on its own disposition;
+`pg_stat_statements` is 16/16 without the block. M4 now has no detector
+anywhere in the tree, which is the intended end state and not an oversight: it
+was already `MISSED` by both calibrated instruments, and the only thing that
+ever saw it was the assertion on the mechanism it removes.
 
 ### Test 16 needs restating at the property level
 
@@ -447,10 +454,10 @@ longer" is the intuitive knob and it was the useless one in both cases.
 
 ### 1.2 Move structural invariants from tests into the code
 
-The `pg_stat_statements` block asserts things that are genuinely load-bearing —
+The `pg_stat_statements` block asserted things that are genuinely load-bearing —
 one materialised `new_data`, upsert and prune fused, locking `SELECT` ordered —
-but it asserts them by pattern-matching SQL text, which is why it cannot
-survive, and why it would go red against a correct rewrite.
+but it asserted them by pattern-matching SQL text, which is why it could not
+survive, and why it would have gone red against a correct rewrite.
 
 The invariants themselves are worth keeping — as `Assert()`s at the point the
 guarantee is established, each naming the fix it protects (A3, A5). An assertion
@@ -785,7 +792,7 @@ static suite it produced, against whatever implementation actually landed.
   | B1/B2 · cache tests, "delete if the plan cache goes away" | Phase 2.1 removes most of the cache's reason to exist | **read at Phase 2 exit**, not before |
   | B9 · Test 13 search_path half | settled: the restriction stays | **resolved** — keep, add an `errhint` |
   | Test 16 · ctid order, "keep until the property-level version exists" | `matview-where-insertorder.spec` landed in Phase 1 | **fired** — delete here |
-  | `pg_stat_statements` structural block, "delete at the start of Phase 2" | Phase 2 opening | fires before the first line of the rewrite, not after |
+  | `pg_stat_statements` structural block, "delete at the start of Phase 2" | Phase 2 opening | **fired** — deleted before the first line of the rewrite, not after |
   | `matview-where-snapshot`, "delete when the premise goes" | the rewrite fusing the lock into one plan | **read at Phase 2 exit** |
   | `matview_where_privs` Test 1, "rewrite if the predicate runs as the invoker" | Phase 2's privilege model | **read at Phase 2 exit** — it inverts rather than lapsing, so it must be rewritten, not regenerated |
 

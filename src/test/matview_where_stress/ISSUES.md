@@ -237,7 +237,7 @@ assumed to work. B17 is closed.
 | `matview-where-lockorder.spec` (isolation) | the locking `SELECT` orders by the arbiter key | M1 · drop that `ORDER BY` | **fails in 60 ms**; the `locked` column inverts from rows 1-5 to rows 6-10 |
 | `matview_where` Test 16 (regress) | `new_data` orders by the arbiter key | M2 · drop that `ORDER BY` | **fails**; insert order goes `{11..20}` → `{20..11}` |
 | `matview-where-snapshot.spec` (injection points) | the row locks are held **before** the CTE runs | M6 · move the locking `SELECT` after the CTE | **fails**; the overlapping refresh stops reporting `<waiting ...>` |
-| `pg_stat_statements` `utility` | the *shape* of what a refresh issues | M4 · `new_data NOT MATERIALIZED` | **fails**; `new_data_is_materialised` flips to `f` |
+| `pg_stat_statements` `utility` | the *shape* of what a refresh issues | M4 · `new_data NOT MATERIALIZED` | **fails**; `new_data_is_materialised` flips to `f` — **but this gate has since been deleted**; see below |
 
 ### On the fourth gate, and why an analogy was not good enough
 
@@ -275,10 +275,18 @@ the mechanism. M4 is behaviourally benign, so nothing behavioural can see it —
 but it is only *interesting* while the CTE is how the guarantee is delivered.
 The invariant belongs as an `Assert()` where the guarantee is established.
 
-`PLAN.md` schedules this block for deletion at the **start** of the Query-tree
-work, and restates the three guarantees as properties (P1 single evaluation, P2
-and P3 deterministic lock order) with a note on which gates are property-level.
-Only the `xmax` spec is.
+`PLAN.md` scheduled this block for deletion at the **start** of the Query-tree
+work, and that is where it went — the opening commit of Phase 2, ahead of any
+change to `matview.c`. M4 consequently has no detector left anywhere, which is
+the intended end state: both calibrated instruments already recorded it as
+`MISSED`, and the only thing that ever saw it was an assertion on the mechanism
+it removes.
+
+`PLAN.md` also restates the three guarantees as properties (P1 single
+evaluation, P2 and P3 deterministic lock order) with a note on which gates are
+property-level. When that was written only the `xmax` spec was; since Phase 1,
+`matview-where-insertorder.spec` is too, and P1's is behavioural rather than
+structural (`fuzz.sh` `serial`).
 
 Two things went wrong on the way to these and are worth not repeating.
 
