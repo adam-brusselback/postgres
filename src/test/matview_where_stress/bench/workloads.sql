@@ -42,7 +42,7 @@ INSERT INTO bench_workload VALUES
  $$SELECT id, cust, status FROM ord$$,
  $$CREATE UNIQUE INDEX ON mv(id); CREATE INDEX ON mv(cust)$$,
  'id', ':scale',
- $$id = :k$$, $$id = ANY(ARRAY(SELECT generate_series(:k, :k + :span - 1)))$$, $$id BETWEEN :k AND :k + :span - 1$$),
+ $$id = :k$$, $$id = ANY(:arraylit)$$, $$id BETWEEN :k AND :k + :span - 1$$),
 
 (2,'aggregate','GROUP BY, predicate on the grouping key',
  $$CREATE TABLE ledger(id bigint primary key, acct int, amt numeric);
@@ -51,7 +51,7 @@ INSERT INTO bench_workload VALUES
  $$SELECT acct, sum(amt) AS total, count(*) AS n, max(amt) AS mx FROM ledger GROUP BY acct$$,
  $$CREATE UNIQUE INDEX ON mv(acct)$$,
  'acct', ':groups',
- $$acct = :k$$, $$acct = ANY(ARRAY(SELECT generate_series(:k, :k + :span - 1)))$$, $$acct BETWEEN :k AND :k + :span - 1$$),
+ $$acct = :k$$, $$acct = ANY(:arraylit)$$, $$acct BETWEEN :k AND :k + :span - 1$$),
 
 (3,'join_agg','join + GROUP BY; the on-list benchmark shape',
  $$CREATE TABLE inv(id bigint primary key, cust int);
@@ -64,7 +64,7 @@ INSERT INTO bench_workload VALUES
      FROM inv i JOIN line l ON l.inv_id = i.id GROUP BY i.id, i.cust$$,
  $$CREATE UNIQUE INDEX ON mv(inv_id); CREATE INDEX ON mv(cust)$$,
  'inv_id', ':groups',
- $$inv_id = :k$$, $$inv_id = ANY(ARRAY(SELECT generate_series(:k, :k + :span - 1)))$$, $$inv_id BETWEEN :k AND :k + :span - 1$$),
+ $$inv_id = :k$$, $$inv_id = ANY(:arraylit)$$, $$inv_id BETWEEN :k AND :k + :span - 1$$),
 
 (4,'window','push-down through WindowAgg; partition-sized scope',
  $$CREATE TABLE player(id bigint primary key, region int, score int);
@@ -74,7 +74,7 @@ INSERT INTO bench_workload VALUES
           rank() OVER (PARTITION BY region ORDER BY score DESC, id) AS rnk FROM player$$,
  $$CREATE UNIQUE INDEX ON mv(id); CREATE INDEX ON mv(region)$$,
  'region', ':groups',
- $$region = :k$$, $$region = ANY(ARRAY(SELECT generate_series(:k, :k + :span - 1)))$$, $$region BETWEEN :k AND :k + :span - 1$$),
+ $$region = :k$$, $$region = ANY(:arraylit)$$, $$region BETWEEN :k AND :k + :span - 1$$),
 
 (5,'expensive','per-row expression + GIN index maintenance dominate',
  $$CREATE TABLE brand(id int primary key, name text);
@@ -86,9 +86,9 @@ INSERT INTO bench_workload VALUES
  $$SELECT p.id, p.name, b.name AS brand,
           to_tsvector('english', p.name||' '||coalesce(p.descr,'')||' '||b.name) AS doc
      FROM product p JOIN brand b ON b.id = p.brand$$,
- $$CREATE UNIQUE INDEX ON mv(id); CREATE INDEX ON mv USING gin(doc)$$,
+ $$CREATE UNIQUE INDEX ON mv(id); CREATE INDEX ON mv USING gin(doc) WITH (fastupdate = off)$$,
  'id', ':scale',
- $$id = :k$$, $$id = ANY(ARRAY(SELECT generate_series(:k, :k + :span - 1)))$$, $$id BETWEEN :k AND :k + :span - 1$$),
+ $$id = :k$$, $$id = ANY(:arraylit)$$, $$id BETWEEN :k AND :k + :span - 1$$),
 
 (6,'nonkey','indexed NON-key predicate; disjoint scopes should run in parallel',
  $$CREATE TABLE ev(id bigint primary key, tenant int, amt numeric);
@@ -97,17 +97,17 @@ INSERT INTO bench_workload VALUES
  $$SELECT id, tenant, amt FROM ev$$,
  $$CREATE UNIQUE INDEX ON mv(id); CREATE INDEX ON mv(tenant)$$,
  'tenant', ':groups',
- $$tenant = :k$$, $$tenant = ANY(ARRAY(SELECT generate_series(:k, :k + :span - 1)))$$, $$tenant BETWEEN :k AND :k + :span - 1$$),
+ $$tenant = :k$$, $$tenant = ANY(:arraylit)$$, $$tenant BETWEEN :k AND :k + :span - 1$$),
 
 (7,'timerange','range predicate over time buckets; large scope, bare form',
  $$CREATE TABLE metric(id bigint primary key, series int, bucket int, val float8);
-   INSERT INTO metric SELECT g, g % 500, g % :groups, (g%977)::float8 FROM generate_series(1,:scale) g;
+   INSERT INTO metric SELECT g, g % 200, g / 1000, (g%977)::float8 FROM generate_series(1,:scale) g;
    CREATE INDEX ON metric(bucket);$$,
  $$SELECT series, bucket, avg(val) AS a, max(val) AS m, count(*) AS n
      FROM metric GROUP BY series, bucket$$,
  $$CREATE UNIQUE INDEX ON mv(series,bucket); CREATE INDEX ON mv(bucket)$$,
- 'bucket', ':groups',
- $$bucket = :k$$, $$bucket = ANY(ARRAY(SELECT generate_series(:k, :k + :span - 1)))$$, $$bucket BETWEEN :k AND :k + :span - 1$$),
+ 'bucket', '(:scale/1000)',
+ $$bucket = :k$$, $$bucket = ANY(:arraylit)$$, $$bucket BETWEEN :k AND :k + :span - 1$$),
 
 (8,'recursive','predicate may not push into the recursive term at all',
  $$CREATE TABLE edge(child int, parent int, primary key(child,parent));
@@ -120,4 +120,4 @@ INSERT INTO bench_workload VALUES
     SELECT child, parent FROM r$$,
  $$CREATE UNIQUE INDEX ON mv(child,parent); CREATE INDEX ON mv(child)$$,
  'child', ':scale',
- $$child = :k$$, $$child = ANY(ARRAY(SELECT generate_series(:k, :k + :span - 1)))$$, $$child BETWEEN :k AND :k + :span - 1$$);
+ $$child = :k$$, $$child = ANY(:arraylit)$$, $$child BETWEEN :k AND :k + :span - 1$$);

@@ -66,6 +66,19 @@ mkdir -p "$TMP"
 trap 'rm -rf "$TMP"' EXIT
 list() { echo "$1" | tr ',' ' '; }
 
+# Return the instance to a comparable state between measurements: reclaim what
+# the previous one bloated, refresh statistics, flush.  Without this, sweep
+# position correlates with accumulated dead tuples, and whatever is measured
+# last always looks worst -- which is indistinguishable from an effect of the
+# variable being swept.
+settle() {
+  $PSQL -Atc "SELECT 'VACUUM (ANALYZE) '||schemaname||'.'||quote_ident(relname)||';'
+                FROM pg_stat_user_tables WHERE schemaname='bench'" 2>/dev/null |
+    $PSQL -f - >/dev/null 2>&1
+  $PSQL -c "VACUUM (ANALYZE) bench.mv" >/dev/null 2>&1
+  $PSQL -c "CHECKPOINT" >/dev/null 2>&1
+}
+
 $PSQL -f "$DIR/workloads.sql"
 $PSQL -f "$DIR/harness.sql"
 [ -n "$WORKLOADS" ] || WORKLOADS=$($PSQL -Atc 'SELECT string_agg(id, ",") FROM bench_workload ORDER BY 1' | tr -d ' ')
@@ -79,10 +92,21 @@ echo "run '$LABEL' :: assertions=$ASSERT  synchronous_commit=$SYNC"
 for w in $(list "$WORKLOADS"); do
  for scale in $(list "$SCALES"); do
   MVROWS=$($PSQL -Atc "SELECT bench_setup('$w', $scale, $GROUPS)")
-  FULL=$($PSQL -Atc "SET search_path=bench,public; SELECT bench_baseline(3)")
+  # Settle before baselining.  Measured straight off the bulk load the baseline
+  # drifts upward by ~1.9x over consecutive runs, and every normalised number
+  # divides by it.  Cache it per (workload, scale, groups) and reuse.
+  settle
+  FULL=$($PSQL -Atc "SELECT full_ms FROM bench_baseline_cache
+                      WHERE workload='$w' AND scale=$scale AND groups=$GROUPS")
+  if [ -z "$FULL" ]; then
+    FULL=$($PSQL -Atc "SET search_path=bench,public; SELECT bench_baseline(3)")
+    $PSQL -c "INSERT INTO bench_baseline_cache VALUES ('$w',$scale,$GROUPS,$FULL)
+              ON CONFLICT (workload,scale,groups) DO UPDATE SET full_ms = EXCLUDED.full_ms" >/dev/null
+    settle
+  fi
   ISO=$($PSQL -Atc "SELECT isolates FROM bench_workload WHERE id='$w'")
   KEYMAXE=$($PSQL -Atc "SELECT keymax FROM bench_workload WHERE id='$w'")
-  KEYMAX=$(echo "$KEYMAXE" | sed "s/:scale/$scale/; s/:groups/$GROUPS/")
+  KEYMAX=$($PSQL -Atc "SELECT ($(echo "$KEYMAXE" | sed "s/:scale/$scale/g; s/:groups/$GROUPS/g"))::bigint")
   echo "== $w  scale=$scale  mv_rows=$MVROWS  full=${FULL}ms  ($ISO)"
 
   for shape in $(list "$SHAPES"); do
@@ -90,8 +114,22 @@ for w in $(list "$WORKLOADS"); do
    PREDT=$($PSQL -Atc "SELECT $PREDCOL FROM bench_workload WHERE id='$w'")
    for span in $(list "$SPANS"); do
     [ "$shape" = key ] && [ "$span" != 1 ] && continue
+    # a span wider than the key space silently clamps to "everything", which is
+    # not the point being measured -- skip it and say so
+    if [ "$span" -gt "$KEYMAX" ] 2>/dev/null; then
+      echo "   skip $w span=$span (> $KEYMAX keys)"; continue; fi
+    # a literal array of thousands of elements is not a realistic predicate;
+    # past 100 keys the range shape is what a caller would actually write
+    [ "$shape" = array ] && [ "$span" -gt 100 ] 2>/dev/null && continue
+    # ARRAY[:k+0,:k+1,...] -- a literal array.  ARRAY(SELECT generate_series(..))
+    # becomes an InitPlan, which blocks equivalence-class propagation to the
+    # other side of a join and seq-scans it (6.7x on join_agg).  The InitPlan
+    # form is kept as the deliberately-labelled "initplan" shape.
+    ARRLIT="ARRAY["$(i=0; while [ $i -lt "$span" ]; do
+                       [ $i -gt 0 ] && printf ,; printf ':k+%s' "$i"; i=$((i+1)); done)"]"
+    [ "$shape" = initplan ] && ARRLIT="ARRAY(SELECT generate_series(:k, :k + $span - 1))"
     SCOPE=$($PSQL -Atc "SET search_path=bench,public;
-       SELECT bench_scope_rows(\$\$$(echo "$PREDT" | sed "s/:k/1/g; s/:span/$span/g")\$\$)")
+       SELECT bench_scope_rows(\$\$$(echo "$PREDT" | sed "s/:arraylit/$ARRLIT/g" | sed "s/:k/1/g; s/:span/$span/g")\$\$)")
     for form in $(list "$FORMS"); do
      CONC=$([ "$form" = conc ] && echo 'CONCURRENTLY ' || echo '')
      for nc in $(list "$CLIENTS"); do
@@ -109,8 +147,10 @@ for w in $(list "$WORKLOADS"); do
            $PSQL -Atc "SELECT sql FROM bench_mutation WHERE id='$w'" | sed 's/$/;/'
          fi
          echo "REFRESH MATERIALIZED VIEW ${CONC}bench.mv WHERE $PREDT;"
-       } | sed "s/:span/$span/g" > "$S"
+       } | sed "s/:span/$span/g; s/:arraylit/$ARRLIT/g" > "$S"
 
+       settle                       # bloat from the previous combination is
+                                    # not an input to this one
        BEST_TPS=0; BEST_LAT=
        i=0; while [ $i -lt "$REPEAT" ]; do
          i=$((i+1))

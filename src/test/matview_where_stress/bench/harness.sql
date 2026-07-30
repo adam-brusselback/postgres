@@ -63,6 +63,14 @@ BEGIN
 END $fn$;
 
 -- Full-refresh baseline, minimum of k.  Everything else is normalised to this.
+-- Baselines are cached per (workload, scale, groups): measuring one repeatedly
+-- drifts upward (149 -> 245 ms over 8 consecutive full refreshes), and every
+-- normalised result divides by it, so it is measured once on a settled instance
+-- and reused for the whole run.
+CREATE TABLE IF NOT EXISTS bench_baseline_cache(
+  workload text, scale bigint, groups int, full_ms numeric,
+  PRIMARY KEY (workload, scale, groups));
+
 CREATE OR REPLACE FUNCTION bench_baseline(k int DEFAULT 3)
 RETURNS numeric LANGUAGE plpgsql AS $fn$
 DECLARE t0 timestamptz; i int; best numeric := NULL; ms numeric;
