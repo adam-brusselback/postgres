@@ -87,6 +87,11 @@ typedef struct MatViewPartialRefreshCache
 	/* The cached plans */
 	SPIPlanPtr	lockPlan;		/* SELECT FOR UPDATE */
 	SPIPlanPtr	refreshPlan;	/* Fused CTE: Evaluate -> Upsert -> Delete */
+
+	bool		invalid;		/* set by the relcache callback; the entry is
+								 * dropped at the next partial refresh, not by
+								 * the callback itself -- see
+								 * InvalidateMatViewCache */
 }			MatViewPartialRefreshCache;
 
 static HTAB *MatViewRefreshCache = NULL;
@@ -128,6 +133,7 @@ static int	matview_execute_spi_plan(SPIPlanPtr plan, ParamListInfo params, bool 
 static char *get_matview_view_query(Oid matviewOid);
 static void InitMatViewCache(void);
 static void InvalidateMatViewCache(Datum arg, Oid relid);
+static void matview_cache_sweep(void);
 static bool refresh_where_clause_is_leakproof(Node *qual);
 static bool matview_argtypes_match(MatViewPartialRefreshCache *entry,
 								   ParamListInfo params);
@@ -984,8 +990,19 @@ matview_argtypes_match(MatViewPartialRefreshCache *entry, ParamListInfo params)
  *
  * The cached SQL names its relations, and a saved plan is re-analyzed from its
  * raw parse tree when invalidated -- so after a rename the text resolves to
- * whatever now holds that name.  Drop cached plans whenever anything they
+ * whatever now holds that name.  Mark cached plans stale whenever anything they
  * could refer to changes.  relid == InvalidOid means "everything".
+ *
+ * Marking is all this may do.  Invalidation callbacks run at arbitrary points:
+ * inside CommandCounterIncrement(), while acquiring a lock, and during
+ * transaction abort -- including from within the very refresh that is executing
+ * these plans, because that refresh writes to the matview and takes locks.
+ * Freeing a plan there would pull a CachedPlan out from under the executor, and
+ * removing the entry would leave refresh_by_direct_modification() holding a
+ * pointer to memory dynahash has already put back on its freelist.  Throwing an
+ * error is not allowed here either, since abort processing has nowhere to put
+ * it.  matview_cache_sweep() does the freeing instead, at a point where nothing
+ * can be using the plans.
  */
 static void
 InvalidateMatViewCache(Datum arg, Oid relid)
@@ -998,7 +1015,32 @@ InvalidateMatViewCache(Datum arg, Oid relid)
 
 	hash_seq_init(&status, MatViewRefreshCache);
 	while ((entry = (MatViewPartialRefreshCache *) hash_seq_search(&status)) != NULL)
+		entry->invalid = true;
+}
+
+/*
+ * Free the plans of every entry the callback marked stale, and drop the entries.
+ *
+ * Called at the start of a partial refresh, before any plan is taken or
+ * executed, which is the property that makes the frees safe.  Sweeping every
+ * entry rather than just this refresh's own is what reclaims the plans of
+ * matviews that have since been dropped.
+ */
+static void
+matview_cache_sweep(void)
+{
+	HASH_SEQ_STATUS status;
+	MatViewPartialRefreshCache *entry;
+
+	if (MatViewRefreshCache == NULL)
+		return;
+
+	hash_seq_init(&status, MatViewRefreshCache);
+	while ((entry = (MatViewPartialRefreshCache *) hash_seq_search(&status)) != NULL)
 	{
+		if (!entry->invalid)
+			continue;
+
 		if (entry->lockPlan)
 			SPI_freeplan(entry->lockPlan);
 		if (entry->refreshPlan)
@@ -1007,6 +1049,8 @@ InvalidateMatViewCache(Datum arg, Oid relid)
 			pfree(entry->whereClauseStr);
 		if (entry->argtypes)
 			pfree(entry->argtypes);
+
+		/* dynahash permits removing the just-returned element mid-scan */
 		if (hash_search(MatViewRefreshCache, &entry->matviewOid,
 						HASH_REMOVE, NULL) == NULL)
 			elog(ERROR, "hash table corrupted");
@@ -1109,6 +1153,15 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	if (!MatViewRefreshCache)
 		InitMatViewCache();
 
+	/*
+	 * Discard anything the relcache callback marked stale.  Do this before
+	 * taking our own entry: the sweep removes entries, so a pointer taken
+	 * first would not survive it.  Afterwards nothing removes entries until
+	 * the next refresh, so cacheEntry stays valid for the whole maintenance
+	 * window even though invalidations keep arriving during it.
+	 */
+	matview_cache_sweep();
+
 	cacheEntry = (MatViewPartialRefreshCache *) hash_search(MatViewRefreshCache,
 															&matviewOid,
 															HASH_ENTER,
@@ -1150,6 +1203,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		cacheEntry->whereClauseStr = NULL;
 		cacheEntry->nargs = 0;
 		cacheEntry->argtypes = NULL;
+		cacheEntry->invalid = false;
 	}
 
 	old_depth = matview_maintenance_depth;

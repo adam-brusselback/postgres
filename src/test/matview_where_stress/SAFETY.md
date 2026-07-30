@@ -57,6 +57,25 @@ and a fresh row inserted into every group. Both refresh forms (bare and
 `CONCURRENTLY`) were run for every case; **they agreed on all 36 shape-runs**,
 so nothing below is an artifact of one implementation path.
 
+### What it found before it answered anything
+
+The harness crashed the server twice on its first full run, both times on the
+same call, and only on the `CONCURRENTLY` form:
+
+    LOG:  client backend (PID 13304) was terminated by signal 11: Segmentation fault
+    DETAIL:  Failed process was running: SELECT run_exh('proj_nonkey_union','concurrently')
+
+That turned out to be a use-after-free in the partial-refresh plan cache:
+`InvalidateMatViewCache()` freed plans and removed hash entries from inside a
+relcache callback, while `refresh_by_direct_modification()` held a pointer to
+one of those entries across the entire maintenance window — and the refresh
+itself generates the invalidations, by locking and writing the matview. Written
+up as B14 in `ISSUES.md`; fixed by having the callback mark rather than free.
+
+Worth stating plainly: the crash has not reproduced since, so it is evidence
+that something was wrong, not evidence that this was it. What justifies the fix
+is reading the code. What the harness did was make anyone look.
+
 ### Hand-picked mutations are not good enough
 
 Three cases were classified **SAFE by a hand-picked mutation and UNSAFE by the

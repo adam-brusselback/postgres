@@ -59,6 +59,42 @@ swap will change that spec's premise as well: after the swap it is the bare form
 that takes ExclusiveLock, and this permutation would need rewriting around
 whichever form still uses row locks.
 
+### On B14, and what the evidence for it is
+
+The safety harness crashed the server twice, both times on the same call:
+
+    LOG:  client backend (PID 13304) was terminated by signal 11: Segmentation fault
+    DETAIL:  Failed process was running: SELECT run_exh('proj_nonkey_union','concurrently')
+
+Only the `CONCURRENTLY` form, which is the only one that uses these cached
+plans. It has not reproduced since — three full harness runs, ~2800 refresh
+cycles each, are clean before *and* after the fix — so **the crash is evidence
+that something is wrong, not evidence that this was it**. What justifies the fix
+is the code, which is wrong by construction whether or not it can be made to
+crash on demand:
+
+- `refresh_by_direct_modification()` takes `cacheEntry` from the hash table and
+  holds it across `SPI_prepare`, `SPI_execute_plan` and the whole maintenance
+  window, writing through it afterwards.
+- `InvalidateMatViewCache()` ran `SPI_freeplan()` and `hash_search(HASH_REMOVE)`
+  over **every** entry.
+- Relcache callbacks fire at `CommandCounterIncrement()`, on lock acquisition,
+  and during abort — all of which the refresh itself triggers, because it locks
+  and writes the matview.
+
+So an invalidation arriving mid-refresh put the entry back on dynahash's
+freelist while a live pointer to it was still in use, and freed a `CachedPlan`
+that could be the one executing. The callback also called `elog(ERROR)`, which
+is not allowed during abort processing.
+
+The fix is the pattern `plancache.c` uses: the callback only sets a flag, and
+`matview_cache_sweep()` does the freeing at the start of the next partial
+refresh, before any plan is taken. Sweeping every stale entry rather than only
+the current one preserves B7 — plans belonging to dropped matviews are still
+reclaimed. Behaviour is unchanged: all 36 harness shape-runs return identical
+verdicts before and after, and regress 248/248, isolation 133/133 and
+pg_stat_statements 16/16 are green.
+
 ---
 
 ## B. Not mentioned on the thread
@@ -78,3 +114,4 @@ whichever form still uses row locks.
 | B11 | Index opened `AccessShareLock` at `matview.c:1063`, closed `NoLock` at `:1126`, with no comment saying the lock is meant to be held (unlike `:1466`) | none | Cosmetic | n/a |
 | B12 | `opt_refresh_where_clause` duplicates the existing `where_clause` production; its `ereport` has no `parser_errposition()` | none | Cosmetic | n/a |
 | B13 | `SetMatViewPopulatedState()`'s new early return also changes the full-rebuild path: it now skips the `pg_class` update *and* the `CommandCounterIncrement()` | none | Only two callers, both benign, but it should be called out rather than slipped in | n/a |
+| B14 | **Use-after-free in the plan cache.** `InvalidateMatViewCache()` freed plans and `HASH_REMOVE`d entries from inside a relcache callback, while `refresh_by_direct_modification()` held a pointer to one of those entries across the whole maintenance window | found by `safety/run.sh`; no deterministic test | **FIXED** — the callback now only marks; `matview_cache_sweep()` frees at the next refresh. See below | keep the sweep |
