@@ -252,6 +252,50 @@ Expect some misses. A6, A7, B5 and B9 are privilege behaviour and B14 is a
 use-after-free; a data-correctness fuzzer will not see any of them, and that is
 fine — it says which coverage has to stay static rather than being folded in.
 
+#### Measured, against the single-session oracle
+
+`./calibrate.sh`, eight mutations, each rebuilt and re-run from a recorded
+pristine baseline. A run is ~40s, which is the number the exit criterion has to
+be built from.
+
+| mutation | issue | observable in | verdict | how |
+|---|---|---|---|---|
+| A4 · drop `ON CONFLICT` | A4 | one session | **CAUGHT** 33s | `errs` 0→96, not `diverged` |
+| B4 · anti-join NULL handling | B4 | one session | **CAUGHT** 38s | `nullable_key/concurrently` 0→76 |
+| B6 · wrong unique index | B6 | one session | MISSED 40s | corpus cannot express it |
+| M1 · drop `ORDER BY`, locking `SELECT` | A5 | two sessions | MISSED 41s | structural |
+| M2 · drop `ORDER BY`, `new_data` | P3 | two sessions | MISSED 40s | structural |
+| M3 · remove the locking `SELECT` | A3 | two sessions | MISSED 42s | structural |
+| M4 · `NOT MATERIALIZED` | — | benign | MISSED 38s | correct: nothing to catch |
+| M6 · lock after instead of before | A3 | two sessions | MISSED 41s | structural |
+
+**Two of three data bugs, none of the four concurrency bugs.** The concurrency
+misses are not a defect — the oracle is single-session by construction and there
+is no second session for a lock-ordering bug to be a bug *in*. They are the
+measurement that says the concurrent fuzzer of 1.1b(b) is a separate instrument
+that has to be built, not a mode of this one.
+
+The two data-bug results are the ones worth reading closely, because both were
+mispredicted and each was a gap of a different kind:
+
+- **B4 was missed until the corpus grew a shape for it.** Every base table in
+  the space started `id int primary key`, so no case had a NULLable unique key,
+  and B4 cannot occur without one. Adding case 19 `nullable_key` moved it from
+  MISSED to CAUGHT with no change to the detector. This is the generator gap
+  1.1c predicts, and it is worth noting how it presented: as a clean run.
+
+- **B6 is missed for a reason a new case cannot fix.** `exh_driver.sql` creates
+  exactly one unique index per case, and B6 is a collision on a *non-arbiter*
+  index. Closing it means changing the driver's schema to carry an optional
+  second index, not adding another row. Left open deliberately — B6 is a
+  documented limitation rather than a live bug, so the cost is knowing the
+  fuzzer cannot stand in for `matview_where` Test 15.
+
+**Consequence for Phase 4.** "Delete the static tests the fuzzer covers"
+requires knowing which those are, and right now the fuzzer does not cover Test
+11 (B4) — it only does since case 19 — or Test 15 (B6) at all. Any deletion
+list has to be derived from a calibration run, not from reading the tests.
+
 ### 1.2 Move structural invariants from tests into the code
 
 The `pg_stat_statements` block asserts things that are genuinely load-bearing —
