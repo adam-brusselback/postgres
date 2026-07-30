@@ -61,6 +61,50 @@ goes away."
 | `pg_stat_statements` structural block | asserts the literal text of generated SQL. In an implementation that generates no SQL there is nothing to assert. **Delete; no replacement is possible** |
 | `matview_where_privs` Test 1 (A6) | the leakproof-or-ownership rule exists *only* because SPI runs one statement under one userid. If the rewrite allows the predicate to run as the invoker, this test's expectation inverts — which is a win, not a loss |
 
+## Restate the requirements as properties, not as mechanisms
+
+The current gates pin *how* three guarantees are met rather than *that* they are
+met. That is a defect in the gates, not a constraint on the implementation. Any
+replacement that delivers the property is equally valid, and a test that says
+otherwise is punishing correct work.
+
+| property | what must hold | current mechanism (one way to satisfy it) | is the gate property-level? |
+|---|---|---|---|
+| **P1 — single evaluation** | the upsert and the prune agree about which rows the view produces | one `MATERIALIZED` CTE | **no** — the `pg_stat_statements` block matches on the literal text `new_data AS MATERIALIZED` |
+| **P2 — deterministic lock order, existing rows** | two overlapping refreshes lock the rows they share in the same order | `ORDER BY` on the locking `SELECT` | **yes** — `matview-where-lockorder.spec` observes *which rows are locked* via `xmax`, and says nothing about how the order was achieved |
+| **P3 — deterministic lock order, inserted rows** | two refreshes inserting the same new keys do not deadlock | `ORDER BY` inside `new_data` | **no** — Test 16 reads ctid order, a proxy that only holds while insertion order and lock order are the same thing |
+
+P2 is the model. It was arrived at by accident — the direct probe was
+unorderable, so it fell back to observing state — but the accident produced the
+right shape: assert the outcome, not the construction.
+
+### The `pg_stat_statements` block is worse than untestable — it is obstructive
+
+It does not merely fail to survive Phase 2. It would **fail against a correct
+rewrite** that delivers P1 by other means: a single `ModifyTable` plan, an
+explicit tuplestore read twice, anything that is not the literal string
+`new_data AS MATERIALIZED`. A gate that goes red when the work is done properly
+is worse than no gate.
+
+**Delete it at the start of Phase 2, not the end.** Its only unique coverage is
+M4, and M4 was only ever interesting because it removed the mechanism that
+happens to deliver P1 today. If P1 is delivered another way, M4 is not a
+regression and there is nothing to catch.
+
+### Test 16 needs restating at the property level
+
+The property is P3: two refreshes inserting overlapping new keys must not
+deadlock. The current test asserts ctid order, which is a proxy that holds only
+while the implementation inserts in lock order. An implementation that acquires
+the locks separately, in order, and then inserts in any order satisfies P3 and
+fails Test 16.
+
+The property-level version is the one already written for P2's cousin:
+`matview_where_stress/run.sh` drives two concurrent refreshes over overlapping
+*existing* rows and asserts no deadlock. The same shape over overlapping *new*
+keys tests P3 directly. Write that during Phase 1; keep Test 16 only until it
+exists, and only as a cheap smoke test with a comment saying it is a proxy.
+
 ## What to build before Phase 2 starts
 
 ### 1.1 Differential mode in the safety oracle — the highest-value item
@@ -203,14 +247,26 @@ A scope-1 refresh is **41.5 µs** (`-O2`), decomposed:
 | `count(*)` rowcount wrapper | 1.6 | 4% |
 | scaffolding | 2.4 | 6% |
 
-## What is already ruled out — do not re-litigate
+## What is ruled out is a property, not a mechanism
 
-- **Splitting the fused CTE** (1.5× on paper) reopens a consistency gap.
-  Demonstrated, not argued: `safety/a3-split-gap.sh`.
-- **Dropping `new_data`'s `ORDER BY`** (13%) breaks insert-order locking.
-  Gated by `matview_where` Test 16.
-- **Dropping the locking `SELECT`'s `ORDER BY`** breaks A5. Gated by
-  `matview-where-lockorder.spec`.
+Each of these is a *guarantee that cannot be given up*. None of them is a
+requirement to keep the current construction. Replace the CTE, replace either
+`ORDER BY`, restructure all of it — as long as the property still holds and a
+property-level gate still passes.
+
+- **P1, single evaluation** cannot be abandoned: the upsert and the prune must
+  agree about which rows the view produces. Demonstrated, not argued —
+  `safety/a3-split-gap.sh` shows two statements over two snapshots leaving a
+  stale row that neither corrects. The 1.5× that splitting appears to buy is
+  the cost of that guarantee, not waste.
+- **P2, deterministic lock order over existing rows** cannot be abandoned
+  (A5). Gated property-level by `matview-where-lockorder.spec`.
+- **P3, deterministic lock order over inserted rows** cannot be abandoned.
+  Gated only by proxy today — see Phase 1.
+
+The 13% attributed to `new_data`'s `ORDER BY` and the 11% to CTE fusion are
+therefore **not** off the table. They are the current price of P1 and P3. A
+cheaper way to pay it is a legitimate optimisation; not paying it is not.
 
 ## Candidates, in rough order of expected value
 
