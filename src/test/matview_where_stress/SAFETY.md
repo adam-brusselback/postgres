@@ -312,6 +312,59 @@ is not a coverage failure. That is not a soundness proof; it is 42 shapes and
 2792 mutations without a counterexample. Coverage (§5) is outside what any
 `REFRESH`-time check can see, because the command is not told what changed.
 
+### Is that check cheap enough for a row-level trigger?
+
+Only if it never invokes the planner. Measured on a 100k-row matview, scope-1
+refresh, minimum of 5 runs of 300 single-row `UPDATE`s:
+
+| | µs/row |
+|---|---|
+| plain `UPDATE`, no refresh at all | 69.8 |
+| row trigger, **parameterised** predicate (plan cache hits) | 427.9 |
+| row trigger, **literal** predicate (plan cache misses every call) | 1372.5 |
+| statement trigger, batch of 100, array predicate | 89.8 |
+| **one extra planner pass** | **141.4** |
+
+The refresh itself, on a cache hit, is 427.9 − 69.8 = **358 µs**. The plan cache
+is saving 1372.5 − 427.9 = **945 µs** of parse and plan per call.
+
+So an extra planner pass is **141 µs against a 358 µs refresh — +39%, on every
+call**, and no cache can absorb it, because the planning *is* the check. That
+rules out the shape this document's own harness uses: `EXPLAIN` the query and
+walk the plan for residual quals. Correct for a test oracle, wrong for the
+server.
+
+Done the other way it is free, and the parts are already in hand:
+
+- **Conditions 1–3 are functions of (view definition, predicate text, argument
+  types)** — which is exactly the partial-refresh cache key. Compute them where
+  the plans are built, store the verdict in the same entry, and a cache hit
+  reads a `bool`. The relcache callback already drops entries when the view
+  definition changes, so the verdict cannot outlive its premises.
+- **No parsing is needed to get the view's `Query`.** `ExecRefreshMatView()`
+  already has it as `dataQuery` (`matview.c:603`), taken straight from
+  `matviewRel->rd_rules` in the relcache — the same place `get_view_query()`
+  reads. Conditions 1–3 are a walk over that target list plus a look at
+  `limitCount`/`groupingSets`/`windowClause`/`distinctClause`: proportional to
+  the size of the view definition, not to the data, with no catalog access.
+- **Condition 4 is cheap even uncached** — `pull_varattnos()` over the qual the
+  code already transformed, tested against the arbiter index's `indkey`. Worth
+  running unconditionally.
+
+On a cache miss the check is recomputed, but a miss is already spending 945 µs
+on parse and plan; a target-list walk does not register against that.
+
+One caveat worth keeping straight: condition 3 (determinism) is the only one
+needing functional-dependency reasoning, which does hit the catalog for unique
+indexes. It is also the only one that is a pure function of the view definition
+with no dependence on the predicate — so it wants caching **per matview**, not
+per (matview, predicate).
+
+And the number that frames all of this: a row-level trigger already costs
+**6.1×** the write it is attached to (427.9 vs 69.8), while statement-level
+batching costs **89.8 µs/row — 4.8× less than the row trigger**. Whatever the
+check costs, it is not what makes row-level triggers expensive.
+
 ### "Will *this* refresh, right now, converge?"
 
 **Yes — exactly, completely, and expensively.** Do the full refresh and diff,
