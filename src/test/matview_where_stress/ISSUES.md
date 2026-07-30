@@ -154,6 +154,51 @@ predicate, so rows the refresh *inserts* take their locks in `new_data` order
 and two concurrent refreshes inserting the same new keys could deadlock without
 it.
 
+### On B17: what a mutation test says about the gates
+
+Four mutations, each the kind of change a performance pass would plausibly
+make, against every gate in the tree:
+
+| mutation | regress | isolation | oracle | A5 stress | a3 gap |
+|---|---|---|---|---|---|
+| M1 · drop `ORDER BY` from the row-locking `SELECT` | pass | pass | pass | **pass** | pass |
+| M2 · drop `ORDER BY` from `new_data` | pass | pass | pass | pass | pass |
+| M3 · remove the row-locking `SELECT` entirely | pass | **FAIL** | pass | pass | pass |
+| M4 · `new_data` `NOT MATERIALIZED` | pass | pass | pass | pass | pass |
+
+Three of four are invisible. Reading across:
+
+- **`regress` cannot see any of it.** All 22 tests are single-session; none of
+  these mutations changes a single-session result.
+- **The safety oracle cannot either**, for the same reason — it is a
+  single-session differential harness by construction. It answers "is this
+  predicate safe", not "is this refresh correct under concurrency".
+- **`a3-split-gap.sh` did not catch M4**, which is the exact hazard it was
+  written for. It hand-writes the two-statement SQL against a plain table
+  rather than driving the real `REFRESH`, so it demonstrates the hazard without
+  testing the product.
+- **The A5 stress reproducer passed M1** — the mutation it exists to catch.
+  Cause: it issued the bare form, and the A8 swap moved the row-locking
+  `SELECT` to `CONCURRENTLY`. The test had been exercising a path that no
+  longer contains the code it tests. Fixed by adding `CONCURRENTLY`, and
+  verified as a detector rather than assumed: on the pristine tree it reports
+  "no deadlocks in 80 refreshes" and exits 0; under M1 it reports "1 of 80
+  refreshes aborted with a deadlock" and exits 1.
+
+M1's silence was the useful result. A test that passes both with and without
+the fix it was written for is worse than no test, because the tracker was
+counting it as the red assertion for A5.
+
+Still missing, and needed before any optimisation work:
+
+1. an isolation spec for the `new_data` snapshot hazard (M4) — the
+   `a3-split-gap.sh` scenario driven through the real `REFRESH` rather than
+   hand-written SQL;
+2. a gate for insert-order lock ordering (M2) — the locking `SELECT` only
+   covers rows that already exist, so rows the refresh *inserts* take their
+   locks in `new_data` order;
+3. `a3-split-gap.sh` promoted from a demonstration to a test.
+
 ---
 
 ## B. Not mentioned on the thread
@@ -173,6 +218,7 @@ it.
 | B11 | Index opened `AccessShareLock` at `matview.c:1063`, closed `NoLock` at `:1126`, with no comment saying the lock is meant to be held (unlike `:1466`) | none | Cosmetic | n/a |
 | B12 | `opt_refresh_where_clause` duplicates the existing `where_clause` production; its `ereport` has no `parser_errposition()` | none | Cosmetic | n/a |
 | B13 | `SetMatViewPopulatedState()`'s new early return also changes the full-rebuild path: it now skips the `pg_class` update *and* the `CommandCounterIncrement()` | none | Only two callers, both benign, but it should be called out rather than slipped in | n/a |
+| B17 | **The test suite does not protect a performance phase.** Four mutations of the kind an optimizer would plausibly write were injected; three passed every gate. Detail below | mutation matrix in `safety/` notes | **OPEN** — three concurrency gates are missing, and one existing test was pointing at code the A8 swap had moved | n/a |
 | B16 | **A refresh may cost ~12x more when each one commits.** 300 scope-1 refreshes in a single transaction measured 82.8 us each; the same 300 via pgbench, one transaction each with `synchronous_commit=off`, measured 970 us. Not yet isolated. The candidate worth checking first: a partial refresh writes to the matview, that write sends a relcache invalidation, the invalidation marks every plan-cache entry stale, and the *next* refresh's `matview_cache_sweep()` then discards them -- so a drain process committing per refresh would re-plan every single time while a trigger inside one transaction never does | `bench/` reproduces it | **OPEN, unconfirmed** — if it holds it affects every D2 drain pattern in USE-CASES.md, and it predates B14 (the old callback did HASH_REMOVE, which has the same effect) | n/a |
 | B15 | **The documentation does not mention blast radius.** A reader following `refresh_materialized_view.sgml` today will refresh a `rank() OVER (PARTITION BY ...)` matview by row key and silently corrupt it. Nor does it mention that a row leaving the predicate's scope is deleted, or that a non-deterministic view definition can diverge between partial and full refresh | `safety/` covers all three | **OPEN** — needs a decision, not just prose: warn, error, or document. `SAFETY.md` has the material and the measured cost of a static check | keep |
 | B14 | **Use-after-free in the plan cache.** `InvalidateMatViewCache()` freed plans and `HASH_REMOVE`d entries from inside a relcache callback, while `refresh_by_direct_modification()` held a pointer to one of those entries across the whole maintenance window | found by `safety/run.sh`; no deterministic test | **FIXED** — the callback now only marks; `matview_cache_sweep()` frees at the next refresh. See below | keep the sweep |

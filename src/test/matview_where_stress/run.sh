@@ -45,8 +45,8 @@ $PSQL -c "EXPLAIN (COSTS OFF) SELECT 1 FROM mvstress mv WHERE (id <= $HOT);" \
 
 i=0
 while [ "$i" -lt "$ITERATIONS" ]; do
-    echo "REFRESH MATERIALIZED VIEW mvstress WHERE id <= $HOT;" >> "$WORKDIR/a.sql"
-    echo "REFRESH MATERIALIZED VIEW mvstress WHERE tag = 'hot';" >> "$WORKDIR/b.sql"
+    echo "REFRESH MATERIALIZED VIEW CONCURRENTLY mvstress WHERE id <= $HOT;" >> "$WORKDIR/a.sql"
+    echo "REFRESH MATERIALIZED VIEW CONCURRENTLY mvstress WHERE tag = 'hot';" >> "$WORKDIR/b.sql"
     i=$((i + 1))
 done
 
