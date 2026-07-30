@@ -122,14 +122,62 @@ This turns "did I preserve semantics" from a judgement call into a test. It is
 the single thing that makes the rewrite tractable, and it should exist before
 the first line of Phase 2.
 
+### 1.1b What a correctness gate for P1 looks like, and where the limit is
+
+A test should prove the matview is right, not that a CTE exists to make it
+right. For P2 and P3 that is straightforward — the correctness statement is
+"overlapping refreshes do not deadlock and lock the same rows in the same
+order", and both are observable without knowing how ordering was achieved.
+
+P1 is harder, and the reason is worth stating plainly rather than working
+around: **a correct implementation has no window to exploit.** The failure it
+prevents — the upsert and the prune disagreeing about which rows the view
+produces — requires a base-table change to land *between* two evaluations. An
+implementation that evaluates once has no such moment, so no injection point can
+be placed there, so no deterministic test can distinguish a correct
+implementation from a differently-correct one. That is not a gap in the test
+suite; it is what the guarantee means.
+
+Two things can be done instead, and they are complementary:
+
+**(a) Assert it where it is constructed.** Whatever mechanism delivers P1, the
+code knows it is delivering it. An `Assert()` at that point, naming A3, survives
+any rewrite that keeps the guarantee and fires on one that drops it by accident.
+This replaces what the `pg_stat_statements` block was reaching for, without
+pinning the mechanism.
+
+**(b) Fuzz for the consequence.** A P1 violation is a *transient* inconsistency:
+the matview briefly holds a row matching no snapshot of the base. It is not
+permanent divergence — a later refresh repairs it — which is why a
+converge-at-the-end test cannot see it. What can see it is a reader looking
+during the window.
+
+The gate is therefore a concurrent correctness fuzzer: N sessions churning the
+base, M sessions refreshing overlapping scopes, and a reader asserting that
+every matview row in scope matches the view. Probabilistic, and honest about
+being so — it is the same trade `matview_where_stress/run.sh` already makes for
+lock ordering, and that one found real deadlocks. Build it in Phase 1, run it
+against the current implementation to establish it is quiet, and run it against
+each step of Phase 2.
+
+It is worth being explicit that (b) is weaker than the gates for P2 and P3.
+Absence of a failure over N runs is not proof. But it is a correctness gate —
+it fails when the matview is wrong, and only then — which is the property that
+matters, and it is strictly better than a gate that fails when the matview is
+right but built differently.
+
 ### 1.2 Move structural invariants from tests into the code
 
 The `pg_stat_statements` block asserts things that are genuinely load-bearing —
 one materialised `new_data`, upsert and prune fused, locking `SELECT` ordered —
 but it asserts them by pattern-matching SQL text, which is why it cannot
-survive. Those invariants belong as `Assert()`s at the point where the
-statements are constructed, each with a comment naming the fix it protects
-(A3, A5). Then the invariant survives the rewrite even though the test does not.
+survive, and why it would go red against a correct rewrite.
+
+The invariants themselves are worth keeping — as `Assert()`s at the point the
+guarantee is established, each naming the fix it protects (A3, A5). An assertion
+says "this implementation delivers P1"; the deleted test said "this
+implementation delivers P1 *by writing a CTE*". The first survives any
+mechanism; the second forbids all but one.
 
 ### 1.3 Write down the contract as one black-box file
 
