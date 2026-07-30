@@ -905,6 +905,65 @@ it is measurable, not a matter of taste.
 **3.5 Re-run the on-list benchmark.** The numbers Adam posted describe v1.
 Everything since has moved, in both directions.
 
+### Tier 1 and 2 sized, and one of them inverts a conclusion
+
+Measured with temporary `INSTR_TIME` timers around every phase of
+`refresh_by_direct_modification()` plus the transform and deparse above it
+(`-O2`, 300 scope-1 refreshes of `projection`, in-backend, instrumentation
+reverted afterwards).  `perf` is not installable on this kernel -- no matching
+`linux-tools` -- and was not needed: the unattributed residual is 1.4 µs of the
+spi path and 4.3 µs of the Query-tree path.
+
+Per refresh, µs:
+
+| phase | spi warm | spi cold | querytree warm | querytree cold |
+|---|---|---|---|---|
+| transform (parse-analyse the predicate) | 1.02 | 2.50 | 1.08 | 2.38 |
+| **deparse (`nodeToString` + `pg_get_expr`)** | **4.53** | 10.14 | **5.25** | 9.47 |
+| arbiter index scan | 0.08 | 0.02 | 0.00 | 0.02 |
+| cache sweep | 0.00 | 0.00 | 0.00 | 0.00 |
+| `SPI_prepare` of both statements | 5.95 | 112.85 | 0.79 | 58.29 |
+| build the source Query | — | — | 1.22 | 2.12 |
+| **rewrite + `pg_plan_query` the source** | — | — | **12.20** | 14.43 |
+| execute the source | — | — | 2.65 | 3.63 |
+| locking `SELECT` | 8.50 | 30.86 | 8.32 | 27.31 |
+| fused upsert/prune | 28.16 | 154.42 | 25.83 | 109.15 |
+| **whole refresh** | **49.7** | **314.8** | **61.6** | **233.4** |
+
+**The Query-tree path is 24% SLOWER than the text path on a warm cache**, and
+the whole deficit is one line: 12.20 µs re-planning a source query whose plan
+never changes, against 11.9 µs of measured gap.  Confirmed over three
+alternating pairs -- 60.1 µs spi against 78.4 µs querytree, steady state.
+
+That inverts what the p21b-O2 charts say, and both are true of what they
+measured.  The charts sweep a varying literal, which misses the plan cache on
+every call, and on that path the Query-tree implementation wins because it
+skips `pg_get_viewdef` and re-parsing the view text (233 against 315 µs).  On a
+stable predicate or a bound parameter -- what a trigger or a drain actually
+issues -- the text path wins, because it has one cached plan and the Query-tree
+path re-plans half its work every time.
+
+So 3.7 is not a nice-to-have.  It is the difference between the rewrite being a
+win in the common case and being a regression there.
+
+Verdicts:
+
+| | verdict | why |
+|---|---|---|
+| 3.2 parameterise `Const`s | **pursue, largest** | 6.3× on the spi path, 3.8× on the Query-tree path; turns every cold refresh warm |
+| 3.7 cache the source plan | **pursue, required** | 12.20 µs, 22% of a warm Query-tree refresh, and the entire reason it currently loses |
+| 3.8 stop deparsing for the key | **pursue** | 4.5-5.3 µs, 9% warm.  Second-order but real, and 2.3 removes the other reason it exists anyway |
+| 3.9 arbiter index scan | **drop** | 0.00-0.08 µs.  0.2% at the very most |
+| 3.10 cache sweep | **drop** | 0.00 µs.  Below the resolution of the timer, at one cache entry |
+
+Two things the sizing killed that were not on the list.  SPI execution overhead
+is ~2 µs per statement, not the ~20 µs an earlier noisy run suggested --
+`dmlexec` at 28.16 µs against the statement's own 26.0 µs from
+`pg_stat_statements` -- so bypassing SPI buys nothing by itself, and Phase 2.2
+has to be argued on the grounds it was always argued on.  And executing the
+source query costs 2.65 µs against 12.20 µs to plan it: planning the read side
+is 4.6× its execution at this scope.
+
 **3.6 The benchmark measures one predicate mode and does not say which.** See
 3.2. `run.sh` needs a `--predmode literal|param` axis and `bench_result` a
 column to record it, because the two differ by 8× and are both real. Nothing
