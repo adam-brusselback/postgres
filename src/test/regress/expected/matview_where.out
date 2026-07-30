@@ -530,11 +530,15 @@ DROP TABLE mv_drift2_base;
 -- is what makes the owner-privilege model tractable, so what should happen here
 -- depends on how the privilege question is settled.
 --
--- Disposition: keep the subquery half; REVISIT the search_path half.  If the
--- privilege fix moves predicate analysis to the caller's search_path, the
--- unqualified reference starts working and this becomes an assertion of the new
--- behaviour rather than a record of the old.  If the restricted path stays, it
--- should move into the documentation instead of being asserted here.
+-- Disposition: keep both halves.  B9 is settled: the restricted search path
+-- stays, because the predicate runs as the matview owner and a caller-supplied
+-- search_path plus owner-context execution is the CVE-2018-1058 shape.  So the
+-- schema-qualification requirement is real behaviour worth asserting, not a
+-- record of something about to change.  What is still owed is a better error --
+-- an errhint pointing at qualification rather than a bare "relation does not
+-- exist".  Note that a Query-tree implementation may make this moot by letting
+-- the predicate run as the invoker; if so, this becomes an assertion of the new
+-- behaviour.
 --
 CREATE TABLE mv_sp_base (id int primary key, v text);
 INSERT INTO mv_sp_base VALUES (1, 'one'), (2, 'two');
@@ -696,9 +700,17 @@ DROP TABLE mv_multi2_base;
 -- physical order is new_data's order.  Reading it back with ORDER BY ctid turns
 -- a concurrency property into a deterministic single-session assertion.
 --
--- Disposition: keep.  It is the only gate on new_data's ORDER BY -- the
--- isolation spec matview-where-lockorder covers the locking SELECT's ordering,
--- and neither covers the other.
+-- Disposition: REPLACE.  This is a proxy, and it is worth being honest about
+-- which.  The property is that two refreshes inserting the same new keys must
+-- not deadlock; what is asserted here is physical order, which reveals that
+-- property only while insertion order and lock order are the same thing.  An
+-- implementation that acquires the locks separately, in order, and then inserts
+-- in any order satisfies the property and fails this test.
+--
+-- The property-level replacement is two concurrent refreshes over overlapping
+-- new keys, asserting no deadlock -- the shape matview_where_stress/run.sh
+-- already uses for existing rows.  Keep this until that exists, as a cheap
+-- smoke test.  See src/test/matview_where_stress/PLAN.md.
 --
 CREATE TABLE mv_iord_base (id int primary key, tag text, v int);
 INSERT INTO mv_iord_base SELECT g, 'old', g FROM generate_series(1, 10) g;

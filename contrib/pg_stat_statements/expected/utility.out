@@ -784,9 +784,20 @@ SELECT calls, rows, query FROM pg_stat_statements
 --                           upsert and the prune disagreeing about which rows
 --                           exist
 --
--- Disposition: keep.  This is the only gate that pins the implementation's
--- shape, as opposed to its behaviour, and it is the one a restructuring for
--- performance has to answer to.
+-- Disposition: DELETE at the start of the Query-tree work, before it begins --
+-- not after.  This asserts the mechanism, not the guarantee.  It matches the
+-- literal text "new_data AS MATERIALIZED", so it would go red against a correct
+-- implementation that delivers the same single-evaluation guarantee some other
+-- way: one ModifyTable plan, a tuplestore read twice, anything not spelled that
+-- way.  A gate that fails when the work is done properly is worse than no gate.
+--
+-- What it is reaching for belongs as an Assert() where the guarantee is
+-- established, naming A3.  An assertion says "this delivers single evaluation";
+-- this test says "this delivers single evaluation BY WRITING A CTE".
+--
+-- Its only unique coverage is a mutation that removes MATERIALIZED, which is
+-- only interesting while the CTE is how the guarantee is delivered.  See
+-- src/test/matview_where_stress/PLAN.md.
 --
 SET pg_stat_statements.track = 'all';
 SELECT pg_stat_statements_reset() IS NOT NULL AS t;

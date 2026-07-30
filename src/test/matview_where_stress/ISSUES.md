@@ -261,11 +261,23 @@ become visible, so the implementation's shape can be asserted directly:
     upsert_and_prune_are_fused t      A3's single statement
     new_data_is_ordered        t      insert-order locking
 
-That is white-box, and deliberately so. Every one of those properties exists
-because a correctness fix depends on it, and each has a comment in the test
-saying which. M4 is the case that proves the gate earns its place: it is
-behaviourally benign — verified — so no behavioural test can catch it, yet it
-removes the guarantee A3 rests on. Only the structural assertion sees it.
+That is white-box, and **that turned out to be the defect, not the point.**
+
+The requirement is single evaluation, not a CTE. A test matching the literal
+text `new_data AS MATERIALIZED` goes red against any correct implementation that
+delivers the same guarantee another way — one `ModifyTable` plan, a tuplestore
+read twice — which makes it obstructive rather than merely fragile. A gate that
+fails when the work is done properly is worse than no gate.
+
+M4 is not evidence the gate earns its place; it is evidence the gate is watching
+the mechanism. M4 is behaviourally benign, so nothing behavioural can see it —
+but it is only *interesting* while the CTE is how the guarantee is delivered.
+The invariant belongs as an `Assert()` where the guarantee is established.
+
+`PLAN.md` schedules this block for deletion at the **start** of the Query-tree
+work, and restates the three guarantees as properties (P1 single evaluation, P2
+and P3 deterministic lock order) with a note on which gates are property-level.
+Only the `xmax` spec is.
 
 Two things went wrong on the way to these and are worth not repeating.
 
