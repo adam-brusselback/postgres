@@ -32,6 +32,10 @@
 #                                           scope-1 refresh.  Leave it off unless you
 #                                           are deliberately measuring commit cost.
 #   --time       10                         seconds per measurement
+#   --mintxn     30                         a measurement that saw fewer
+#                                           refreshes than this is re-run for
+#                                           longer, up to --maxtime
+#   --maxtime    45                         ceiling for that extension
 #   --repeat     3                          take the best of N
 #   --label      <text>                     names this run in bench_result
 #   --port/--db/--bindir
@@ -45,6 +49,7 @@ set -e
 WORKLOADS=; SCALES=100000; GROUPS=1000; SPANS=1,10,100
 FORMS=conc,bare; SHAPES=key; CLIENTS=1; OVERLAP=disjoint; MUTATE=off
 SYNC=off
+MINTXN=30; MAXTIME=45
 TIME=10; REPEAT=3; LABEL=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo run)
 PORT=5610; DB=postgres; BINDIR=/home/user/pgsql-opt/bin
 
@@ -56,6 +61,7 @@ while [ $# -gt 0 ]; do
     --clients)   CLIENTS=$2;   shift 2;;  --overlap) OVERLAP=$2; shift 2;;
     --mutate)    MUTATE=$2;    shift 2;;  --time)    TIME=$2;    shift 2;;
     --sync)      SYNC=$2;      shift 2;;
+    --mintxn)    MINTXN=$2;    shift 2;;  --maxtime) MAXTIME=$2; shift 2;;
     --repeat)    REPEAT=$2;    shift 2;;  --label)   LABEL=$2;   shift 2;;
     --port)      PORT=$2;      shift 2;;  --db)      DB=$2;      shift 2;;
     --bindir)    BINDIR=$2;    shift 2;;
@@ -122,8 +128,9 @@ for w in $(list "$WORKLOADS"); do
     [ "$shape" = key ] && [ "$span" != 1 ] && continue
     # a span wider than the key space silently clamps to "everything", which is
     # not the point being measured -- skip it and say so
-    if [ "$span" -gt "$KEYMAX" ] 2>/dev/null; then
-      echo "   skip $w span=$span (> $KEYMAX keys)"; continue; fi
+    if [ "$span" -ge "$KEYMAX" ] 2>/dev/null; then
+      echo "   skip $w $shape span=$span: covers all $KEYMAX keys, which is a"
+      echo "        full refresh wearing a predicate, not a partial one"; continue; fi
     # a literal array of thousands of elements is not a realistic predicate;
     # past 100 keys the range shape is what a caller would actually write
     [ "$shape" = array ] && [ "$span" -gt 100 ] 2>/dev/null && continue
@@ -136,6 +143,18 @@ for w in $(list "$WORKLOADS"); do
     [ "$shape" = initplan ] && ARRLIT="ARRAY(SELECT generate_series(:k, :k + $span - 1))"
     SCOPE=$($PSQL -Atc "SET search_path=bench,public;
        SELECT bench_scope_rows(\$\$$(echo "$PREDT" | sed "s/:arraylit/$ARRLIT/g" | sed "s/:k/1/g; s/:span/$span/g")\$\$)")
+    # Same thing from the other side: a key space wide enough to survive the
+    # guard above can still select nearly every row.  timerange span=100 chose
+    # 99% of its matview and was recorded as a partial refresh for a whole run.
+    if [ -n "$SCOPE" ] && [ "$SCOPE" -gt 0 ] 2>/dev/null &&
+       [ $((SCOPE * 100 / MVROWS)) -ge 90 ] 2>/dev/null; then
+      echo "   skip $w $shape span=$span: scope $SCOPE is "\
+           "$((SCOPE * 100 / MVROWS))% of the matview"; continue; fi
+    if [ -z "$SCOPE" ] || [ "$SCOPE" = 0 ] 2>/dev/null; then
+      echo "   WARNING $w $shape span=$span: the scope probe selected no rows,"
+      echo "        so this combination cannot be normalised.  Its key space"
+      echo "        does not contain key 1."; fi
+
     for form in $(list "$FORMS"); do
      # bare is match/merge.  conc, spi and querytree all select direct
      # modification; spi and querytree additionally pin which implementation of
@@ -162,29 +181,43 @@ for w in $(list "$WORKLOADS"); do
 
        settle                       # bloat from the previous combination is
                                     # not an input to this one
-       BEST_TPS=0; BEST_LAT=
+       BEST_TPS=0; BEST_LAT=; BEST_TXN=0
        i=0; while [ $i -lt "$REPEAT" ]; do
          i=$((i+1))
-         OUT=$($PGBENCH -n -f "$S" -c "$nc" -j "$(( nc < 4 ? nc : 4 ))" -T "$TIME" \
-                 -D keymax="$KEYMAX" -D nclients="$nc" 2>&1) || {
-                   echo "   pgbench failed for $w/$shape/$span/$form/$nc/$ov" >&2
-                   echo "$OUT" | tail -3 >&2; break; }
-         T=$(echo "$OUT" | sed -n 's/^tps = \([0-9.]*\).*/\1/p' | head -1)
-         L=$(echo "$OUT" | sed -n 's/^latency average = \([0-9.]*\).*/\1/p' | head -1)
+         t=$TIME
+         # A measurement is only as good as the number of refreshes it saw.
+         # At --time 5 the recursive workload got four, and four samples
+         # reported to two decimal places looks exactly like four thousand.
+         # Run it, and if it came up short, run it again for long enough.
+         while : ; do
+           OUT=$($PGBENCH -n -f "$S" -c "$nc" -j "$(( nc < 4 ? nc : 4 ))" -T "$t" \
+                   -D keymax="$KEYMAX" -D nclients="$nc" 2>&1) || {
+                     echo "   pgbench failed for $w/$shape/$span/$form/$nc/$ov" >&2
+                     echo "$OUT" | tail -3 >&2; break; }
+           T=$(echo "$OUT" | sed -n 's/^tps = \([0-9.]*\).*/\1/p' | head -1)
+           L=$(echo "$OUT" | sed -n 's/^latency average = \([0-9.]*\).*/\1/p' | head -1)
+           N=$(echo "$OUT" | sed -n 's/^number of transactions actually processed: \([0-9]*\).*/\1/p' | head -1)
+           [ -n "$N" ] || N=0
+           if [ "$N" -ge "$MINTXN" ] 2>/dev/null || [ "$t" -ge "$MAXTIME" ] 2>/dev/null; then
+             break; fi
+           t=$(( t * MINTXN / (N > 0 ? N : 1) + 1 ))
+           [ "$t" -gt "$MAXTIME" ] && t=$MAXTIME
+           echo "   extend $w $shape span=$span $form: $N txns in ${TIME}s, retrying at ${t}s"
+         done
          [ -n "$T" ] || continue
          if [ "$(echo "$T > $BEST_TPS" | bc -l 2>/dev/null || echo 1)" = 1 ]; then
-           BEST_TPS=$T; BEST_LAT=$L
+           BEST_TPS=$T; BEST_LAT=$L; BEST_TXN=$N
          fi
        done
        [ "$BEST_TPS" = 0 ] && continue
 
        $PSQL -c "INSERT INTO bench_result(run_label,pg_version,assertions,workload,isolates,
                    scale,groups,mv_rows,form,predshape,span,scope_rows,clients,overlap,mutate,sync,
-                   tps,latency_ms,full_ms,us_per_scope_row,vs_full_per_row)
+                   tps,latency_ms,txns,full_ms,us_per_scope_row,vs_full_per_row)
                  SELECT '$LABEL','$VER','$ASSERT','$w',\$\$$ISO\$\$,
                    $scale,$GROUPS,$MVROWS,'$form','$shape',$span,
                    NULLIF($SCOPE,0),$nc,'$ov',$([ "$MUTATE" = on ] && echo true || echo false),'$SYNC',
-                   $BEST_TPS, $BEST_LAT, $FULL,
+                   $BEST_TPS, $BEST_LAT, $BEST_TXN, $FULL,
                    round(($BEST_LAT * 1000.0) / NULLIF($SCOPE,0), 3),
                    round((($BEST_LAT * 1000.0) / NULLIF($SCOPE,0))
                          / NULLIF(($FULL * 1000.0) / NULLIF($MVROWS,0), 0), 2)" >/dev/null

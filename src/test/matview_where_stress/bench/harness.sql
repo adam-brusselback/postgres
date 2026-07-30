@@ -22,11 +22,15 @@ CREATE TABLE IF NOT EXISTS bench_result(
                            -- flush swamps a small refresh
   tps         numeric,
   latency_ms  numeric,
+  txns        int,         -- refreshes the measurement actually saw; a latency
+                           -- averaged over four of them is not a measurement
   full_ms     numeric,     -- full-refresh baseline for this (workload, scale)
   us_per_scope_row numeric,
   vs_full_per_row  numeric -- the normalised figure: how many times a full
                            -- rebuild's per-row cost this refresh costs
 );
+
+ALTER TABLE bench_result ADD COLUMN IF NOT EXISTS txns int;
 
 -- How each workload's base data is mutated, when --mutate is on.  Uses :k.
 DROP TABLE IF EXISTS bench_mutation;

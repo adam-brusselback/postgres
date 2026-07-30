@@ -111,7 +111,7 @@ INSERT INTO bench_workload VALUES
 
 (8,'recursive','predicate may not push into the recursive term at all',
  $$CREATE TABLE edge(child int, parent int, primary key(child,parent));
-   INSERT INTO edge SELECT g, g/2 FROM generate_series(2,:scale) g;
+   INSERT INTO edge SELECT g, g/2 FROM generate_series(1,:scale) g;
    CREATE INDEX ON edge(parent);$$,
  $$WITH RECURSIVE r AS (
       SELECT child, parent FROM edge
