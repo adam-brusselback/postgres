@@ -44,7 +44,7 @@ INSERT INTO bench_mutation VALUES
 -- Build one workload's schema at a given scale, and return the matview row count.
 CREATE OR REPLACE FUNCTION bench_setup(p_id text, p_scale bigint, p_groups int)
 RETURNS bigint LANGUAGE plpgsql AS $fn$
-DECLARE w bench_workload; n bigint; stmt text;
+DECLARE w bench_workload; n bigint; stmt text; analyze_stmt text;
 BEGIN
   SELECT * INTO w FROM public.bench_workload WHERE id = p_id;
   IF w IS NULL THEN RAISE EXCEPTION 'no such workload: %', p_id; END IF;
@@ -55,6 +55,27 @@ BEGIN
 
   stmt := replace(replace(w.setup, ':scale', p_scale::text), ':groups', p_groups::text);
   EXECUTE stmt;
+
+  -- Analyze what the setup just built, before anything is planned against it.
+  --
+  -- Without this the matview is created from a plan made against tables with no
+  -- statistics at all, and one workload does not merely plan badly, it fails to
+  -- start: 'recursive' asks for a 64 GiB dedup hash table and dies in
+  -- ExecInitNode with "out of memory ... request of size 68719476736".  It is
+  -- the estimate that is wrong, not the data -- the closure is 1.47M rows and
+  -- builds in a couple of seconds once the planner can see the table.
+  --
+  -- This only affects setup.  Measurements run after settle(), which vacuums
+  -- and analyzes everything, so numbers taken before this existed are still
+  -- comparable with numbers taken after.
+  FOR analyze_stmt IN
+    SELECT 'ANALYZE ' || quote_ident(n.nspname) || '.' || quote_ident(c.relname)
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'bench' AND c.relkind IN ('r', 'p')
+  LOOP
+    EXECUTE analyze_stmt;
+  END LOOP;
+
   EXECUTE 'CREATE MATERIALIZED VIEW bench.mv AS ' || w.viewsql;
   EXECUTE replace(w.idx, ' mv(', ' bench.mv(');
   EXECUTE 'ANALYZE bench.mv';
