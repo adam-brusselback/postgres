@@ -23,6 +23,21 @@
 -- maintenance flag raised -- are all easy to reintroduce.  They should stay in
 -- the tree after the fixes land.
 --
+-- One qualification, for Test 1 specifically.  It asserts the RULE -- a
+-- non-leakproof predicate requires ownership -- rather than the property the
+-- rule exists to deliver, which is that a predicate cannot read across a
+-- privilege boundary.  The rule is needed because SPI runs the whole statement
+-- under one userid, so the predicate necessarily runs as the owner.
+--
+-- If the Query-tree work lets the predicate be evaluated as the invoker, the
+-- leak stops being possible instead of being forbidden, and the right expected
+-- output for this test becomes "succeeds".  At that point the test does not
+-- merely stop applying, it INVERTS: it would report a strictly better
+-- implementation as a security regression.  Rewrite it then to assert that the
+-- leak cannot happen rather than that the rejection does -- do not simply
+-- regenerate the expected output, which would silently retire the check.
+-- See src/test/matview_where_stress/PLAN.md 1.4.
+--
 -- The last test deliberately leaves the session unable to protect any matview
 -- from direct DML, so nothing may be added after it.
 --

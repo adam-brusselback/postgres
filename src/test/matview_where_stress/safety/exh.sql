@@ -1,6 +1,12 @@
 DROP TABLE IF EXISTS probe_exh;
+-- ukey2 is optional and last, so the 8-value positional INSERTs below keep
+-- working unchanged.  It exists because B6 -- arbitrating on the wrong unique
+-- index -- cannot happen at all unless a case has two of them, and until this
+-- column existed no case could, which is why the 1.1c calibration recorded B6
+-- as MISSED for a reason no new case could fix.
 CREATE TABLE probe_exh(ord int, id text primary key, shape text, expect text,
-                       setup text, viewsql text, ukey text, mutspace text);
+                       setup text, viewsql text, ukey text, mutspace text,
+                       ukey2 text DEFAULT NULL);
 
 -- N = 12 base rows, 4 groups.  The mutation space below is EXHAUSTIVE over
 -- single-row changes drawn from a 5-value domain: every row x every new value,

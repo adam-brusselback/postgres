@@ -82,4 +82,62 @@ INSERT INTO probe_exh VALUES
      FROM generate_series(1,12) i, generate_series(0,3) nk
    UNION ALL SELECT format('DELETE FROM b WHERE id=%s',i),
                    format('k = %s OR k IS NULL',i%4)
+     FROM generate_series(1,12) i$$),
+
+-- Case 19 covers a NULLable key of one column.  This is the composite form,
+-- which is a different shape and not implied by it: the arbiter is (a, bcol)
+-- with only bcol NULLable, so ON CONFLICT has to arbitrate a partly-NULL key
+-- and the anti-join has to compare two columns, one of which can be NULL.
+-- Getting the single-column case right does not make this one right -- the
+-- comparison is per-column and the operator choice applies to all of them.
+('21','nullable_composite','composite unique key with a NULLable member','SAFE',
+ $$CREATE TABLE b(id int primary key, a int, bcol int, v int);
+   INSERT INTO b SELECT x, x%3,
+                        CASE WHEN x % 5 = 0 THEN NULL ELSE x%4 END, x*10
+     FROM generate_series(1,12) x;$$,
+ $$SELECT a, bcol, sum(v) AS total FROM b GROUP BY a, bcol$$, '(a, bcol)',
+ $$SELECT format('UPDATE b SET v=%s WHERE id=%s',v,i),
+          format('a = %s AND %s',i%3,
+                 CASE WHEN i%5 = 0 THEN 'bcol IS NULL'
+                      ELSE format('bcol = %s',i%4) END)
+     FROM generate_series(1,12) i, unnest(ARRAY[0,99]) v
+   UNION ALL SELECT format('DELETE FROM b WHERE id=%s',i),
+          format('a = %s AND %s',i%3,
+                 CASE WHEN i%5 = 0 THEN 'bcol IS NULL'
+                      ELSE format('bcol = %s',i%4) END)
+     FROM generate_series(1,12) i
+   UNION ALL SELECT format('UPDATE b SET bcol=NULL WHERE id=%s',i),
+          format('a = %s AND (bcol IS NULL OR bcol = %s)',i%3,i%4)
      FROM generate_series(1,12) i$$);
+
+-- Case 20 declares a second unique index, so it carries nine values where the
+-- cases above carry eight.  A multi-row VALUES list has to be uniform, so it
+-- gets its own statement rather than nine NULLs added to everything else.
+INSERT INTO probe_exh VALUES
+
+-- Two unique indexes, so the arbiter choice is decidable.  This is the shape
+-- B6 needs and the corpus could not express until probe_exh grew a ukey2.
+--
+-- (id) is created first and is the one the upsert should arbitrate on.  (code)
+-- is unique too, so choosing it instead is not a syntax error -- it is a
+-- silently different upsert.  The mutation space moves `code` while the
+-- predicate names `id`: with the right arbiter the row is updated in place,
+-- and with the wrong one the new code is absent from the matview, so ON
+-- CONFLICT finds nothing to arbitrate and INSERTs a second row with the same
+-- id.  That collides with the (id) index inside the same statement, because
+-- the prune's DELETE is not visible to the upsert's INSERT.
+--
+-- So B6 surfaces as errors rather than as divergence, which is exactly why the
+-- comparison vector in calibrate.sh has to carry `errs` as well as `diverged`.
+('20','two_ukeys','two unique indexes; the arbiter choice decides correctness','SAFE',
+ $$CREATE TABLE b(id int primary key, code int, v int);
+   INSERT INTO b SELECT x, 100+x, x*10 FROM generate_series(1,12) x;$$,
+ $$SELECT id, code, v FROM b$$, '(id)',
+ $$SELECT format('UPDATE b SET v=%s WHERE id=%s',v,i), format('id = %s',i)
+     FROM generate_series(1,12) i, unnest(ARRAY[0,99]) v
+   UNION ALL SELECT format('UPDATE b SET code=%s WHERE id=%s',200+i,i),
+                   format('id = %s',i)
+     FROM generate_series(1,12) i
+   UNION ALL SELECT format('DELETE FROM b WHERE id=%s',i), format('id = %s',i)
+     FROM generate_series(1,12) i$$,
+ '(code)');

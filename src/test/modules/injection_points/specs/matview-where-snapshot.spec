@@ -32,9 +32,23 @@
 # between the two statements is microseconds wide and nothing can be reliably
 # landed inside it.
 #
-# Disposition: keep.  It is the only gate on the two-statement structure of a
-# partial refresh, and any attempt to restructure that for performance should
-# have to answer to it.
+# Disposition: DELETE when the premise goes, and note that the premise is a
+# mechanism.  This spec needs a partial refresh to be two SPI statements with
+# an injection point between them; a rewrite that fuses the lock into a single
+# plan removes the place the injection point lives, and there is nothing left
+# to assert -- not because the guarantee weakened but because the seam closed.
+#
+# An earlier version of this note called it "the only gate on the two-statement
+# structure", which states the problem rather than a reason to keep it.  The
+# structure is not the promise.  The promise is P1: a base-table change landing
+# mid-refresh must not leave the matview holding rows that match no snapshot of
+# the base.  That is held behaviourally by fuzz.sh's serial mode, which detects
+# the two mutations that break it (M3 and M6) at 45 and 55 events per run --
+# see src/test/matview_where_stress/PLAN.md 1.1b and 1.4.
+#
+# So: keep while the two statements exist, because a cheap deterministic check
+# is worth having; delete it with them, and do not treat its removal as a loss
+# of coverage.
 
 setup
 {

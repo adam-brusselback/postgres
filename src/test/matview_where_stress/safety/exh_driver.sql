@@ -22,6 +22,14 @@ BEGIN
       EXECUTE c.setup;
       EXECUTE 'CREATE MATERIALIZED VIEW probe.mv AS ' || c.viewsql;
       EXECUTE 'CREATE UNIQUE INDEX mv_u ON probe.mv ' || c.ukey;
+      -- Created second, so it is second in RelationGetIndexList and the
+      -- arbiter choice between the two is observable: a matview cannot have a
+      -- PRIMARY KEY, so indisprimary is false for both and
+      -- matview_pick_arbiter_index falls through to "first usable".  B6
+      -- reverses that to last.
+      IF c.ukey2 IS NOT NULL THEN
+        EXECUTE 'CREATE UNIQUE INDEX mv_u2 ON probe.mv ' || c.ukey2;
+      END IF;
       EXECUTE m.mut;
       EXECUTE 'REFRESH MATERIALIZED VIEW ' || conc || 'probe.mv WHERE ' || m.pred;
       EXECUTE 'CREATE TABLE probe.after AS SELECT * FROM probe.mv';

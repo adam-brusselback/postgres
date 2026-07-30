@@ -198,6 +198,35 @@ This turns "did I preserve semantics" from a judgement call into a test. It is
 the single thing that makes the rewrite tractable, and it should exist before
 the first line of Phase 2.
 
+**Built and calibrated, against the pair that exists today.**
+`safety/diff_driver.sql` and `safety/rundiff.sh`. For each mutation it stands up
+two identical matviews over the same base, refreshes one each way, and diffs
+them — so "these two implementations disagree" is a single number with the
+offending mutation and predicate attached.
+
+The Query-tree path does not exist yet, so the two ways are the two that do:
+the bare form (match/merge) against `CONCURRENTLY` (direct modification). They
+are genuinely different implementations of one contract, and the contract file
+already states they must agree (Promise 7). When the new path lands, the two
+form strings become the two GUC settings and nothing else in the harness
+changes.
+
+Instantiating it now rather than on the first day of Phase 2 is the whole
+point. A harness written against an implementation that does not exist yet is a
+harness nobody has watched catch anything — the exact defect 1.1c exists to
+find, one level up. This one has been watched:
+
+    pristine   21 shapes, 1533 mutations, 0 divergence, 0 errors either side
+    under B4   nullable_key 76/96 and nullable_composite 12/48 disagree
+
+Worth noting what it stays quiet about, because it is not a weakness. The
+unsafe shapes — `drift_out`, `topn`, `win_rowkey` and the rest — show zero
+divergence here while diverging heavily in the oracle. Both forms are wrong in
+the same way on those, and that is exactly the distinction: the oracle asks "is
+this predicate safe", this asks "do the two implementations agree". A rewrite
+can be perfectly faithful and still be refreshing an unsafe shape, so both
+questions have to be asked separately.
+
 ### 1.1b What a correctness gate for P1 looks like, and where the limit is
 
 A test should prove the matview is right, not that a CTE exists to make it
@@ -280,9 +309,9 @@ be built from.
 
 | mutation | issue | observable in | verdict | how |
 |---|---|---|---|---|
-| A4 · drop `ON CONFLICT` | A4 | one session | **CAUGHT** 33s | `errs` 0→96, not `diverged` |
-| B4 · anti-join NULL handling | B4 | one session | **CAUGHT** 38s | `nullable_key/concurrently` 0→76 |
-| B6 · wrong unique index | B6 | one session | MISSED 40s | corpus cannot express it |
+| A4 · drop `ON CONFLICT` | A4 | one session | **CAUGHT** 46s | `errs` 0→96, not `diverged` |
+| B4 · anti-join NULL handling | B4 | one session | **CAUGHT** 56s | `nullable_key` 0→76, `nullable_composite` 0→12 |
+| B6 · wrong unique index | B6 | one session | **CAUGHT** 52s | `two_ukeys` `errs` 0→12 |
 | M1 · drop `ORDER BY`, locking `SELECT` | A5 | two sessions | MISSED 41s | structural |
 | M2 · drop `ORDER BY`, `new_data` | P3 | two sessions | MISSED 40s | structural |
 | M3 · remove the locking `SELECT` | A3 | two sessions | MISSED 42s | structural |
@@ -304,17 +333,37 @@ mispredicted and each was a gap of a different kind:
   MISSED to CAUGHT with no change to the detector. This is the generator gap
   1.1c predicts, and it is worth noting how it presented: as a clean run.
 
-- **B6 is missed for a reason a new case cannot fix.** `exh_driver.sql` creates
-  exactly one unique index per case, and B6 is a collision on a *non-arbiter*
-  index. Closing it means changing the driver's schema to carry an optional
-  second index, not adding another row. Left open deliberately — B6 is a
-  documented limitation rather than a live bug, so the cost is knowing the
-  fuzzer cannot stand in for `matview_where` Test 15.
+- **B6 needed a change to the driver, not another case.** `exh_driver.sql`
+  created exactly one unique index per case, and B6 is a collision on a
+  *non-arbiter* index — inexpressible, not merely unwritten. `probe_exh` now
+  carries an optional `ukey2`, and case 20 `two_ukeys` uses it. B6 moved from
+  MISSED to CAUGHT.
+
+  It surfaces as **errors, not divergence**, which is worth recording: with the
+  wrong arbiter the upsert finds nothing to conflict on, inserts a second row
+  with the same `id`, and collides with the other unique index inside the same
+  statement — because the prune's `DELETE` is not visible to the upsert's
+  `INSERT`. A vector that compared only `diverged` would have called this a
+  miss. That is the second bug the `errs` column has caught.
+
+  Note also what makes the arbiter choice decidable at all: a matview cannot
+  have a `PRIMARY KEY`, so `indisprimary` is false for every index on it and
+  `matview_pick_arbiter_index` falls through to "first usable". The mutation
+  reverses that to "last". Without two indexes there is no difference between
+  those two rules.
+
+- **A NULLable key needed both shapes.** Case 19 covers a single-column
+  NULLable key; case 21 `nullable_composite` covers a composite `(a, bcol)`
+  where only `bcol` is NULLable. The second is not implied by the first — the
+  operator choice applies to every column of the key, and getting one column
+  right says nothing about a key where only some columns can be NULL. Both
+  catch B4 (76 and 12 divergences).
 
 **Consequence for Phase 4.** "Delete the static tests the fuzzer covers"
-requires knowing which those are, and right now the fuzzer does not cover Test
-11 (B4) — it only does since case 19 — or Test 15 (B6) at all. Any deletion
-list has to be derived from a calibration run, not from reading the tests.
+requires knowing which those are. As of this run the fuzzer does cover Test 11
+(B4) and Test 15 (B6) — but it covered neither before cases 19–21 existed, and
+nothing about reading the tests would have revealed that. Any deletion list has
+to be derived from a calibration run.
 
 #### Measured, against the concurrent fuzzer
 
@@ -488,6 +537,54 @@ The oracle is single-session, so it cannot see locking or privilege behaviour at
 all. Those are covered today by four specs and three privilege tests, two of
 which are Tier 3. Before the rewrite, make sure the *behavioural* half of each
 has a Tier 1 home, so the coverage does not disappear with the spec.
+
+**Done — the audit, and it found exactly two things without a home.**
+
+Locking:
+
+| gate | property it holds | survives a rewrite? |
+|---|---|---|
+| `matview-where-serialize` | readers never block; overlapping refreshes serialize, disjoint ones do not | **yes** — observes blocking, names no mechanism |
+| `matview-where-lockorder` | P2, order over existing rows | **yes** — observes `xmax` |
+| `matview-where-insertorder` | P3, order over inserted rows | **yes** — observes `pg_blocking_pids()` |
+| `matview-where-deadlock` | characterisation of cross-statement deadlock | conditional; already marked REPLACE-or-DELETE |
+| `matview-where-snapshot` | *that a refresh is two SPI statements* | **no** |
+
+`matview-where-snapshot` is the gap. Its disposition claimed it was "the only
+gate on the two-statement structure of a partial refresh", which states the
+problem rather than a justification: the two-statement structure is a mechanism,
+and a rewrite that fuses the lock into one plan dissolves the premise while
+delivering the guarantee. Its behavioural content — a base-table change landing
+between the lock and the work must not corrupt the matview — is P1, and P1's
+gate is `fuzz.sh`'s `serial` mode, which catches M3 and M6 at 45 and 55 events.
+So it has a home; the spec is now marked for deletion when the premise goes,
+with the replacement named.
+
+Privilege:
+
+| test | property it holds | survives a rewrite? |
+|---|---|---|
+| Test 2 (B5) | the maintenance exemption is scoped to the matview being refreshed | **yes** |
+| Test 3 (A7) | an error during refresh restores the flag | **yes** |
+| Test 1 (A6) | *that a non-leakproof predicate requires ownership* | **no** |
+
+Test 1 is the other gap, and it is subtler than the snapshot spec because it
+does not merely stop applying — it **inverts**. The property is that a predicate
+cannot be used to read across a privilege boundary. Today that is delivered by
+refusing non-leakproof predicates from non-owners, because SPI runs the whole
+statement under one userid. A rewrite that evaluates the predicate as the
+invoker delivers the same property by making the leak impossible instead of
+forbidding the expression — at which point the correct expected output is
+"succeeds", and a test asserting "ERROR" fails against the better
+implementation.
+
+That is a win being recorded as a regression, which is the same failure mode as
+the `pg_stat_statements` block. Noted in the test itself: if Phase 2 changes who
+the predicate runs as, Test 1 is to be rewritten to assert that the leak cannot
+happen, not that the rejection does.
+
+Neither gap needs a new test today. Both need the disposition to say what
+happens when the premise moves, which is what was missing.
 
 ---
 

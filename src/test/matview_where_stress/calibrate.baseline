@@ -14,6 +14,8 @@ having|bare|0|0
 having|concurrently|0|0
 join_group|bare|0|0
 join_group|concurrently|0|0
+nullable_composite|bare|0|0
+nullable_composite|concurrently|0|0
 nullable_key|bare|0|0
 nullable_key|concurrently|0|0
 pred_on_key|bare|0|0
@@ -30,6 +32,8 @@ share_of_total|bare|35|0
 share_of_total|concurrently|35|0
 topn|bare|16|0
 topn|concurrently|16|0
+two_ukeys|bare|0|0
+two_ukeys|concurrently|0|0
 win_part|bare|0|0
 win_part|concurrently|0|0
 win_part_and|bare|20|0
