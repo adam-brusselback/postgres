@@ -13,6 +13,62 @@ directory. Where something is unknown it says so.
 
 ---
 
+# Operating model: fuzz while it moves, crystallise when it stops
+
+The fuzzer and the static suite are not alternatives. They are the two ends of a
+pipeline, and the direction matters:
+
+    fuzz -> find a divergence -> minimise it -> commit it as a static test
+
+Every case in the shipped suite should be a failure that **actually happened**,
+reduced to its smallest reproducing form. That is a better basis than the one
+used so far, which was: imagine a failure mode, write a test for it, and
+discover afterwards that half of them could not fail.
+
+Which instrument is in use depends on how much the implementation is moving:
+
+| stage | fuzzer mode | why |
+|---|---|---|
+| Phase 1 | oracle mode, against a full refresh | establish it is quiet on current code, so later noise means something |
+| Phase 2, implementation | **differential: old vs new** | the strongest signal available, and only available while both paths exist |
+| Phase 3, optimisation | oracle mode, continuous | the implementation is stable; what changes is how it performs |
+| after | **deleted** | it is a development instrument |
+
+What ships to -hackers is deterministic tests only. A probabilistic test in the
+regression suite is a flaky test, and reviewers are right to reject it. The
+static suite is not a downgrade from the fuzzer — it is the deliverable, and the
+fuzzer is the thing that writes it.
+
+## Two things this needs that a naive fuzzer does not have
+
+**A shrinker.** A raw failure is "these 400 interleaved operations produced a
+wrong matview", which is an anecdote, not a test. It has to reduce to the
+smallest reproducing case before it is worth anything. For the single-session
+oracle that is easy — it already enumerates one mutation at a time. For
+concurrency failures it means recording the operation log and replaying with
+operations removed, or with forced serialisation, until it stops failing; then
+building a deterministic isolation spec around whichever rows diverged. Without
+this the fuzzer generates work rather than tests.
+
+**An exit criterion.** "The fuzzer is quiet" has to be a number, decided before
+it is needed rather than when someone wants to move on: clean across the full
+shape matrix for K operations, at N concurrency levels, on both refresh forms.
+Otherwise the transition from Phase 2 to Phase 3 is a judgement call made by
+whoever is tired.
+
+## The differential window closes
+
+Differential mode — running the same mutation under both implementations and
+diffing — is the highest-value configuration in the whole plan, and it exists
+only while the old path is still reachable. Once the old implementation is
+deleted the fuzzer drops back to comparing against a full refresh, which is
+weaker: it can tell you the answer is wrong, but not that it *changed*.
+
+So the old path stays until the fuzzer's exit criterion is met, not until the
+new one looks finished.
+
+---
+
 # Phase 1 — Tests
 
 The goal is not more coverage. It is **coverage that survives a rewrite**, so the
