@@ -75,17 +75,35 @@ scope 1. Two candidates worth investigating, neither free of consequences:
   already orders by the same key. Whether the second ordering earns its 13% is
   an open question.
 
-Four measured traps, in descending severity:
+Four measured traps (`-O2`, 100k-row matview, scope 1–50):
 
 | trap | penalty | why |
 |---|---|---|
-| predicate column unindexed on **either** side | up to **324×** | predicate is applied to the matview *and* to the view query; both need an index |
-| predicate on an **aggregate output** (`WHERE total > x`) | **126×** | cannot push below `GroupAggregate`; O(base table) even matching 0 rows |
-| queue table in a subquery with **stale statistics** | **12×** | planner misestimates a high-churn queue and picks a hash join + seq scan |
+| predicate on an **aggregate output** (`WHERE total > x`) | **149×** | cannot push below `GroupAggregate`; O(base table) even matching 0 rows. **Also incorrect** — see below |
+| id set as a **subquery** rather than an array | **10.8×** | a semijoin does not push through the aggregation; 15.9 ms vs 1.5 ms |
+| predicate column unindexed on **either** side | **12×** | the predicate is applied to the matview *and* to the view query; both need an index |
 | **literal** predicate that varies per call | **4.2×** | plan cache is keyed on deparsed text; every distinct literal is a miss |
 
 All four are avoided by: index the predicate columns on both sides, predicate on
 grouping keys, and pass id sets as an **array parameter**.
+
+Two corrections to the first version of this table, both from re-measuring at
+`-O2` rather than on a debug build:
+
+- The unindexed-column penalty was quoted at **324×**. It does not reproduce:
+  12× on this shape. The penalty is real and it is the reason to index both
+  sides, but it is bounded by the cost of a full scan, not unbounded.
+- The 10.8× was attributed to **stale statistics on the queue table**. That is
+  wrong. Forcing `reltuples` to 1,000,000 on a 50-row queue moved the time by
+  5% (15.9 → 16.7 ms). The penalty is **non-pushability**, not staleness: a
+  subquery predicate cannot be pushed through `GROUP BY`, so it is paid whether
+  the statistics are fresh or not. `ANALYZE`ing your queue table will not save
+  you; passing an array will.
+
+And the first row is not only a performance trap. `WHERE total > x` **also
+produces a wrong matview** — 22 of 48 exhaustive mutations diverge, because a
+group crossing the threshold enters or leaves the predicate's scope. See
+`SAFETY.md`.
 
 ---
 
@@ -213,9 +231,10 @@ END $$;
 Three things this gets right, each of which is a measured trap otherwise:
 
 - **`array_agg` then `= ANY($1)`**, rather than
-  `WHERE invoice_id IN (SELECT key FROM mv_dirty)`. The subquery form is 12×
-  slower when the queue's statistics are stale — which for a queue table is the
-  normal state — and cannot push down at all through an aggregating view.
+  `WHERE invoice_id IN (SELECT key FROM mv_dirty)`. The subquery form measured
+  **10.8× slower** on an aggregating matview, because a semijoin cannot be
+  pushed through the aggregation. This is a property of the query shape, not of
+  the queue's statistics — `ANALYZE`ing the queue does not help.
 - **Claim-and-delete in the same statement** as the refresh's transaction, so a
   rollback puts the keys back. Deleting after the refresh commits loses work on
   crash; deleting before risks dropping keys on rollback.
@@ -392,7 +411,7 @@ Scope one tenant, 0.01%–10% of the matview · matview 1M–100M rows
 REFRESH MATERIALIZED VIEW CONCURRENTLY tenant_summary WHERE tenant_id = $1;
 ```
 Non-key predicate: **needs an index on `tenant_id` on the matview and on every
-base table**, or you pay the 324×. Tenants are naturally disjoint, so this is
+base table**, or you pay the 12×. Tenants are naturally disjoint, so this is
 the case where the upsert form's parallelism earns the most — many tenants
 refreshing at once never collide.
 
@@ -661,9 +680,12 @@ day"; only a rebuild handles the date roll.
 
 ## Selection rule
 
+0. Does the predicate cover every row whose **output** changes, not just whose
+   input changes? If not, nothing below matters — the matview will be wrong.
 1. Is the predicate on a **grouping key**, indexed on **both** the matview and
-   the base tables? If not, fix that first — nothing else matters by comparison.
-2. Rows selected **> ~10% of the matview** → full rebuild.
+   the base tables? If not, fix that first — nothing else matters for speed.
+2. Rows selected **> ~11%** of the matview → full rebuild rather than
+   `CONCURRENTLY`; **> ~27%** → full rebuild rather than the bare form.
 3. Rows selected **> ~500** → bare form.
 4. Otherwise → `CONCURRENTLY`, driven by a statement-level trigger (sync) or a
    queue and drainer (async), always passing keys as an **array parameter**.

@@ -3,47 +3,81 @@ Branch-local material for REFRESH MATERIALIZED VIEW ... WHERE ...
 
 This directory is NOT part of any test schedule and is not wired into either
 build system.  Delete it before posting the patch to -hackers.  It holds the
-two things that do not belong in the patch itself:
+things that do not belong in the patch itself:
 
-  ISSUES.md  Open review items, split into those raised on the -hackers thread
-             and those found separately, each mapped to the test that covers it.
+  ISSUES.md     Review items, split into those raised on the -hackers thread
+                (A1-A9) and those found separately (B1-B15), each mapped to the
+                test that covers it.  Start here.
 
-  run.sh     The stress reproducer described below.
+  SAFETY.md     Which predicates are safe, established by differential testing
+                rather than by argument.  Five independent failure modes, what
+                the planner's own push-down analysis already decides, what is
+                provable and what is not, and what a static check would cost.
 
-The reproducer exists because one of the failure modes of the non-concurrent
-partial refresh cannot be expressed deterministically as an isolation spec.
+  USE-CASES.md  53 use cases across 17 domains, each placed against a measured
+                cost model, with the driver pattern and refresh form that suits
+                it.  Intended to feed the documentation and the design
+                discussion.
 
-The row-locking step of refresh_by_direct_modification() is
+  safety/       The differential safety oracle.  See below.
 
-    SELECT 1 FROM <matview> mv WHERE (<predicate>) FOR UPDATE
+  run.sh        The lock-ordering stress reproducer.  See below.
 
-with no ORDER BY, so a single refresh statement locks rows in whatever order its
-plan happens to produce.  Two concurrent refreshes whose predicates select
-overlapping rows but produce different plans will therefore lock those rows in
-different orders and deadlock.  Reproducing that requires both statements to be
-simultaneously mid-scan, which isolationtester cannot arrange -- it drives one
-step at a time.
+All timings in these files come from a -O2 build with assertions off unless they
+say otherwise.  An earlier revision quoted debug-build numbers under the caveat
+"treat ratios as transferable"; that caveat did not hold, and several ratios
+moved materially when re-measured.  Do not add a timing here without recording
+which build produced it.
 
-src/test/isolation/specs/matview-where-deadlock.spec covers the deterministic,
-cross-statement variant of the same flaw.  Note that adding ORDER BY to the
-locking SELECT fixes the variant reproduced here but not the one in that spec:
-ordering within one statement says nothing about the order of separate
-statements.
 
-Usage
------
+safety/ -- the differential oracle
+----------------------------------
+
+    safety/run.sh [PGPORT] [PGDATABASE]        # PSQL_BIN=... to choose a psql
+
+For each (view shape, predicate, mutation): build the matview, mutate the base
+data, partial refresh, snapshot, full refresh, symmetric difference.  A
+non-empty difference is a counterexample -- proof that the predicate is unsafe
+for that view.  An empty one is evidence, not proof.
+
+Two harnesses share the oracle.  The single-shot one covers 42 (view, predicate,
+mutation) triples and also records what the planner did with the predicate.  The
+exhaustive one takes 18 (view, predicate) pairs and runs each against its
+complete single-row mutation space over a 12-row base table -- about 2800
+refresh cycles.  Both refresh forms are run for every case, and they have agreed
+on every shape so far.
+
+It found the use-after-free that is now B14 before it answered any question
+about predicates.
+
+
+run.sh -- the lock-ordering reproducer
+--------------------------------------
 
     ./run.sh [PGPORT] [PGHOST] [PGDATABASE]
 
 Defaults: port 5432, host /tmp, database postgres.  Requires psql on PATH.
 
+This reproduces A5's non-deterministic variant, which cannot be expressed as an
+isolation spec.  The row-locking step of refresh_by_direct_modification() locks
+the rows its predicate selects; with no ORDER BY it locks them in whatever order
+the plan produces, so two concurrent refreshes with different plans over
+overlapping rows deadlock.  Driving that needs both statements simultaneously
+mid-scan, which isolationtester cannot arrange -- it steps one session at a
+time.
+
 The script builds a matview whose physical row order is the reverse of its key
-order, then runs two sessions in parallel:
+order, then runs two sessions in parallel: one whose predicate the planner
+satisfies with an index scan (ascending key order), and one whose predicate
+forces a sequential scan (descending key order).  It exits non-zero and prints a
+count if any deadlock is detected.
 
-  - one refreshing with a predicate the planner satisfies with an index scan,
-    which locks in ascending key order;
-  - one refreshing with a predicate that forces a sequential scan, which locks
-    in physical order, i.e. descending key order.
+A5 is now FIXED -- the locking SELECT and the CTE both ORDER BY the arbiter key
+-- so this script should exit zero on the current tree.  It is kept as a
+regression guard for the life of this branch.  On the tree as originally posted,
+roughly half the refreshes aborted.
 
-It exits non-zero and prints a count if any deadlock is detected.  On an
-unfixed tree roughly half the refreshes abort.
+The ORDER BY fixes only this variant.  For the cross-statement variant, in
+src/test/isolation/specs/matview-where-deadlock.spec, it does not help:
+ordering within one statement says nothing about the order of separate
+statements.

@@ -9,8 +9,9 @@ been mentioned there. Each row names the test that covers it, so a fix shows up
 as that test turning green.
 
 **All of these are now fixed unless marked otherwise, and the whole suite is
-green** (regress, isolation 133/133, pg_stat_statements 16/16). The State column
-records what happened.
+green** — regress 248/248, isolation 133/133, pg_stat_statements 16/16, verified
+on both a `-O0 --enable-cassert` and a `-O2` build. The State column records what
+happened.
 
 The **Disposition** column says whether a test is worth leaving in the tree once
 its issue is fixed, or is scaffolding to remove then. The reasoning for each is
@@ -37,7 +38,7 @@ in a `Disposition:` comment on the test itself. Greps that find everything:
 | A6 | Predicate functions run with the owner's privileges, not the caller's | Zsolt Parragi | `matview_where_privs` Test 1 | **FIXED** — a non-leakproof predicate now requires ownership | keep |
 | A7 | An error during refresh removes the matview modification restrictions | Zsolt Parragi | `matview_where_privs` Test 3 | **FIXED** — PG_TRY restores the flag | keep |
 | A8 | `CONCURRENTLY` semantics are inverted for `WHERE`: the bare form is the more permissive one | Vellaipandiyan | `matview_where` Test 14 | **DONE** — CONCURRENTLY selects direct modification, the bare form match/merge | **DELETE once the swap lands** — it asserts a lock level, not a behaviour, so it will break on unrelated locking changes. What should survive is the documented statement of which form blocks writers |
-| A9 | Document the intended safety model and the guarantees for overlapping refreshes | Dharin Shah, Vellaipandiyan | `matview-where-serialize.spec` covers the executable part | **partial** — the three lock claims are pinned; the prose Adam wrote on-list has not landed in `refresh_materialized_view.sgml`, and the paragraph that is there claims `ROW EXCLUSIVE` "blocks other modification commands", which is wrong | keep the spec |
+| A9 | Document the intended safety model and the guarantees for overlapping refreshes | Dharin Shah, Vellaipandiyan | `matview-where-serialize.spec` covers the executable part | **FIXED for what it asked** — `refresh_materialized_view.sgml` now describes both forms, their lock levels and their deadlock behaviour; the false `ROW EXCLUSIVE` "blocks other modification commands" claim is gone. But see B15: the docs still say nothing about the hazard that matters most | keep the spec |
 
 ### On A5 and the two lock-ordering variants
 
@@ -109,9 +110,10 @@ pg_stat_statements 16/16 are green.
 | B6 | With more than one unique index, `direct_mod` can collide on a non-arbiter index and reject a row set that both the full and the concurrent refresh accept | `matview_where` Test 15 | **DOCUMENTED LIMITATION** — direct modification cannot; the bare form can | keep |
 | B7 | Cache entries are never invalidated or freed — no relcache callback, no `HASH_REMOVE`. Leaks saved plans for dropped matviews, and underlies B1–B3 | none | **FIXED** by the relcache callback | n/a |
 | B8 | Rowcount handed to `SetQueryCompletion()` is `SPI_processed` after the fused CTE, whose top statement is the `DELETE` — so `pg_stat_statements` sees deletions only | `contrib/pg_stat_statements` `utility` | **FIXED** — both forms report rows written; they differ because match/merge applies a change as delete+insert | keep |
-| B9 | The predicate is analyzed under `RestrictSearchPath()`, so callers must schema-qualify everything | `matview_where` Test 13 (first half) | Green, characterisation only. What is correct here depends on how A6 is settled | revisit with A6 — becomes an assertion of new behaviour if the path opens up, or moves to the docs if it stays restricted |
+| B9 | The predicate is analyzed under `RestrictSearchPath()`, so callers must schema-qualify everything | `matview_where` Test 13 (first half); `safety/cases2.sql` case `dim_change_fixed` | **OPEN, and upgraded from cosmetic.** The safety work showed that the *correct* predicate for a change to a joined dimension table is `id IN (SELECT id FROM f WHERE did = $1)` — a sub-select over a base table. Unqualified, that fails with `ERROR: relation "f" does not exist`. The feature's own correctness story depends on a predicate form the restriction makes awkward | revisit with A6 — becomes an assertion of new behaviour if the path opens up, or moves to the docs if it stays restricted |
 | B10 | The volatility check is a weaker guarantee than the patch claims — a STABLE wrapper around a VOLATILE body passes, which is how both A6 and B5 work | covered indirectly by A6 / B5 | Worth a doc note either way | n/a |
 | B11 | Index opened `AccessShareLock` at `matview.c:1063`, closed `NoLock` at `:1126`, with no comment saying the lock is meant to be held (unlike `:1466`) | none | Cosmetic | n/a |
 | B12 | `opt_refresh_where_clause` duplicates the existing `where_clause` production; its `ereport` has no `parser_errposition()` | none | Cosmetic | n/a |
 | B13 | `SetMatViewPopulatedState()`'s new early return also changes the full-rebuild path: it now skips the `pg_class` update *and* the `CommandCounterIncrement()` | none | Only two callers, both benign, but it should be called out rather than slipped in | n/a |
+| B15 | **The documentation does not mention blast radius.** A reader following `refresh_materialized_view.sgml` today will refresh a `rank() OVER (PARTITION BY ...)` matview by row key and silently corrupt it. Nor does it mention that a row leaving the predicate's scope is deleted, or that a non-deterministic view definition can diverge between partial and full refresh | `safety/` covers all three | **OPEN** — needs a decision, not just prose: warn, error, or document. `SAFETY.md` has the material and the measured cost of a static check | keep |
 | B14 | **Use-after-free in the plan cache.** `InvalidateMatViewCache()` freed plans and `HASH_REMOVE`d entries from inside a relcache callback, while `refresh_by_direct_modification()` held a pointer to one of those entries across the whole maintenance window | found by `safety/run.sh`; no deterministic test | **FIXED** — the callback now only marks; `matview_cache_sweep()` frees at the next refresh. See below | keep the sweep |
