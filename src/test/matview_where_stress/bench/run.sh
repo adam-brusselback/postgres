@@ -14,7 +14,13 @@
 #   --scales     100000,1000000             base table rows
 #   --groups     1000                       distinct key values
 #   --spans      1,10,100                   keys per refresh
-#   --forms      conc,bare                  conc | bare | full
+#   --forms      conc,bare                  conc | bare | spi | querytree
+#                                           spi and querytree are both direct
+#                                           modification, with the Query-tree
+#                                           implementation off and on.  Measure
+#                                           them against each other on ONE
+#                                           binary: that is the whole comparison,
+#                                           and it removes build variance from it.
 #   --shapes     key,array,range            predicate shape
 #   --clients    1,4,16                     concurrent sessions
 #   --overlap    disjoint,hot               disjoint scopes, or all fighting
@@ -131,12 +137,17 @@ for w in $(list "$WORKLOADS"); do
     SCOPE=$($PSQL -Atc "SET search_path=bench,public;
        SELECT bench_scope_rows(\$\$$(echo "$PREDT" | sed "s/:arraylit/$ARRLIT/g" | sed "s/:k/1/g; s/:span/$span/g")\$\$)")
     for form in $(list "$FORMS"); do
-     CONC=$([ "$form" = conc ] && echo 'CONCURRENTLY ' || echo '')
+     # bare is match/merge.  conc, spi and querytree all select direct
+     # modification; spi and querytree additionally pin which implementation of
+     # it runs, so the two can be measured against each other on one binary.
+     CONC=$([ "$form" = bare ] && echo '' || echo 'CONCURRENTLY ')
+     QT=$(case "$form" in querytree) echo on;; spi) echo off;; *) echo '';; esac)
      for nc in $(list "$CLIENTS"); do
       for ov in $(list "$OVERLAP"); do
        S="$TMP/s.bench"
        {
          echo "SET synchronous_commit = $SYNC;"
+         [ -n "$QT" ] && echo "SET matview_partial_refresh_querytree = $QT;"
          if [ "$ov" = disjoint ]; then
            echo "\\set slice greatest(1, :keymax / :nclients)"
            echo "\\set k (:client_id * :slice) + random(1, greatest(1, :slice - :span))"

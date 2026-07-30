@@ -76,7 +76,7 @@ test: brin gin gist spgist privileges init_privs security_label collate matview 
 # pg_regress gives one connection per test file, so listing them here is
 # sufficient; they may still run concurrently with each other.
 # ----------
-test: matview_where matview_where_cache matview_where_privs matview_where_contract
+test: matview_where matview_where_cache matview_where_privs matview_where_contract matview_where_inject
 
 # ----------
 # Additional BRIN tests
