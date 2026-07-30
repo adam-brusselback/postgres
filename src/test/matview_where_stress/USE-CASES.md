@@ -5,29 +5,75 @@ Branch-local. Not part of the patch; delete this directory before posting to
 
 Scope figures ("rows selected") and matview sizes are typical field values, not
 measurements — they are here to place each case against the measured cost
-regimes below. Timings **are** measured, on a debug build (`-O0
---enable-cassert`); treat ratios as transferable and absolute ms as not.
+regimes below.
+
+> **Build note.** Everything in the first version of this file was measured on a
+> `-O0 --enable-cassert` build, with the caveat "treat ratios as transferable."
+> That caveat was wrong. Re-measured on `-O2` with assertions off, absolute
+> costs fall by 5–30× and **some ratios move materially** — the statement- vs
+> row-trigger advantage went from 4.8× to 2.0×, and the bare form's break-even
+> against a full rebuild from ~10% to ~27%. The table below is the `-O2` one.
+> Assume any timing in this tree that does not say `-O2` is inflated.
 
 ---
 
 ## The cost model everything below is placed against
 
-Measured on a 100k-row matview, minimum of 3 runs:
+Measured on a 100k-row matview, `-O2`, assertions off, minimum of 5 runs:
 
-| path | fixed cost | marginal cost | notes |
+| path | fixed cost | marginal cost | break-even vs rebuild |
 |---|---|---|---|
-| upsert + prune (`CONCURRENTLY`) | ~1.0 ms | ~0.088 ms/row | parallel across disjoint rows |
-| delete + insert (proposed bare form) | ~0.9 ms | ~0.022 ms/row | serialized on ExclusiveLock |
-| diff/merge (bare form today) | ~9–12 ms | ~0.026 ms/row | temp tables + ANALYZE + diff |
-| full rebuild | — | ~3.5 µs/row | scale-invariant baseline |
+| upsert + prune (`CONCURRENTLY`) | **0.035 ms** | **~11.6 µs/row** | ~11% of the matview |
+| diff/merge (bare form today) | **~2.0 ms** | **~4.7 µs/row** | ~27% of the matview |
+| full rebuild | — | **1.343 µs/row** | — |
+
+Measured points (ms), so the shape is visible rather than inferred:
+
+| scope | 1 | 10 | 100 | 1000 | 10000 | 50000 |
+|---|---|---|---|---|---|---|
+| `CONCURRENTLY` | 0.035 | 0.085 | 0.650 | 9.77 | 114.2 | 722.2 |
+| bare | 2.007 | 2.149 | 2.657 | 7.59 | 48.1 | 246.8 |
+
+Full refresh of the same matview: **134.3 ms**.
 
 Derived rules:
 
-- **A partial refresh costs roughly what rebuilding `scope × 11` rows would.**
-  So it pays while scope is below ~1/11 of the matview; above ~10%, rebuild.
-- Cost depends on **rows selected**, not matview size — verified across 10k,
-  100k and 1M (35.4 / 34.3 / 35.5 ms at scope 1000).
-- Crossover between the two partial forms is ~500 rows.
+- Both forms are **linear** in scope — 10.1 / 11.6 / 15.2 µs/row for
+  `CONCURRENTLY` across the three decades, 5.5 / 4.5 / 5.0 for bare. The
+  quadratic behaviour of the v2 patch is gone.
+- **`CONCURRENTLY` costs ~8× what rebuilding the same rows would**, so it pays
+  below ~11% of the matview. **The bare form costs ~3.5×**, so it pays to ~27%.
+  The single "10% then rebuild" rule was wrong: it is right for the upsert form
+  and far too conservative for the bare one.
+- Cost depends on **rows selected**, not matview size.
+- **Crossover between the two forms is between 100 and 1000 rows** — at 100 the
+  upsert form wins 0.65 vs 2.66 ms, at 1000 the bare form wins 7.59 vs 9.77.
+  The ~500 estimate holds.
+
+### Where a scope-1 refresh actually goes
+
+41.5 µs, decomposed (call overhead of 1.1 µs already subtracted):
+
+| component | µs | share |
+|---|---|---|
+| the upsert — the work that was asked for | 11.1 | 27% |
+| the prune (anti-join delete) | 9.6 | 23% |
+| separate `SELECT ... FOR UPDATE` statement | 7.1 | 17% |
+| `ORDER BY` inside `new_data` — sorting one row | 5.3 | 13% |
+| CTE fusion penalty vs two plain statements | 4.4 | 11% |
+| `count(*)` wrapper that produces the rowcount | 1.6 | 4% |
+| refresh scaffolding (opens, arbiter pick, SPI) | 2.4 | 6% |
+
+**Roughly a quarter of a scope-1 partial refresh does the thing the user asked
+for.** The rest is machinery that earns its cost at large scope and does not at
+scope 1. Two candidates worth investigating, neither free of consequences:
+
+- upsert and prune as **two plain statements** cost 20.7 µs against the fused
+  CTE's 32.0 — 1.5× cheaper. But the fusion is what closed A3's consistency gap,
+  so this needs checking against that before it is a win.
+- the `ORDER BY` is there for A5 deadlock avoidance, and the locking `SELECT`
+  already orders by the same key. Whether the second ordering earns its 13% is
+  an open question.
 
 Four measured traps, in descending severity:
 

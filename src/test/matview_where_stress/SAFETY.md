@@ -315,24 +315,32 @@ is not a coverage failure. That is not a soundness proof; it is 42 shapes and
 ### Is that check cheap enough for a row-level trigger?
 
 Only if it never invokes the planner. Measured on a 100k-row matview, scope-1
-refresh, minimum of 5 runs of 300 single-row `UPDATE`s:
+refresh, `-O2` with assertions off, minimum of 5 runs of 500 single-row
+`UPDATE`s:
 
 | | µs/row |
 |---|---|
-| plain `UPDATE`, no refresh at all | 69.8 |
-| row trigger, **parameterised** predicate (plan cache hits) | 427.9 |
-| row trigger, **literal** predicate (plan cache misses every call) | 1372.5 |
-| statement trigger, batch of 100, array predicate | 89.8 |
-| **one extra planner pass** | **141.4** |
+| plain `UPDATE`, no refresh at all | 13.2 |
+| row trigger, **parameterised** predicate (plan cache hits) | 61.9 |
+| row trigger, **literal** predicate (plan cache misses every call) | 260.0 |
+| statement trigger, batch of 100, array predicate | 31.1 |
+| **one extra planner pass** | **20.0** |
 
-The refresh itself, on a cache hit, is 427.9 − 69.8 = **358 µs**. The plan cache
-is saving 1372.5 − 427.9 = **945 µs** of parse and plan per call.
+The refresh itself, on a cache hit, is 61.9 − 13.2 = **48.7 µs**. The plan cache
+is saving 260.0 − 61.9 = **198 µs** of parse and plan per call, a 4.2× penalty
+for getting it wrong.
 
-So an extra planner pass is **141 µs against a 358 µs refresh — +39%, on every
+So an extra planner pass is **20 µs against a 48.7 µs refresh — +41%, on every
 call**, and no cache can absorb it, because the planning *is* the check. That
 rules out the shape this document's own harness uses: `EXPLAIN` the query and
 walk the plan for residual quals. Correct for a test oracle, wrong for the
 server.
+
+> These numbers replace a first set taken on a `-O0 --enable-cassert` build,
+> which overstated every absolute by ~5×. The conclusion is unchanged — the
+> planner-pass share was 39% there and 41% here — but two neighbouring ratios
+> did move: the plan-cache-miss penalty went from 3.2× to 4.2×, and the
+> statement-trigger advantage over a row trigger fell from 4.8× to 2.0×.
 
 Done the other way it is free, and the parts are already in hand:
 
@@ -361,9 +369,15 @@ with no dependence on the predicate — so it wants caching **per matview**, not
 per (matview, predicate).
 
 And the number that frames all of this: a row-level trigger already costs
-**6.1×** the write it is attached to (427.9 vs 69.8), while statement-level
-batching costs **89.8 µs/row — 4.8× less than the row trigger**. Whatever the
+**4.7×** the write it is attached to (61.9 vs 13.2), while statement-level
+batching costs **31.1 µs/row — 2.0× less than the row trigger**. Whatever the
 check costs, it is not what makes row-level triggers expensive.
+
+Where the row trigger's 48.7 µs of refresh goes is broken down in
+`USE-CASES.md`: about a quarter is the upsert the user asked for, and the rest
+is a prune, a separate locking statement, an `ORDER BY` over one row, a CTE
+fusion penalty and a rowcount wrapper. That is the place to look for the 2×, not
+at the safety check.
 
 ### "Will *this* refresh, right now, converge?"
 
