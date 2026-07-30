@@ -576,18 +576,25 @@ DROP TABLE mv_sp_base;
 -- opposite to the expectation established by normal REFRESH MATERIALIZED VIEW
 -- semantics."  Adam Brusselback agreed to swap the two paths, so that
 -- CONCURRENTLY selects the direct-modification path and the bare form selects
--- match/merge.  That swap is not in the tree.
+-- match/merge.  That swap has since landed, so this test now records the agreed
+-- behaviour rather than pinning a direction not yet taken.
 --
 -- What decides whether writers are blocked is the lock ExecRefreshMatView()
 -- takes on the matview: match/merge takes ExclusiveLock, direct modification
 -- takes only RowExclusiveLock.  Reading it back inside the refreshing
 -- transaction is enough to tell which path ran.
 --
--- Disposition: DELETE once the swap lands.  This asserts a lock level rather
--- than a behaviour, which is exactly the kind of test that breaks on unrelated
--- locking changes.  It is here to pin the agreed direction until it is
--- implemented, not to live in the tree afterwards.  What should survive is the
--- documented statement of which form blocks writers.
+-- Disposition: REPLACE.  The swap has landed, so the condition this test was
+-- waiting on has fired -- and it asserts a lock level, which is the mechanism,
+-- not "does a concurrent writer block", which is the guarantee.  An
+-- implementation that blocks writers by some other means satisfies the
+-- guarantee and fails this test, the same defect as Test 16 and the
+-- pg_stat_statements block.
+--
+-- The behavioural replacement belongs in the isolation suite next to
+-- matview-where-serialize, which already pins "readers never block"; what is
+-- missing is "the bare form blocks a concurrent writer and CONCURRENTLY does
+-- not".  Keep this until that exists.  See src/test/matview_where_stress/PLAN.md.
 --
 CREATE TABLE mv_lock_base (id int primary key, v text);
 INSERT INTO mv_lock_base VALUES (1, 'one'), (2, 'two');

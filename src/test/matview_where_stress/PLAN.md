@@ -470,7 +470,20 @@ static suite it produced, against whatever implementation actually landed.
   re-verified, P3's no-deadlock test in place, P1's `Assert()` sited where the
   final code establishes the guarantee.
 - Every test that only existed to guard the old mechanism is deleted, not
-  carried forward. `ISSUES.md`'s Disposition column already says which.
+  carried forward. `ISSUES.md`'s Disposition column says which — but several
+  entries are *conditional*, and the conditions have to be read as fired or not
+  rather than taken at face value:
+
+  | disposition | condition | state |
+  |---|---|---|
+  | A8 · Test 14, "DELETE once the swap lands" | the swap landed in `0607847` | **fired** — replace with a behavioural test beside `matview-where-serialize` |
+  | A5 · `run.sh`, "delete with this directory" | Phase 4 | fires here |
+  | B1/B2 · cache tests, "delete if the plan cache goes away" | Phase 2.1 removes most of the cache's reason to exist | **read at Phase 2 exit**, not before |
+  | B9 · Test 13 search_path half | settled: the restriction stays | **resolved** — keep, add an `errhint` |
+
+  A conditional disposition nobody re-reads is how Test 14 came to sit in the
+  tree for a dozen commits announcing that a swap which had already landed was
+  "not in the tree".
 - **Both build systems.** `parallel_schedule` and `isolation_schedule` are read
   by autoconf *and* meson, so regress and isolation tests need registering once.
   Module specs are not — `src/test/modules/injection_points/meson.build` lists
