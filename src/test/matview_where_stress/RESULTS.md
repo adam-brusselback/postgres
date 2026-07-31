@@ -47,6 +47,7 @@ cited elsewhere and someone will otherwise re-derive it.
 | R15 | `Const` parameterisation | **8× faster**, by turning plan-cache misses into hits | PLAN.md 3.2 | SPECIALIZE.md §3 | settled |
 | R16 | `ORDER BY` on the pre-lock, aligned vs not | ~~3.6×~~ | superseded by R10, which measures 1.2–1.7× | PLAN.md "The locking SELECT" | **superseded** |
 | R17 | `FOR UPDATE` cost | the cost is the **locking, not the scan** — it defeats the index-only scan, 5.4 ms of 6.5 ms at scope 10000 | clean 100,000-row table | PLAN.md "The locking SELECT" | settled |
+| R26 | **Query-tree path against text path, warm** | **24% slower** at scope 1 (49.7 µs text against 61.6 µs Query-tree); confirmed at a different absolute level over three alternating pairs, 60.1 against 78.4, which is **30%**.  The whole deficit is one line: 12.20 µs re-planning the source query.  On a *cold* cache the Query-tree path **wins** (233 against 315 µs), because it skips `pg_get_viewdef` and re-parsing the view text | as R2 — `INSTR_TIME` timers, `-O2`, 300 scope-1 refreshes of `projection`, instrumentation reverted after | PLAN.md "Tier 1 and 2 sized"; CACHE.md | settled |
 
 ## Correctness instruments
 
