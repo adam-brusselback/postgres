@@ -20,6 +20,12 @@ things that do not belong in the patch itself:
                 the planner's own push-down analysis already decides, what is
                 provable and what is not, and what a static check would cost.
 
+  SPECIALIZE.md The Phase 4 design: one algorithm, several specialisations.
+                Seven axes, which tier of the system can observe each, what
+                each selects, and what must be declared rather than inferred.
+                Written after the axis set changed three times in one sitting,
+                each time invalidating a recommendation already made.
+
   USE-CASES.md  53 use cases across 17 domains, each placed against a measured
                 cost model, with the driver pattern and refresh form that suits
                 it.  Intended to feed the documentation and the design
