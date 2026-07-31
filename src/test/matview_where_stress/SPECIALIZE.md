@@ -328,29 +328,24 @@ matters, what its numbers are still worth — is below.
 
 1. ~~**Mutability** — nothing has ever been measured against an append-only or
    no-delete matview. Largest saving, zero data.~~ Closed by
-   `bench/mutability.sql`, which hand-writes the six statement forms and times
-   them against a plain-heap clone, because the code cannot emit four of them
-   yet. Measured on top of the row comparison rather than instead of it:
-   `no_delete` is **13–19% faster** at scope ≥1000, and `append_only` adds a
-   further **10–22 points**. It was billed as the largest
-   saving available; it is real but it is not that. The bigger consequence is
-   §2: the `no_delete` half does not need declaring at all, which leaves
-   `append_only` as the only declared thing in the design.
+   `bench/mutability.sql`, which hand-writes the six statement forms and
+   times them against a plain-heap clone, because the code cannot emit four
+   of them yet. Measured on top of the row comparison rather than instead of
+   it: **R6**. It was billed as the largest saving available; it is real but
+   it is not that. The bigger consequence is §2: the `no_delete` half does
+   not need declaring at all, which leaves `append_only` as the only declared
+   thing in the design.
 2. ~~**Concurrency** — `--clients 4,16 --overlap hot`, plus `fuzz.sh`.~~ Closed,
-   54 cells: **zero deadlocks, zero failed transactions, zero serialization
-   failures** at 1/4/16 clients across both overlap settings. Disjoint scales
-   to **3.4–5.9× the throughput** at 4 clients then flattens. Overlapping goes
-   the other way — `nonkey` range/scope 1000 hot falls to 26 tps at 16 clients,
-   down from 161 at one client — and that
-   collapse is the lock working, not failing. `--overlap hot` is still one point
-   ("everyone fights over keys 1–10") rather than a sweep of intersection
-   probability, which is the part left undone.
+   54 cells — **R8**: no deadlocks, no failed transactions, no serialization
+   failures, disjoint scaling cleanly and overlapping collapsing. That
+   collapse is the lock working, not failing. `--overlap hot` is still one
+   point ("everyone fights over keys 1–10") rather than a sweep of
+   intersection probability, which is the part left undone.
 3. ~~**Churn** — `--mutate on` across a varying changed-fraction.~~ Closed by
-   `bench/churn.sql`, as percent faster: **54–56 → 41–51 → 27–36 → 18–27 →
-   ≈0** at churn 0/5/25/50/100 on `nonkey`/scope 10000. Break-even ≈ 60–70%
-   churn, past which it is not worth turning on. The gate is on
-   scope, and scope is still a proxy — but the proxy now has the curve behind
-   it rather than an argument about driver patterns. Remaining weakness:
+   `bench/churn.sql` — the curve and its break-even are **R4**. Past
+   break-even the comparison is not worth turning on. The gate is on scope,
+   and scope is still a proxy — but the proxy now has the curve behind it
+   rather than an argument about driver patterns. Remaining weakness:
    `churn.sql` measures one arm per invocation, so the comparison is
    cross-process; at the 100% end, where the true difference is a few
    percent, that variance swamps the signal and the sign flips between runs.
@@ -367,31 +362,29 @@ matters, what its numbers are still worth — is below.
 
    The margin does not close as the predicate widens: it narrows a little on
    `aggregate` (1.63× to 1.34×) and widens on `timerange` (1.68× to 1.95×),
-   with no sign of converging on either. Match/merge builds a transient heap of
-   the whole scope and diffs it no matter what; direct modification's cost
+   with no sign of converging on either. Match/merge builds a transient heap
+   of the whole scope and diffs it no matter what; direct modification's cost
    tracks what actually changed. So the region where match/merge should have
    won — near-total scopes, where it does the same work either way — is the
    region where it loses by the most on the larger matview.
 
-   It keeps its place in the code for the case the fast path cannot serve — more
-   than one unique index, where there is no single arbiter to conflict on — and
-   that is a capability boundary, not a performance one.
+   It keeps its place in the code for the case the fast path cannot serve —
+   more than one unique index, where there is no single arbiter to conflict
+   on — and that is a capability boundary, not a performance one.
 
    Caveat: measured before today's routing change, when a bare `WHERE` still
    reached match/merge, so `bare` and `conc` are standing in for the two
-   algorithms. The comparison is algorithm-vs-algorithm; it is not a claim about
-   what the two spellings do now.
+   algorithms. The comparison is algorithm-vs-algorithm; it is not a claim
+   about what the two spellings do now.
 5. ~~**Transaction context** — every run commits per refresh; D1 amortises into
    the writing transaction, D3 calls once a night.~~ Closed with `--perxact`,
    and the answer is not the one assumed. Amortising the commit over 20
-   refreshes helps only while the scope is small — **3.5–3.7× at scope 1,
-   2.1–3.1× at scope 10, 1.25–1.9× at scope 100** — and then reverses hard:
-   **2.1× slower at scope 1000, 3.3× slower at scope 10000**. Twenty rewrites
-   of one scope inside one transaction leave update chains that no cleanup can
-   touch until it commits, and later refreshes walk them. D1 is therefore not
-   "D2 minus the commit cost", and a statement trigger firing repeatedly
-   against a large scope inside one writing transaction is the worst case for
-   this feature rather than the best.
+   refreshes helps only while the scope is small and then reverses hard —
+   **R7**. Twenty rewrites of one scope inside one transaction leave update
+   chains that no cleanup can touch until it commits, and later refreshes
+   walk them. D1 is therefore not "D2 minus the commit cost", and a statement
+   trigger firing repeatedly against a large scope inside one writing
+   transaction is the worst case for this feature rather than the best.
 
 ---
 

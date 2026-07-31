@@ -29,6 +29,7 @@ and one produced a wrong correction. So:
 
 | fact | owner |
 |---|---|
+| **every settled number, with its protocol and where it was derived** | **RESULTS.md** — the index. Check it before measuring, and quote from it rather than from memory |
 | phase profiles, per-µs measurements, the raw matrices | **PLAN.md** Phase 3/4 — this is the source, cite it |
 | which specialisation to build, in what order, and why | **SPECIALIZE.md** |
 | axes, and what changes an answer | **SPECIALIZE.md** §1 |
@@ -37,8 +38,9 @@ and one produced a wrong correction. So:
 | what the feature is for, and its driver patterns | **USE-CASES.md** |
 | commits worth returning to | **RESTORE.md** |
 
-SPECIALIZE.md **cites** the numbers below rather than replacing them. Before
-re-measuring anything, check whether Phase 3/4 already did — twice now, it had.
+SPECIALIZE.md **cites** the numbers below rather than replacing them, and
+RESULTS.md indexes both. Before re-measuring anything, check RESULTS.md —
+twice now, the answer was already there.
 
 Branch-local. Not part of the patch.
 
