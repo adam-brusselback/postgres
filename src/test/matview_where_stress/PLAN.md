@@ -1010,6 +1010,84 @@ Constrained hard by A3/P1/P2 — the lock has to be taken before the source rows
 are read, in arbiter-key order. Listed for completeness, not recommended: the
 risk is to the guarantees and the prize is small.
 
+## Phase 4 candidates, found after the first list was exhausted
+
+**4.1 The fused statement is re-planned on every call when the predicate is
+parameterised.** SPI plans go through the plan cache's custom-versus-generic
+choice, and for this statement `auto` keeps picking custom -- so a bound
+parameter, the pattern a trigger or a drain actually issues, pays a full
+planning round every refresh.  Invisible to the phase profile above because it
+happens inside `SPI_execute_plan`, counted under `dmlexec`.  Measured, 300
+scope-1 refreshes with `WHERE id = $1`:
+
+| `plan_cache_mode` | per refresh |
+|---|---|
+| `auto` (default) | 138.7 µs |
+| `force_custom_plan` | 162.1 µs |
+| **`force_generic_plan`** | **51.4 µs** |
+
+**2.7×, and larger than everything in the previous list put together.**  It is
+also faster than the constant-literal case, which still re-parses.
+`SPI_prepare_cursor(src, nargs, argtypes, CURSOR_OPT_GENERIC_PLAN)` is a
+one-line change from the `SPI_prepare()` calls today.
+
+Do not adopt it on this measurement alone.  A generic plan is the wrong answer
+where a custom one is genuinely better -- a skewed predicate column, an
+`= ANY(array)` whose selectivity varies with the array -- and `auto` exists
+because of those cases.  Measure across all eight workloads and all three
+predicate shapes first, and expect the answer to be "generic, except when",
+not "generic".
+
+**4.2 Suppress the write when the row has not changed.**  The upsert writes a
+new row version for every row in scope whether or not anything about it
+differs.  Adding `WHERE mv IS DISTINCT FROM EXCLUDED` to the `DO UPDATE`
+measured, against a target with indexes on the updated columns and a source
+identical to it:
+
+| scope | plain | conditional | |
+|---|---|---|---|
+| 1 | 35 µs | 37 µs | 2 µs worse |
+| 100 | 473 µs | 344 µs | 27% better |
+| 1,000 | 9,084 µs | 4,310 µs | 53% better |
+| 10,000 | 92,748 µs | 52,720 µs | 43% better |
+
+With no index on the updated columns the effect vanishes -- those updates are
+HOT and cost little -- so this is worth what the matview's own indexes make it
+worth.  The benefit also scales with the *unchanged fraction* of the scope, and
+the benchmark refreshes without mutating anything, so a sweep would show the
+maximum and call it typical.  Measure it with `--mutate on`.
+
+**4.3 Everything sized so far is scope 1, and the winners differ at scale.**
+The phase profile, the plan-cache finding, the whole Tier 1/2 exercise: all at
+one row, where fixed costs are everything.  4.2 is *negative* at scope 1 and
+worth half the statement at 10,000.  Re-run the phase profile at scope 100 and
+10,000 before picking anything else -- there is no reason to expect the same
+list.
+
+**4.4 The scope is scanned twice.**  The locking `SELECT` reads every row the
+predicate selects, and the prune's anti-join reads them all again.  At scope
+10,000 that is two index scans plus a hash anti-join over one set of rows.
+Whether the second can reuse the first is a real question; P2 constrains the
+first, not the second.
+
+**4.5 `FOR NO KEY UPDATE` for rows that will only be updated.**  The pre-lock
+takes `FOR UPDATE` over the whole scope because some of those rows will be
+deleted.  Rows that will only be upserted need the weaker mode, which does not
+conflict with foreign-key checks.  A concurrency optimisation, not a latency
+one -- measure it with `--clients 4,16 --overlap hot`, where the current sweep
+has nothing to say.
+
+**4.6 Skip the prune when it provably cannot delete anything.**  On the
+Query-tree path the source row count is known once the tuplestore is filled.
+If it matches the number of matview rows in scope and the upsert inserted none,
+nothing can be missing.  The derivation is the hard part and it has to be right
+every time, not usually.
+
+**4.7 Reuse the tuplestore and the ENR tuple descriptor across refreshes.**
+`CreateTupleDescCopy()` and a `tuplestore_begin_heap()`/`_end()` pair per
+refresh, inside the 4.3 µs the Query-tree path does not otherwise account for.
+Small, and cheap to do while touching that code for 3.7.
+
 ## Phase 3 is a loop, not a pass
 
 Optimise, run the fuzzer, run the static gates, measure. Any divergence stops
