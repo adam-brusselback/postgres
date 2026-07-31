@@ -4,6 +4,7 @@
     ./mutations.py B4          apply
     ./mutations.py pristine    restore
     ./mutations.py --list      show the corpus
+    ./mutations.py --check     verify every mutation still applies
 
 Pristine is defined as `git show HEAD:src/backend/commands/matview.c`, not as a
 copy kept somewhere.  A copy is a thing that can drift from what it claims to be
@@ -31,15 +32,28 @@ TARGET = 'src/backend/commands/matview.c'
 #   needs='concur'  observable only with two overlapping sessions
 #   needs='inject'  a quoting escape; observable by matview_where_inject
 MUTATIONS = {
+    # NB: this stopped applying when the row comparison landed, because that
+    # inserted a WHERE ... IS DISTINCT FROM between the UPDATE SET and the else,
+    # and nothing noticed -- a mutation that cannot be applied is a detector
+    # that has never fired, one level up from a test that cannot fail.  The
+    # occurrence counts below exist so the same drift is loud next time.
     'A4': ('A4', 'data',
            'drop ON CONFLICT from the upsert (scope drift)', [
-               ('"  ON CONFLICT (%s) DO ",', '"  /*%s*/ ",'),
+               ('"  ON CONFLICT (%s) DO ",', '"  /*%s*/ ",', 1),
                ('\t\t\tappendStringInfo(&buf, "UPDATE SET %s ", set_clause.data);\n'
+                '\t\t\tif (use_optimized)\n'
+                '\t\t\t\tappendStringInfo(&buf, "WHERE (%s) IS DISTINCT FROM (%s) ",\n'
+                '\t\t\t\t\t\t\t\t mv_cols.data, excluded_cols.data);\n'
+                '\t\t}\n'
                 '\t\telse\n'
                 '\t\t\tappendStringInfoString(&buf, "NOTHING ");',
                 '\t\t\tappendStringInfo(&buf, "/*%s*/ ", set_clause.data);\n'
+                '\t\t\tif (use_optimized)\n'
+                '\t\t\t\tappendStringInfo(&buf, "/*%s %s*/ ",\n'
+                '\t\t\t\t\t\t\t\t mv_cols.data, excluded_cols.data);\n'
+                '\t\t}\n'
                 '\t\telse\n'
-                '\t\t\tappendStringInfoString(&buf, " ");'),
+                '\t\t\tappendStringInfoString(&buf, " ");', 1),
            ]),
 
     'B4': ('B4', 'data',
@@ -162,8 +176,10 @@ MUTATIONS = {
 
     'M1': ('A5', 'concur',
            'drop ORDER BY from the row-locking SELECT (deadlock)', [
-               ('"SELECT 1 FROM %s mv WHERE (%s) ORDER BY %s FOR UPDATE"',
-                '"SELECT 1 FROM %s mv WHERE (%s) /*%s*/ FOR UPDATE"'),
+               ('"SELECT 1 FROM %s mv WHERE (%s) ORDER BY %s "\n'
+                '\t\t\t\t\t\t "FOR NO KEY UPDATE"',
+                '"SELECT 1 FROM %s mv WHERE (%s) /*%s*/ "\n'
+                '\t\t\t\t\t\t "FOR NO KEY UPDATE"', 1),
            ]),
 
     'M2': ('P3', 'concur',
@@ -174,8 +190,10 @@ MUTATIONS = {
 
     'M3': ('A3', 'concur',
            'remove the row-locking statement entirely (serialization)', [
-               ('"SELECT 1 FROM %s mv WHERE (%s) ORDER BY %s FOR UPDATE"',
-                '"SELECT 1 FROM %s mv WHERE (%s) AND false /*%s*/"'),
+               ('"SELECT 1 FROM %s mv WHERE (%s) ORDER BY %s "\n'
+                '\t\t\t\t\t\t "FOR NO KEY UPDATE"',
+                '"SELECT 1 FROM %s mv WHERE (%s) AND false /*%s*/"\n'
+                '\t\t\t\t\t\t ""', 1),
            ]),
 
     # Kept for the record: verified behaviourally benign.  The planner does not
@@ -331,6 +349,33 @@ def refuse_if_uncommitted():
                  'them.')
 
 
+def check_all():
+    """Verify every mutation still matches the code it is meant to break.
+
+    A mutation whose pattern has drifted cannot be applied, and a mutation that
+    cannot be applied is a detector that has never fired -- the same defect as a
+    test that cannot fail, one level up.  This has already happened twice: A4
+    stopped matching when the row comparison inserted a WHERE clause between the
+    UPDATE SET and its else, and M1/M3 stopped matching when the pre-lock became
+    FOR NO KEY UPDATE.  Neither was noticed until something went looking for it.
+
+    Run this after any edit to matview.c.
+    """
+    src = pristine()
+    bad = set()
+    for name, (issue, needs, desc, edits) in sorted(MUTATIONS.items()):
+        for edit in edits:
+            old = edit[0]
+            want = edit[2] if len(edit) > 2 else 1
+            got = src.count(old)
+            if got != want:
+                bad.add(name)
+                print(f'FAIL {name}: expected {want} occurrence(s), found '
+                      f'{got} -- {old[:60]}...')
+    print(f'{len(MUTATIONS) - len(bad)}/{len(MUTATIONS)} mutations still apply')
+    return 1 if bad else 0
+
+
 def main():
     args = [a for a in sys.argv[1:] if a != '--force']
     force = '--force' in sys.argv
@@ -342,6 +387,9 @@ def main():
         for k, (issue, needs, desc, _) in sorted(MUTATIONS.items()):
             print(f'{k:9} {issue:4} {needs:7} {desc}')
         return
+
+    if name == '--check':
+        sys.exit(check_all())
 
     if not force:
         refuse_if_uncommitted()
