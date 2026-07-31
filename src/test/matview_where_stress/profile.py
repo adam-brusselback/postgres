@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Add or remove per-phase timers in refresh_by_direct_modification().
 
-    ./profile.py on     instrument matview.c
-    ./profile.py off    restore it from HEAD
+    ./profile.py on       instrument matview.c
+    ./profile.py off      restore it from HEAD
+    ./profile.py --check  verify every pattern still matches; exits non-zero if not
 
 The timers log one MVPROF line per 30 refreshes at LOG level, giving the
 microseconds spent in each phase.  This is throwaway instrumentation, not a
@@ -24,8 +25,8 @@ PROLOGUE = '''#include "utils/tuplestore.h"
 #include "portability/instr_time.h"
 
 /* TEMPORARY per-phase profiling -- see src/test/matview_where_stress/profile.py */
-static instr_time mvp_t[11];
-static double mvp_us[11];
+static instr_time mvp_t[12];
+static double mvp_us[12];
 static int64 mvp_calls;
 #define MVP_TOTAL 0
 #define MVP_TRANSFORM 1
@@ -34,18 +35,20 @@ static int64 mvp_calls;
 #define MVP_SWEEP 4
 #define MVP_PREPARE 5
 #define MVP_SRCBUILD 6
-#define MVP_SRCPLAN 7
+#define MVP_SRCREWRITE 7
 #define MVP_LOCKEXEC 8
 #define MVP_DMLEXEC 9
 #define MVP_SRCEXEC 10
+#define MVP_SRCPLAN 11
 #define MVP_START(i) INSTR_TIME_SET_CURRENT(mvp_t[i])
 #define MVP_STOP(i) \\
   do { instr_time _e; INSTR_TIME_SET_CURRENT(_e); \\
        INSTR_TIME_SUBTRACT(_e, mvp_t[i]); \\
        mvp_us[i] += INSTR_TIME_GET_MICROSEC(_e); } while (0)
-static const char *const mvp_name[11] = {
+static const char *const mvp_name[12] = {
   "total", "transform", "deparse", "arbiter", "sweep",
-  "prepare", "srcbuild", "srcplan", "lockexec", "dmlexec", "srcexec"
+  "prepare", "srcbuild", "srcrewrite", "lockexec", "dmlexec", "srcexec",
+  "srcplan"
 };
 static void
 mvp_report(void)
@@ -53,11 +56,11 @@ mvp_report(void)
   StringInfoData b; int i;
   initStringInfo(&b);
   appendStringInfo(&b, "MVPROF calls=%lld", (long long) mvp_calls);
-  for (i = 0; i < 11; i++)
+  for (i = 0; i < 12; i++)
     appendStringInfo(&b, " %s=%.1f", mvp_name[i], mvp_us[i]);
   elog(LOG, "%s", b.data);
   pfree(b.data);
-  for (i = 0; i < 11; i++) mvp_us[i] = 0;
+  for (i = 0; i < 12; i++) mvp_us[i] = 0;
   mvp_calls = 0;
 }'''
 
@@ -83,15 +86,23 @@ EDITS = [
 	/* Find a usable unique index, preferring the primary key. */
 	indexoidlist = RelationGetIndexList(matviewRel);"""),
 
-    ("""	matview_cache_sweep();
-
-	cacheEntry = (MatViewPartialRefreshCache *) hash_search(MatViewRefreshCache,""",
+    # The sweep moved inside "if (use_cache)" in 49a3528 (B14's fix), so ARBITER
+    # has to stop BEFORE that branch -- a nested refresh takes the else arm and
+    # would otherwise never stop the timer.
+    ("""	use_cache = (matview_maintenance_depth == 0);""",
      """	MVP_STOP(MVP_ARBITER);
-	MVP_START(MVP_SWEEP);
-	matview_cache_sweep();
-	MVP_STOP(MVP_SWEEP);
+	use_cache = (matview_maintenance_depth == 0);"""),
 
-	cacheEntry = (MatViewPartialRefreshCache *) hash_search(MatViewRefreshCache,"""),
+    ("""		matview_cache_sweep();
+
+		cacheEntry = (MatViewPartialRefreshCache *)
+			hash_search(MatViewRefreshCache, &matviewOid, HASH_ENTER, &found);""",
+     """		MVP_START(MVP_SWEEP);
+		matview_cache_sweep();
+		MVP_STOP(MVP_SWEEP);
+
+		cacheEntry = (MatViewPartialRefreshCache *)
+			hash_search(MatViewRefreshCache, &matviewOid, HASH_ENTER, &found);"""),
 
     ("""	/* Prepare plans if we don't have valid cached ones. */
 	if (cacheEntry->lockPlan == NULL || cacheEntry->refreshPlan == NULL)
@@ -129,15 +140,23 @@ EDITS = [
 		MVP_STOP(MVP_SRCBUILD);
 		matview_materialize_source(sourceQuery, params, snapshot, sourceStore);"""),
 
+    # R27: the 12.20 us was ONE line covering rewrite AND plan, and the saving
+    # 3.7 can recover is bounded by the plan half alone.  Timed separately.
     ("""	AcquireRewriteLocks(sourceQuery, true, false);
 	rewritten = QueryRewrite(sourceQuery);""",
-     """	MVP_START(MVP_SRCPLAN);
+     """	MVP_START(MVP_SRCREWRITE);
 	AcquireRewriteLocks(sourceQuery, true, false);
 	rewritten = QueryRewrite(sourceQuery);"""),
 
-    ("""	plan = pg_plan_query(sourceQuery, NULL, CURSOR_OPT_PARALLEL_OK, params,
+    ("""	CHECK_FOR_INTERRUPTS();
+
+	plan = pg_plan_query(sourceQuery, NULL, CURSOR_OPT_PARALLEL_OK, params,
 						 NULL);""",
-     """	plan = pg_plan_query(sourceQuery, NULL, CURSOR_OPT_PARALLEL_OK, params,
+     """	MVP_STOP(MVP_SRCREWRITE);
+	CHECK_FOR_INTERRUPTS();
+
+	MVP_START(MVP_SRCPLAN);
+	plan = pg_plan_query(sourceQuery, NULL, CURSOR_OPT_PARALLEL_OK, params,
 						 NULL);
 	MVP_STOP(MVP_SRCPLAN);
 	MVP_START(MVP_SRCEXEC);"""),
@@ -190,16 +209,32 @@ EDITS = [
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else ''
-    if mode not in ('on', 'off'):
+    if mode not in ('on', 'off', '--check'):
         sys.exit(__doc__)
 
     src = subprocess.run(['git', 'show', 'HEAD:' + TARGET],
                          capture_output=True, text=True, check=True).stdout
 
+    # --check exists because this script rotted silently and nobody noticed.
+    # 49a3528 moved matview_cache_sweep() inside "if (use_cache)"; 13 of the 14
+    # patterns still matched, so `on` exited having instrumented nothing, and the
+    # only symptom would have been a phase profile that never appeared.  This is
+    # ISSUES.md B23 one file over -- there, the mutation corpus rotted against
+    # the code it mutates and still produced plausible numbers.  Report every
+    # miss rather than the first, so one run says how far the drift goes.
+    if mode == '--check':
+        missing = [(i, old) for i, (old, _) in enumerate(EDITS) if old not in src]
+        for i, old in missing:
+            print(f'  MISS  edit {i}: {old.strip().splitlines()[0][:66]}')
+        print(f'{len(EDITS) - len(missing)}/{len(EDITS)} patterns apply '
+              f'against HEAD:{TARGET}')
+        sys.exit(1 if missing else 0)
+
     if mode == 'on':
         for old, new in EDITS:
             if old not in src:
-                sys.exit(f'pattern not found, the code has moved:\n  {old[:70]}...')
+                sys.exit(f'pattern not found, the code has moved:\n  {old[:70]}...'
+                         f'\nrun ./profile.py --check to see every miss at once')
             src = src.replace(old, new, 1)
 
     with open(TARGET, 'w') as f:
