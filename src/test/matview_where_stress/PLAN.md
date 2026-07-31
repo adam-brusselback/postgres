@@ -5,11 +5,12 @@
 **Phase 1 — complete.** Oracle, fuzzer, calibration, contract file, both gap
 closures.
 
-**Phase 2 — one step in, and blocked.** 2.1 (read side) is done and measured.
-**2.2 is a decision, not unstarted work**: option (b) is what 2.1 shipped, so
-what 2.2 decides is whether to go on to (a), hand-built DML `Query` trees. 2.3
-is gated on that choice — under (b) the predicate is still text. **B14 is
-reopened and blocks both**; see ISSUES.md.
+**Phase 2 — done for this cycle.** 2.1 (read side) is done and measured. **2.2
+is decided: (b), which is what 2.1 already shipped** — the DML and the predicate
+stay as short generated SQL. 2.3 followed it and is closed too, since under (b)
+the predicate is still text. Option (a), hand-built DML `Query` trees, is a
+**follow-on patch to evaluate on its own evidence, not work this cycle owes**;
+the reasoning is at 2.2 and is not to be reopened without a measurement.
 
 **Phase 3 — worked out of order, and ahead of Phase 2.** Gaps 1–5, the churn
 curve, heap state, the `ORDER BY` split. That is legitimate ("Phase 3 is a
@@ -696,18 +697,18 @@ This alone removes, by construction rather than by fix:
 |---|---|
 | B1, B2 | a Query holds OIDs; a rename cannot re-resolve it to a different relation |
 | B3 | parameter types live in the tree, not in a rendered `$1` |
-| B7, B14 | the bespoke plan cache and its use-after-free exist to avoid re-deparsing; with no deparse, most of its reason to exist goes. **B14 is reopened and live in the tree today** — see ISSUES.md; this row is what Phase 2.3 would retire, not a description of the present |
+| B7, B14 | the bespoke plan cache and its use-after-free exist to avoid re-deparsing; with no deparse, most of its reason to exist goes. This row is what Phase 2.3 *would* retire — and 2.3 is closed for this cycle, so the cache stays and B14's guard is what holds |
 | B9 | `RestrictSearchPath()` guards name resolution in generated text; the view side no longer resolves names at all |
 
 Five tracked items and one CVE-shaped hazard, deleted rather than patched.
 
-That is the plan, not the state. B14 has since reopened — the nested-refresh
-case, reproduced on an assertions build — and Phase 2.3 has not been written, so
-it needs a guard now rather than waiting to be deleted later. Note too that
-Phase 2.3 removes the *deparse*, not the cache: something still has to hold
-prepared plans across refreshes, so the hazard class B14 belongs to — freeing a
-structure that a re-entrant caller is still using — survives the rewrite and has
-to be designed against rather than dissolved by it.
+That is the plan, not the state. B14 reopened — the nested-refresh case,
+reproduced on an assertions build — and was fixed in place rather than waiting
+to be deleted later, because 2.3 is now closed for this cycle. Note too that 2.3
+removes the *deparse*, not the cache: something still has to hold prepared plans
+across refreshes, so the hazard class B14 belongs to — freeing a structure that a
+re-entrant caller is still using — would survive the rewrite and has to be
+designed against rather than dissolved by it.
 
 ### 2.1b Measure here, and again after 2.2
 
@@ -767,6 +768,10 @@ like anything else in `matview.c`.
 
 ### 2.3 The predicate — the last piece of text
 
+**Closed with 2.2: the predicate stays text this cycle.** Kept because it
+records what the deparse costs and what it is entangled with, both of which the
+follow-on needs.
+
 The `WHERE` clause is already a parsed node tree by the time
 `refresh_by_direct_modification()` sees it; it is deparsed to text only because
 SPI needs a string, and it is rendered twice — into the locking `SELECT` and
@@ -802,13 +807,34 @@ as an ephemeral named relation and the existing fused upsert-and-prune SQL reads
 that instead of its CTE. What is still generated text is short and fixed —
 relation and column identifiers, and the predicate.
 
-**The decision is to go on to (a) anyway: no generated SQL at all.** (b) is the
-waypoint, not the destination. That means the `INSERT ... ON CONFLICT` and the
-`DELETE` become `Query` trees, with arbiter-index inference done by hand, and
-2.3 below stops deparsing the predicate as well. The cost is exactly the review
-risk named above — nothing in core outside `analyze.c` builds an upsert — and
-the differential harness is what makes it checkable: every step is compared
-against the text path over all 22 shapes before it lands.
+### DECIDED: (b) is where this cycle ships. Do not reopen it here.
+
+**2.2 and 2.3 are closed for this cycle.** The patch goes to -hackers with (b):
+the source rows come from a `Query` tree via an ephemeral named relation, and
+the upsert, the prune and the predicate remain short generated SQL.
+
+This was reopened three times because the reasoning kept being rederived from
+scratch, so the reasoning is written down here once and the question is shut:
+
+- **(a)'s benefit is structural, not measured.** No number in RESULTS.md says
+  the text DML costs anything at scale — R2 puts source planning at 0.9% by
+  scope 100 and 0.0% by 10k, and the DML text is built once per *cache miss*,
+  not per row. The saving (b) leaves on the table is small and shrinking with
+  scope.
+- **(a)'s cost is review risk, and it is large.** Nothing in core outside
+  `analyze.c` builds an `INSERT ... ON CONFLICT`; arbiter-index inference by
+  hand has no precedent to copy. That is the single most likely thing in the
+  patch to draw a "why is this here" from a committer, and it would be defending
+  a rewrite whose benefit we cannot quote a number for.
+- **The honest cost of stopping at (b):** it keeps a plan cache, and the plan
+  cache is what produced B14. That hazard class stays in the design rather than
+  being designed out. Recorded rather than argued away — B14's guard closes the
+  instance, not the class.
+
+**Follow-on, not this cycle:** evaluate whether (a) is worth doing at all. It is
+a separate patch on top of a landed (b), measurable against it, and can be
+abandoned on its own evidence without touching what shipped. Open it only with a
+measurement in hand — not because the design feels cleaner.
 
 ## 2.4 What this phase does not change
 
@@ -1027,7 +1053,7 @@ invalidations turns it into a branch.
 
 It is no longer only a cost item: sweeping *every* entry rather than this
 refresh's own is what lets a nested refresh free an enclosing one's in-flight
-plans (B14, reopened). Narrowing the sweep to the caller's own key — the shape
+plans (B14). Narrowing the sweep to the caller's own key — the shape
 `ri_FetchPreparedPlan()` uses — would address both the cost and half the
 correctness problem in one change.
 
