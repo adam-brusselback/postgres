@@ -1461,6 +1461,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	List	   *indexoidlist;
 	ListCell   *lc;
 	MatViewPartialRefreshCache *cacheEntry;
+	MatViewPartialRefreshCache localEntry;
+	bool		use_cache;
 	bool		found;
 	uint64		result_processed = 0;
 	int			old_depth;
@@ -1508,23 +1510,62 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 						RelationGetRelationName(matviewRel)),
 				 errdetail("Partial refresh requires a usable unique index to perform an UPSERT operation.")));
 
-	/* Look up or create a plan cache entry for this matview. */
-	if (!MatViewRefreshCache)
-		InitMatViewCache();
-
 	/*
-	 * Discard anything the relcache callback marked stale.  Do this before
-	 * taking our own entry: the sweep removes entries, so a pointer taken
-	 * first would not survive it.  Afterwards nothing removes entries until
-	 * the next refresh, so cacheEntry stays valid for the whole maintenance
-	 * window even though invalidations keep arriving during it.
+	 * Look up or create a plan cache entry for this matview -- but only the
+	 * outermost partial refresh uses the session cache at all.
+	 *
+	 * A nested one is reachable: the predicate and the view definition are both
+	 * evaluated inside the maintenance window, so a function in either can
+	 * issue REFRESH MATERIALIZED VIEW ... WHERE.  If such a call reached the
+	 * code below, matview_cache_sweep() would free and remove the entry the
+	 * enclosing refresh is still executing from.  The sweep's frees were
+	 * deferred to here on the belief that "nothing removes entries until the
+	 * next refresh" -- but a nested refresh IS the next refresh, and it sweeps
+	 * every entry the callback marked, which is all of them.  Neither the
+	 * CachedPlan refcount nor anything else protects against that:
+	 * SPI_freeplan() deletes the _SPI_plan's own context, which holds the
+	 * plancache_list that _SPI_execute_plan is iterating.  Reproduced on an
+	 * assertions build as a refresh executing a different matview's plan, as a
+	 * freed query_string printed by the error context, and as a SIGSEGV.
+	 *
+	 * The nested refresh must be of a different matview: CheckTableNotInUse()
+	 * rejects one of the same matview well before this point, which is also why
+	 * the mismatch branch below cannot reach an enclosing refresh's entry -- it
+	 * only ever frees plans under the OID its own caller passed.
+	 *
+	 * So a nested refresh prepares private plans and touches neither the hash
+	 * table nor the entries in it.  They are not SPI_keepplan'd, so SPI_finish()
+	 * below reclaims them; nesting is rare enough that losing the cache there
+	 * costs nothing, and the alternative -- sharing an entry with a caller that
+	 * is mid-execution -- is what this is fixing.
 	 */
-	matview_cache_sweep();
+	use_cache = (matview_maintenance_depth == 0);
 
-	cacheEntry = (MatViewPartialRefreshCache *) hash_search(MatViewRefreshCache,
-															&matviewOid,
-															HASH_ENTER,
-															&found);
+	if (use_cache)
+	{
+		if (!MatViewRefreshCache)
+			InitMatViewCache();
+
+		/*
+		 * Discard anything the relcache callback marked stale.  Do this before
+		 * taking our own entry: the sweep removes entries, so a pointer taken
+		 * first would not survive it.  Afterwards nothing removes entries --
+		 * the callback only marks, and a nested refresh no longer sweeps -- so
+		 * cacheEntry stays valid for the whole maintenance window even though
+		 * invalidations keep arriving during it.
+		 */
+		matview_cache_sweep();
+
+		cacheEntry = (MatViewPartialRefreshCache *)
+			hash_search(MatViewRefreshCache, &matviewOid, HASH_ENTER, &found);
+	}
+	else
+	{
+		memset(&localEntry, 0, sizeof(localEntry));
+		localEntry.matviewOid = matviewOid;
+		cacheEntry = &localEntry;
+		found = false;
+	}
 
 	/*
 	 * We have a cache hit ONLY if the entry exists, the unique index matches,
@@ -1827,7 +1868,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		cacheEntry->lockPlan = SPI_prepare(buf.data, nargs, argtypes);
 		if (cacheEntry->lockPlan == NULL)
 			elog(ERROR, "SPI_prepare failed for lock acquisition: %s", buf.data);
-		SPI_keepplan(cacheEntry->lockPlan);
+		if (use_cache)
+			SPI_keepplan(cacheEntry->lockPlan);
 
 		resetStringInfo(&buf);
 
@@ -1879,22 +1921,31 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		cacheEntry->refreshPlan = SPI_prepare(buf.data, nargs, argtypes);
 		if (cacheEntry->refreshPlan == NULL)
 			elog(ERROR, "SPI_prepare failed for refresh CTE: %s", buf.data);
-		SPI_keepplan(cacheEntry->refreshPlan);
+		if (use_cache)
+			SPI_keepplan(cacheEntry->refreshPlan);
 
-		/* Save cache metadata in a long-lived context. */
-		oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
-		cacheEntry->uniqueIndexOid = uniqueIndexOid;
-		cacheEntry->querytree = use_querytree;
-		cacheEntry->whereClauseStr = pstrdup(whereClauseStr);
-		cacheEntry->nargs = nargs;
-		if (nargs > 0)
+		/*
+		 * Save cache metadata in a long-lived context.  Only for a real entry:
+		 * the metadata exists to be compared on a LATER call, and a nested
+		 * refresh's entry is gone when this one returns, so writing it into
+		 * CacheMemoryContext would be a leak with no reader.
+		 */
+		if (use_cache)
 		{
-			cacheEntry->argtypes = (Oid *) palloc(nargs * sizeof(Oid));
-			memcpy(cacheEntry->argtypes, argtypes, nargs * sizeof(Oid));
+			oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
+			cacheEntry->uniqueIndexOid = uniqueIndexOid;
+			cacheEntry->querytree = use_querytree;
+			cacheEntry->whereClauseStr = pstrdup(whereClauseStr);
+			cacheEntry->nargs = nargs;
+			if (nargs > 0)
+			{
+				cacheEntry->argtypes = (Oid *) palloc(nargs * sizeof(Oid));
+				memcpy(cacheEntry->argtypes, argtypes, nargs * sizeof(Oid));
+			}
+			else
+				cacheEntry->argtypes = NULL;
+			MemoryContextSwitchTo(oldcxt);
 		}
-		else
-			cacheEntry->argtypes = NULL;
-		MemoryContextSwitchTo(oldcxt);
 
 		pfree(matview_name);
 		if (view_sql != NULL)

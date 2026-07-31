@@ -35,10 +35,11 @@ irrelevant commits:
     # this directory alone
     git log --oneline c8beb05..HEAD -- src/test/matview_where_stress
 
-Two of those ten are worth knowing by name. `0c16eaf` is the original
-use-after-free fix in the plan cache — the one ISSUES.md B14 has since reopened,
-because it deferred the free to "the next refresh" and a nested refresh is the
-next refresh. `9a5195b` is Phase 2.1, where the read side stopped being text.
+Two of those are worth knowing by name. `0c16eaf` is the original
+use-after-free fix in the plan cache — the one ISSUES.md B14 reopened, because it
+deferred the free to "the next refresh" and a nested refresh is the next refresh;
+the second fix refuses the shared cache at maintenance depth > 0. `9a5195b` is
+Phase 2.1, where the read side stopped being text.
 
 **The path filter is the reliable view; the prefix is only a convenience.**
 Going forward, `matview stress:` marks a commit touching nothing but this

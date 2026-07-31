@@ -501,8 +501,9 @@ even at a poor hit rate.
   plancache's plan and not our entry — B2, still open.
 - *It is keyed too coarsely.* One entry per `matviewOid`, so two callers with
   different predicates on one matview evict each other every time. That is worse
-  than no cache: maintenance paid for a guaranteed miss. It is also the second
-  free site in B14.
+  than no cache: maintenance paid for a guaranteed miss. It is **not** a second
+  free site in B14 — an earlier version of this line said it was, and RESULTS.md
+  X8 says why it is not.
 
 The fix for all three is `ri_triggers.c`'s pattern: **let plancache be the
 detector and own the text yourself.** `ri_FetchPreparedPlan()` gates reuse on
@@ -557,8 +558,12 @@ object, bypassing SPI — and its history is worth reading before posting:
   that "departs from the PostgreSQL norm of tracking resources by
   subtransaction". A session cache that cannot unwind on subxact abort will meet
   the same objection.
-- **Run under `debug_discard_caches = 1` before posting.** Neither our suite nor
-  the RI feature's did; the buildfarm did it for them on day one.
+- **Run under `debug_discard_caches = 1` before posting.** The RI feature's suite
+  did not; the buildfarm did it for them on day one. Ours now does — all five
+  `matview_where*` files green, `matview_where` taking 85 s against 409 ms
+  normally, which is how you can tell the setting was actually in effect. Re-run
+  it after any change to the cache; it is not in `make check`, so nothing will
+  remind you.
 - **Do not read silence as approval.** That feature shipped with two named
   reviewers, no committer review beside the author's, and a `Tested-by:` that
   was benchmarks only — then took six follow-up commits in eleven weeks.

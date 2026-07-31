@@ -56,6 +56,10 @@ cited elsewhere and someone will otherwise re-derive it.
 | R19 | concurrent fuzzer | M1 **76/160** deadlocks, M2 **40/80**, M3 **45** lost updates, M6 **55**; quiet on pristine | probabilistic; absence over N runs is not proof | PLAN.md 1.1b; `fuzz.sh` | settled |
 | R20 | mutation corpus | **16/16 apply** against the current tree | `mutations.py --check`; an edit declares its expected occurrence count | ISSUES.md B23 | settled |
 | R21 | what the oracle cannot see | P1 admits **no deterministic test**: a correct implementation has no window to exploit, so there is nowhere to put an injection point | — | PLAN.md 1.1b and 1.4 | settled |
+| R22 | the B14 use-after-free, and that its test is a test | **unfixed 249/250, fixed 250/250.** Test 5 fails on unfixed with `ERROR: cannot change materialized view "mv_c4_inner"` from a refresh of `mv_c4`; standalone reproducer shows `0x7F` fill in the error context | one `-O2 --enable-cassert` build, flipping only `matview.c` between arms, full `installcheck` each way | ISSUES.md B14 | settled |
+| R23 | why the first version of that test passed | `REFRESH` runs under `RestrictSearchPath()`, so **unqualified names in a nested function do not resolve**; the `ALTER TABLE` raised, the `EXCEPTION` block swallowed it, the nested refresh never ran | observed directly by replacing the trap with `RAISE NOTICE` | ISSUES.md B14 | settled |
+| R24 | same-matview nesting | **blocked**, by `CheckTableNotInUse()`: *"cannot REFRESH MATERIALIZED VIEW … because it is being used by active queries in this session"* | run, not read: `scratch/uaf/selfnest.sql` | ISSUES.md B14; RESULTS.md X8 | settled |
+| R25 | the suite under `debug_discard_caches = 1` | **5/5 green**, first time it has been run. `matview_where` **85 s against 409 ms**, which is the evidence the setting was in effect rather than silently ignored | `pg_regress --dbname=regression_dcc` with `PGOPTIONS='-c debug_discard_caches=1'`, assert build | SPECIALIZE.md §7b | settled |
 
 ## Retracted, and why — read before re-deriving
 
@@ -67,7 +71,9 @@ cited elsewhere and someone will otherwise re-derive it.
 | X4 | "drop both `ORDER BY`s" is one decision | one saving and one regression, and the second is unresolvable. See R10, R11 |
 | X5 | `+28.6%` does not reproduce | it does — the recheck regrouped it. See the header of this file, and R1 |
 | X6 | a batch-scoped cache needs no invalidation because locks are held | false. `LockRelationOid()` calls `AcceptInvalidationMessages()`, so your own `table_open()` can invalidate what you cached. See SPECIALIZE.md §7a |
-| X7 | B14 is fixed | reopened. "Frees at the next refresh" — and a nested refresh is the next refresh. See ISSUES.md B14 |
+| X7 | B14 is fixed | reopened once. "Frees at the next refresh" — and a nested refresh is the next refresh. Fixed again and now covered by R22; the retraction stays because the first fix was believed on a green suite that could not have caught it |
+| X8 | the mismatch branch is a second use-after-free site, needing no invalidation | it is not. It frees only under the OID its own caller passed, and same-matview nesting is blocked before any cache code (R24). ISSUES.md already contradicted itself about this in two places. It is cache thrash, not memory-unsafety |
+| X9 | a green suite means the fix is verified | the first B14 fix was believed this way, and so was the first version of its test (R23). **A test that has not been seen to fail is not evidence** — record both arms or record nothing |
 
 ---
 

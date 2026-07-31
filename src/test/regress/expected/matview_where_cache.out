@@ -194,3 +194,170 @@ SELECT * FROM mv_c3 ORDER BY id;
 
 DROP MATERIALIZED VIEW mv_c3;
 DROP TABLE mv_c3_base;
+--
+-- Test 5: A nested partial refresh must not free the enclosing one's plans
+--
+-- The predicate and the view definition are both evaluated inside the outer
+-- refresh's maintenance window, so a function in either can issue REFRESH
+-- MATERIALIZED VIEW ... WHERE.  That nested call used to reach the same
+-- session cache the enclosing refresh was executing from, and free out of it:
+--
+-- matview_cache_sweep() frees every entry the relcache callback marked stale,
+-- and the callback marks all of them because it ignores its relid argument.
+-- The sweep was placed before the entry lookup on the reasoning that "nothing
+-- removes entries until the next refresh" -- but a nested refresh IS the next
+-- refresh, and it runs while the enclosing one holds a pointer into its entry
+-- and is executing a plan out of it.
+--
+-- Nothing protected against that.  SPI_freeplan() deletes the _SPI_plan's own
+-- context, which holds the plancache_list that _SPI_execute_plan is walking, so
+-- the CachedPlan refcount is not the relevant lifetime.  Observed on an
+-- assertions build as the enclosing refresh executing the nested matview's plan
+-- (what this test catches, because dynahash hands the removed element straight
+-- back to the nested HASH_ENTER), as an error context printing a freed query
+-- string, and as a SIGSEGV.
+--
+-- The nested refresh has to be of a *different* matview.  CheckTableNotInUse()
+-- rejects one of the same matview -- "because it is being used by active
+-- queries in this session" -- before any of this code runs, which is also why
+-- the other free site in refresh_by_direct_modification(), the arbiter/
+-- predicate mismatch branch, is not a second way in: it only ever frees plans
+-- under the OID its own caller passed, and that OID cannot be an enclosing
+-- refresh's.
+--
+-- The fix is upstream of the sweep: a refresh at maintenance depth > 0 prepares
+-- private plans and touches neither the hash table nor the entries in it.
+--
+CREATE TABLE mv_c4_base (id int primary key, v int);
+CREATE TABLE mv_c4_inner_base (id int primary key, v int);
+INSERT INTO mv_c4_base SELECT g, g FROM generate_series(1, 5) g;
+INSERT INTO mv_c4_inner_base SELECT g, g FROM generate_series(1, 5) g;
+CREATE MATERIALIZED VIEW mv_c4_inner AS SELECT id, v FROM mv_c4_inner_base;
+CREATE UNIQUE INDEX ON mv_c4_inner(id);
+-- Called from the outer view definition, so it runs inside the outer refresh's
+-- maintenance window.
+--
+-- The ALTER TABLE is what makes the sweep bite: it emits a relcache
+-- invalidation, the callback marks every entry stale including the enclosing
+-- refresh's, and the nested refresh's sweep then frees it.  The nested refresh
+-- itself cannot succeed -- rows in a second matview cannot be locked while the
+-- first is being maintained -- but it fails at the locking step, well after the
+-- sweep has run.  Reaching the free site does not require the nested refresh to
+-- work, only to start.  The trap keeps this test about the cache rather than
+-- about that restriction.
+--
+-- Both names are schema-qualified, and that is load-bearing rather than
+-- stylistic: REFRESH runs its query under RestrictSearchPath(), so an
+-- unqualified name here does not resolve, the ALTER TABLE raises instead, the
+-- trap swallows it and the nested refresh never runs at all.  Written that way
+-- first, this test passed against the unfixed code.
+CREATE FUNCTION mv_c4_nested(x int) RETURNS int LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+  BEGIN
+    ALTER TABLE public.mv_c4_inner_base SET (autovacuum_enabled = true);
+    REFRESH MATERIALIZED VIEW CONCURRENTLY public.mv_c4_inner WHERE id = 1;
+  EXCEPTION WHEN OTHERS THEN
+    NULL;
+  END;
+  RETURN x;
+END $$;
+CREATE MATERIALIZED VIEW mv_c4 AS SELECT id, mv_c4_nested(v) AS v FROM mv_c4_base;
+CREATE UNIQUE INDEX ON mv_c4(id);
+SELECT * FROM mv_c4 ORDER BY id;
+ id | v 
+----+---
+  1 | 1
+  2 | 2
+  3 | 3
+  4 | 4
+  5 | 5
+(5 rows)
+
+-- Both refresh paths are exercised, but only one of them is the guard, and
+-- saying which is the point of this comment.  Against the unfixed code the
+-- Query-tree arm below fails deterministically and the classic arm passes: the
+-- free happens on both, but the classic path hands SPI its plan pointer once
+-- and never re-reads cacheEntry, so the freed plan keeps executing and the
+-- damage surfaces as a garbage query_string or a crash -- neither of which can
+-- be written into an expected file.  The classic arm is coverage of the nested
+-- path, not a detector.  If the Query-tree path is ever removed, this test
+-- stops asserting anything and needs rebuilding, not deleting.
+--
+-- The classic path: predicate deparsed into SQL text, plans built by
+-- SPI_prepare over that text.
+SET matview_partial_refresh_querytree = off;
+SET matview_partial_refresh_optimized = off;
+UPDATE mv_c4_base SET v = 102 WHERE id = 2;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c4 WHERE id = 2;
+SELECT * FROM mv_c4 ORDER BY id;
+ id |  v  
+----+-----
+  1 |   1
+  2 | 102
+  3 |   3
+  4 |   4
+  5 |   5
+(5 rows)
+
+-- And again on the same warmed entry, so this asserts more than the first call
+-- after a cold cache.
+UPDATE mv_c4_base SET v = 103 WHERE id = 3;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c4 WHERE id = 3;
+SELECT * FROM mv_c4 ORDER BY id;
+ id |  v  
+----+-----
+  1 |   1
+  2 | 102
+  3 | 103
+  4 |   4
+  5 |   5
+(5 rows)
+
+-- The Query-tree path.  Before the fix this reported "cannot change
+-- materialized view mv_c4_inner" from a refresh of mv_c4: the enclosing
+-- refresh had picked up the nested one's plan out of the reused entry.
+SET matview_partial_refresh_querytree = on;
+SET matview_partial_refresh_optimized = on;
+UPDATE mv_c4_base SET v = 104 WHERE id = 4;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c4 WHERE id = 4;
+SELECT * FROM mv_c4 ORDER BY id;
+ id |  v  
+----+-----
+  1 |   1
+  2 | 102
+  3 | 103
+  4 | 104
+  5 |   5
+(5 rows)
+
+UPDATE mv_c4_base SET v = 105 WHERE id = 5;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c4 WHERE id = 5;
+SELECT * FROM mv_c4 ORDER BY id;
+ id |  v  
+----+-----
+  1 |   1
+  2 | 102
+  3 | 103
+  4 | 104
+  5 | 105
+(5 rows)
+
+RESET matview_partial_refresh_querytree;
+RESET matview_partial_refresh_optimized;
+-- The nested refresh never committed anything, and must not have: it failed at
+-- the locking step every time.
+SELECT * FROM mv_c4_inner ORDER BY id;
+ id | v 
+----+---
+  1 | 1
+  2 | 2
+  3 | 3
+  4 | 4
+  5 | 5
+(5 rows)
+
+DROP MATERIALIZED VIEW mv_c4;
+DROP MATERIALIZED VIEW mv_c4_inner;
+DROP FUNCTION mv_c4_nested(int);
+DROP TABLE mv_c4_base;
+DROP TABLE mv_c4_inner_base;
