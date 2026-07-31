@@ -24,7 +24,12 @@ PREFIX=${PREFIX:-/home/user/pgsql-opt}
 ITER=${ITER:-40}
 REFRESHERS=${REFRESHERS:-4}
 
-MUTS=${*:-M1 M2 M3 M6}
+# B4 is here on purpose and is not one of the four the oracle misses: it is a
+# DATA mutation that leaves stale rows without deadlocking, which is the only
+# thing that can exercise the end-state assertion p2/p3 gained.  That assertion
+# has never been seen to fail, and an assertion nobody has watched fail is the
+# thing this whole directory exists to distrust.
+MUTS=${*:-M1 M2 M3 M6 B4}
 
 printf '%-8s %-5s %-9s %6s  %s\n' MUT ISSUE VERDICT SECS 'MODE THAT FIRED'
 printf '%s\n' '---------------------------------------------------------------'
@@ -65,8 +70,13 @@ for m in $MUTS pristine; do
 
     # Every mode must have reached a verdict, or a mode that silently stopped
     # running looks exactly like a mode that found nothing.
+    # MODES is the count fuzz.sh actually has.  This was hardcoded to 3 and went
+    # stale the moment `nest` was added -- which would have appended
+    # "[only 4/3 modes ran]" to every row rather than failing, i.e. a staleness
+    # check that itself goes stale.  Derive it.
+    want=$(grep -c '^mode_[a-z0-9]*() {' "$DIR/fuzz.sh")
     ran=$(grep -c '^  \(ok\|FAIL\|SKIP\)' "/tmp/pgt/fz-$m.log" 2>/dev/null || true)
-    [ "$rc" = 2 ] || [ "$ran" -eq 3 ] || detail="$detail [only $ran/3 modes ran]"
+    [ "$rc" = 2 ] || [ "$ran" -ge "$want" ] || detail="$detail [only $ran/$want modes ran]"
     printf '%-8s %-5s %-9s %6s  %s\n' "$m" "$issue" "$verdict" \
         "$(( $(date +%s) - start ))" "$detail"
 done
