@@ -63,12 +63,27 @@ MUTATIONS = {
     # in the same anti-join position.  Their prune is DELETE ... WHERE <scope>
     # AND NOT EXISTS (<new data>), the same statement shape as ours.
     #
-    # Only the 'groupingsets' case can observe it: it is the one shape in the
-    # corpus whose arbiter index is NULLS NOT DISTINCT, and GROUPING SETS is
-    # what puts real NULLs in its key columns.
-    'B4b': ('B4', 'data',
+    # VERIFIED BENIGN on this architecture, which is the interesting part.
+    # Applied to a NULLS NOT DISTINCT matview with a NULL-keyed row in scope,
+    # the row is updated (150 -> 1099) and survives; the corpus reports 0/48
+    # divergences on the case added to catch it.  The upsert and the prune are
+    # ONE statement over ONE snapshot, so the DELETE cannot remove a row the
+    # upsert already modified in the same command -- the upsert wins.
+    #
+    # TimescaleDB's MERGE and DELETE are separate statements: the MERGE commits
+    # its update, then the DELETE re-reads the row and removes it.  Same
+    # operator, opposite outcome, and the only difference is statement fusion.
+    # Worth stating on-list: fusing the upsert and the prune is not merely
+    # fewer scans, it closes a data-loss class that a mature implementation of
+    # this same algorithm shipped.
+    #
+    # The asymmetry with B4 follows: forcing IS NOT DISTINCT FROM *is* a real
+    # bug, because there the two halves disagree -- a NULLS DISTINCT index lets
+    # the upsert insert a duplicate NULL row while the anti-join declines to
+    # clean it up.  The operator only matters when upsert and prune disagree.
+    'B4b': ('B4', 'benign',
             'anti-join always uses plain equality '
-            '(deletes NULL-keyed rows -- TimescaleDB #8151)', [
+            '(benign here -- see above; TimescaleDB #8151)', [
                 ('anti_join_op = indexStruct->indnullsnotdistinct ?\n'
                  '\t\t\t"IS NOT DISTINCT FROM" : "=";',
                  'anti_join_op = "=";', 2),

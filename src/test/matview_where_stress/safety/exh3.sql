@@ -84,6 +84,39 @@ INSERT INTO probe_exh VALUES
                    format('k = %s OR k IS NULL',i%4)
      FROM generate_series(1,12) i$$),
 
+-- Cases 19 and 21 both use a default unique index, which is NULLS DISTINCT --
+-- and there plain equality IS the correct anti-join operator, so neither of
+-- them can observe the operator being chosen wrongly in that direction.  This
+-- case is the same shape as 19 with the index declared NULLS NOT DISTINCT,
+-- where the correct operator is IS NOT DISTINCT FROM instead.
+--
+-- Why it had to exist: mutation B4b forces plain equality everywhere.  On this
+-- index the upsert matches the NULL-keyed row and updates it, while the
+-- anti-join's "nd.k = mv.k" evaluates to NULL, NOT EXISTS holds, and the prune
+-- deletes the row the upsert just wrote -- silent loss on every refresh.  Run
+-- against the corpus as it stood, B4b was MISSED: the only NULLS NOT DISTINCT
+-- shape was 'groupingsets', whose expected verdict is already UNSAFE for an
+-- unrelated reason, so a divergence there is indistinguishable from the
+-- verdict it was always going to get.  TimescaleDB shipped this exact bug and
+-- fixed it in #8151.
+--
+-- The GROUP BY collapses the NULLs, so the matview holds exactly one NULL-keyed
+-- row and the stricter index is satisfiable.
+('23','nullable_key_nd','NULLable unique key, NULLS NOT DISTINCT (the B4b shape)','SAFE',
+ $$CREATE TABLE b(id int primary key, k int, v int);
+   INSERT INTO b SELECT x, CASE WHEN x % 5 = 0 THEN NULL ELSE x % 4 END, x*10
+     FROM generate_series(1,12) x;$$,
+ $$SELECT k, sum(v) AS total FROM b GROUP BY k$$, '(k) NULLS NOT DISTINCT',
+ $$SELECT format('UPDATE b SET v=%s WHERE id=%s',v,i),
+          CASE WHEN i%5 = 0 THEN 'k IS NULL' ELSE format('k = %s',i%4) END
+     FROM generate_series(1,12) i, unnest(ARRAY[0,99]) v
+   UNION ALL SELECT format('UPDATE b SET k=NULL WHERE id=%s',i),
+                   format('k = %s OR k IS NULL',i%4)
+     FROM generate_series(1,12) i
+   UNION ALL SELECT format('DELETE FROM b WHERE id=%s',i),
+                   format('k = %s OR k IS NULL',i%4)
+     FROM generate_series(1,12) i$$),
+
 -- Case 19 covers a NULLable key of one column.  This is the composite form,
 -- which is a different shape and not implied by it: the arbiter is (a, bcol)
 -- with only bcol NULLable, so ON CONFLICT has to arbitrate a partly-NULL key
