@@ -9,8 +9,11 @@
 # docs yet, which remains an open review item.
 #
 # With a WHERE clause, CONCURRENTLY selects the direct-modification path, which
-# takes only RowExclusiveLock and relies on a "SELECT ... FOR UPDATE" over the
-# rows matching the predicate to serialize against other partial refreshes.
+# takes only RowExclusiveLock and relies on a "SELECT ... FOR NO KEY UPDATE"
+# over the rows matching the predicate to serialize against other partial
+# refreshes.  FOR NO KEY UPDATE conflicts with itself, which is the whole of
+# what that serialization needs; FOR UPDATE would additionally conflict with
+# FOR KEY SHARE, which nothing takes on a matview.
 # This spec pins down the three claims that follow from that design:
 #
 #   - readers are never blocked;

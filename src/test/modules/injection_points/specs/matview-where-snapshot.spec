@@ -2,7 +2,7 @@
 #
 # A partial refresh is two SPI statements, not one:
 #
-#   1.  SELECT 1 FROM mv WHERE (predicate) ORDER BY key FOR UPDATE
+#   1.  SELECT 1 FROM mv WHERE (predicate) ORDER BY key FOR NO KEY UPDATE
 #   2.  WITH new_data AS MATERIALIZED (SELECT ... WHERE (predicate) ORDER BY key),
 #            upsert AS (INSERT ... ON CONFLICT ... ),
 #            pruned AS (DELETE ... WHERE NOT EXISTS (SELECT FROM new_data))

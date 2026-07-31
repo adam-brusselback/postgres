@@ -12,7 +12,8 @@
 #
 # Instead we read the lock order off the heap.  A refresh blocked partway
 # through its locking SELECT has already locked every row it reached, and a row
-# locked FOR UPDATE carries the locker's xid in xmax -- which any scan can see,
+# locked FOR NO KEY UPDATE carries the locker's xid in xmax -- which any scan
+# can see,
 # committed or not.  So: pin one row in the middle of the predicate's range,
 # send a refresh that covers rows on both sides of it, and read which side has a
 # non-zero xmax.
@@ -28,7 +29,7 @@
 # which one waits -- cannot work: whichever probe succeeds holds a row that the
 # blocked refresh still needs, so the permutation cannot be ordered to terminate
 # in both the fixed and the broken case.  An observer that takes no conflicting
-# lock has no such problem.  (SELECT ... FOR UPDATE is not an option either way:
+# lock has no such problem.  (SELECT ... FOR SHARE is not an option either way:
 # "cannot lock rows in materialized view".)
 #
 # Verified as a detector, not assumed: with the ORDER BY removed from the

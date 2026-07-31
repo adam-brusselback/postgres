@@ -215,7 +215,9 @@ them — so "these two implementations disagree" is a single number with the
 offending mutation and predicate attached.
 
 The Query-tree path does not exist yet, so the two ways are the two that do:
-the bare form (match/merge) against `CONCURRENTLY` (direct modification). They
+the bare form against `CONCURRENTLY`. (Both now run direct modification
+unless the matview carries more than one unique index; when this was written the
+bare form always meant match/merge.) They
 are genuinely different implementations of one contract, and the contract file
 already states they must agree (Promise 7). When the new path lands, the two
 form strings become the two GUC settings and nothing else in the harness

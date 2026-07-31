@@ -428,7 +428,9 @@ CREATE UNIQUE INDEX ON mv_drift2(id);
 -- the new location, so the stale row at the old location is not deleted.
 UPDATE mv_drift2_base SET category_id = 200 WHERE id = 1;
 
--- match/merge (bare spelling) absorbs the collision.
+-- The bare spelling absorbs the collision.  (Both spellings run direct
+-- modification here -- one unique index -- so this is not a routing
+-- difference; it is the upsert matching the drifted row by its key.)
 REFRESH MATERIALIZED VIEW mv_drift2 WHERE category_id = 200;
 SELECT * FROM mv_drift2 ORDER BY id;
 

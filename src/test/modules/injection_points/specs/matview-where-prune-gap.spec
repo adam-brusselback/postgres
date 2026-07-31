@@ -14,7 +14,7 @@
 # says so.
 #
 # Why a new key rather than a changed one.  Overlapping refreshes are ordered by
-# the locking SELECT, which takes FOR UPDATE on the matview rows in scope -- so
+# the locking SELECT, which takes FOR NO KEY UPDATE on the rows in scope -- so
 # a refresh that would change an existing row is made to wait, and cannot be in
 # flight at the same time as another one over the same rows.  A key the matview
 # does not hold yet locks nothing.  A refresh whose scope contains only such
