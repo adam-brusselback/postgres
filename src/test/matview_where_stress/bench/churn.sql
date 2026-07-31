@@ -51,6 +51,13 @@
 
 CREATE TABLE IF NOT EXISTS public.churn_result(
   run_at       timestamptz DEFAULT now(),
+  -- Which server incarnation measured this row.  The container running these
+  -- benchmarks is restarted without warning, and a sweep that straddles a
+  -- restart silently mixes two machines: an earlier comparison across a restart
+  -- showed a uniform 3-38% "regression" that vanished when both arms were
+  -- measured on one boot.  Recording it makes the mix detectable instead of
+  -- something the reader has to remember to worry about.
+  server_start timestamptz DEFAULT pg_postmaster_start_time(),
   workload     text,
   span         int,
   scope_rows   bigint,

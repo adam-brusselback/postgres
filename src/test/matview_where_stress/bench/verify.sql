@@ -81,10 +81,19 @@ checks AS (
                                    FROM r), 'unrecorded'),
          NOT EXISTS (SELECT 1 FROM r WHERE perxact IS NULL)
 
+  -- A sweep that straddles a server restart has measured two machines and
+  -- reported them as one.  That is not hypothetical: a comparison across a
+  -- container restart showed a uniform 3-38% regression, in cells with one
+  -- client and no contention, that vanished entirely once both arms were
+  -- measured on one boot.  Nothing in the numbers themselves shows it.
+  UNION ALL SELECT 11, 'one server incarnation',
+         (SELECT count(DISTINCT server_start) FROM r)::text || ' distinct',
+         (SELECT count(DISTINCT server_start) FROM r) <= 1
+
   -- Not a pass/fail: a run that swept concurrency and found no deadlocks has
   -- said something, and a run that never left one client has not.  Stating
   -- which is which stops the first being read into the second.
-  UNION ALL SELECT 11, 'concurrency exercised',
+  UNION ALL SELECT 12, 'concurrency exercised',
          CASE WHEN (SELECT max(clients) FROM r) > 1
               THEN 'clients up to ' || (SELECT max(clients) FROM r)::text ||
                    ', ' || (SELECT sum(deadlocks) FROM r)::text ||
