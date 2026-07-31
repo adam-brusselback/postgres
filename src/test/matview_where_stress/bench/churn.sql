@@ -213,7 +213,9 @@ BEGIN
           VALUES (w.id, span, scope, pct, actual, opt, 5, round(us, 1));
       END LOOP;
     END LOOP;
-    VACUUM (ANALYZE) bench.mv;
+    -- No VACUUM here: it cannot run inside a DO block.  Bloat is handled by
+    -- taking the best of five (mutate, refresh) pairs rather than the mean, so
+    -- the least-bloated iteration is the one reported.
   END LOOP;
   RESET matview_partial_refresh_optimized;
 END $outer$;
