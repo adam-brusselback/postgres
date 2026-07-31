@@ -11,6 +11,7 @@
 --   concurrently  direct modification, whatever the GUC currently says
 --   spi           direct modification from the view's deparsed SQL text
 --   querytree     direct modification from the view's Query tree
+--   qtopt         the same, with matview_partial_refresh_optimized on
 --
 -- bare vs concurrently is the pair that existed before Phase 2 and is what
 -- this harness was verified on.  spi vs querytree is what it was built for:
@@ -35,14 +36,14 @@ CREATE OR REPLACE FUNCTION run_diff(p_id text, p_a text, p_b text) RETURNS text
 LANGUAGE plpgsql AS $fn$
 DECLARE
   c probe_exh; m record; n bigint;
-  conc_a text; conc_b text; qt_a text; qt_b text;
+  conc_a text; conc_b text; qt_a text; qt_b text; opt_a text; opt_b text;
   tot int := 0; bad int := 0; ea int := 0; eb int := 0;
   fm text; fp text; fd bigint;
 BEGIN
   SELECT * INTO c FROM public.probe_exh WHERE id = p_id;
 
-  IF p_a NOT IN ('bare','concurrently','spi','querytree')
-     OR p_b NOT IN ('bare','concurrently','spi','querytree') THEN
+  IF p_a NOT IN ('bare','concurrently','spi','querytree','qtopt')
+     OR p_b NOT IN ('bare','concurrently','spi','querytree','qtopt') THEN
     RAISE EXCEPTION 'unknown refresh form: % / %', p_a, p_b;
   END IF;
 
@@ -51,8 +52,14 @@ BEGIN
 
   -- Only the two named forms move the GUC; 'concurrently' leaves whatever the
   -- session already had, so an outer PGOPTIONS setting still means something.
-  qt_a := CASE p_a WHEN 'querytree' THEN 'on' WHEN 'spi' THEN 'off' END;
-  qt_b := CASE p_b WHEN 'querytree' THEN 'on' WHEN 'spi' THEN 'off' END;
+  qt_a := CASE WHEN p_a IN ('querytree','qtopt') THEN 'on'
+               WHEN p_a = 'spi' THEN 'off' END;
+  qt_b := CASE WHEN p_b IN ('querytree','qtopt') THEN 'on'
+               WHEN p_b = 'spi' THEN 'off' END;
+  opt_a := CASE WHEN p_a = 'qtopt' THEN 'on'
+                WHEN p_a IN ('querytree','spi') THEN 'off' END;
+  opt_b := CASE WHEN p_b = 'qtopt' THEN 'on'
+                WHEN p_b IN ('querytree','spi') THEN 'off' END;
 
   FOR m IN EXECUTE 'SELECT * FROM (' || c.mutspace || ') s(mut, pred)' LOOP
     tot := tot + 1;
@@ -83,6 +90,9 @@ BEGIN
       BEGIN
         IF qt_a IS NOT NULL THEN
           EXECUTE 'SET matview_partial_refresh_querytree = ' || qt_a;
+          IF opt_a IS NOT NULL THEN
+            EXECUTE 'SET matview_partial_refresh_optimized = ' || opt_a;
+          END IF;
         END IF;
         EXECUTE 'REFRESH MATERIALIZED VIEW ' || conc_a || 'probe.mv_a WHERE ' || m.pred;
       EXCEPTION WHEN OTHERS THEN ea := ea + 1;
@@ -90,6 +100,9 @@ BEGIN
       BEGIN
         IF qt_b IS NOT NULL THEN
           EXECUTE 'SET matview_partial_refresh_querytree = ' || qt_b;
+          IF opt_b IS NOT NULL THEN
+            EXECUTE 'SET matview_partial_refresh_optimized = ' || opt_b;
+          END IF;
         END IF;
         EXECUTE 'REFRESH MATERIALIZED VIEW ' || conc_b || 'probe.mv_b WHERE ' || m.pred;
       EXCEPTION WHEN OTHERS THEN eb := eb + 1;

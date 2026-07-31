@@ -14,7 +14,7 @@
 #   --scales     100000,1000000             base table rows
 #   --groups     1000                       distinct key values
 #   --spans      1,10,100                   keys per refresh
-#   --forms      conc,bare                  conc | bare | spi | querytree
+#   --forms      conc,bare                  conc | bare | spi | querytree | qtopt
 #                                           spi and querytree are both direct
 #                                           modification, with the Query-tree
 #                                           implementation off and on.  Measure
@@ -160,13 +160,15 @@ for w in $(list "$WORKLOADS"); do
      # modification; spi and querytree additionally pin which implementation of
      # it runs, so the two can be measured against each other on one binary.
      CONC=$([ "$form" = bare ] && echo '' || echo 'CONCURRENTLY ')
-     QT=$(case "$form" in querytree) echo on;; spi) echo off;; *) echo '';; esac)
+     QT=$(case "$form" in querytree|qtopt) echo on;; spi) echo off;; *) echo '';; esac)
+     OPT=$(case "$form" in qtopt) echo on;; querytree|spi) echo off;; *) echo '';; esac)
      for nc in $(list "$CLIENTS"); do
       for ov in $(list "$OVERLAP"); do
        S="$TMP/s.bench"
        {
          echo "SET synchronous_commit = $SYNC;"
          [ -n "$QT" ] && echo "SET matview_partial_refresh_querytree = $QT;"
+         [ -n "$OPT" ] && echo "SET matview_partial_refresh_optimized = $OPT;"
          if [ "$ov" = disjoint ]; then
            echo "\\set slice greatest(1, :keymax / :nclients)"
            echo "\\set k (:client_id * :slice) + random(1, greatest(1, :slice - :span))"

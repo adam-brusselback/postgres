@@ -62,6 +62,7 @@
 
 /* See matview.h.  Branch-local scaffolding for the Query-tree rewrite. */
 bool		matview_partial_refresh_querytree = false;
+bool		matview_partial_refresh_optimized = false;
 
 /*
  * Name the materialised source rows are registered under for the SQL that
@@ -101,6 +102,11 @@ typedef struct MatViewPartialRefreshCache
 								 * parameter as "$n" with no type, so two
 								 * clauses can be textually identical and still
 								 * need different plans */
+
+	bool		optimized;		/* was matview_partial_refresh_optimized set
+								 * when these plans were built?  It changes the
+								 * generated SQL, so a plan built one way is
+								 * wrong for the other */
 
 	bool		querytree;		/* was matview_partial_refresh_querytree set
 								 * when these plans were built?  The two paths
@@ -1329,6 +1335,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	int			old_depth;
 	Oid			old_relid;
 	bool		use_querytree = matview_partial_refresh_querytree;
+	bool		use_optimized = matview_partial_refresh_querytree &&
+		matview_partial_refresh_optimized;
 	int			nkeyatts = 0;
 	int16	   *keyattnums = NULL;
 	Tuplestorestate *sourceStore = NULL;
@@ -1400,6 +1408,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	if (found &&
 		cacheEntry->uniqueIndexOid == uniqueIndexOid &&
 		cacheEntry->querytree == use_querytree &&
+		cacheEntry->optimized == use_optimized &&
 		cacheEntry->whereClauseStr != NULL &&
 		whereClauseStr != NULL &&
 		strcmp(cacheEntry->whereClauseStr, whereClauseStr) == 0 &&
@@ -1429,6 +1438,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		cacheEntry->nargs = 0;
 		cacheEntry->argtypes = NULL;
 		cacheEntry->querytree = use_querytree;
+		cacheEntry->optimized = use_optimized;
 		cacheEntry->invalid = false;
 	}
 
@@ -1488,6 +1498,9 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		TupleDesc	tupdesc = matviewRel->rd_att;
 		StringInfoData conflict_cols;
 		StringInfoData set_clause;
+		StringInfoData mv_cols;
+		StringInfoData excluded_cols;
+		bool		first_distinct = true;
 		StringInfoData join_clause;
 		const char *anti_join_op;
 		bool		first;
@@ -1533,6 +1546,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 			"IS NOT DISTINCT FROM" : "=";
 
 		initStringInfo(&conflict_cols);
+		initStringInfo(&mv_cols);
+		initStringInfo(&excluded_cols);
 		initStringInfo(&set_clause);
 		initStringInfo(&join_clause);
 
@@ -1589,6 +1604,26 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 
 			quoted = quote_identifier(NameStr(attr->attname));
 			appendStringInfo(&set_clause, "%s = EXCLUDED.%s", quoted, quoted);
+
+			/*
+			 * The same columns again, as a row comparison, so the upsert can
+			 * skip a row whose values did not change.  ON CONFLICT DO UPDATE
+			 * writes a new row version whether or not anything differs, and
+			 * a partial refresh re-reads scopes that are mostly unchanged --
+			 * a drain re-refreshing a key it already caught up on writes the
+			 * whole scope again for nothing.
+			 *
+			 * Non-key columns only: the key columns are what the row was
+			 * matched on, so they are equal by construction.
+			 */
+			if (!first_distinct)
+			{
+				appendStringInfoString(&mv_cols, ", ");
+				appendStringInfoString(&excluded_cols, ", ");
+			}
+			first_distinct = false;
+			appendStringInfo(&mv_cols, "%s.%s", matview_alias, quoted);
+			appendStringInfo(&excluded_cols, "EXCLUDED.%s", quoted);
 		}
 
 		index_close(indexRel, AccessShareLock);
@@ -1670,7 +1705,12 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 						 matview_name, conflict_cols.data);
 
 		if (has_non_key_cols)
+		{
 			appendStringInfo(&buf, "UPDATE SET %s ", set_clause.data);
+			if (use_optimized)
+				appendStringInfo(&buf, "WHERE (%s) IS DISTINCT FROM (%s) ",
+								 mv_cols.data, excluded_cols.data);
+		}
 		else
 			appendStringInfoString(&buf, "NOTHING ");
 
@@ -1712,6 +1752,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		pfree(buf.data);
 		pfree(conflict_cols.data);
 		pfree(set_clause.data);
+		pfree(mv_cols.data);
+		pfree(excluded_cols.data);
 		pfree(join_clause.data);
 		if (argtypes != NULL)
 			pfree(argtypes);
