@@ -41,7 +41,7 @@ Two traps worth naming, because both have caught this document before:
 | axis | values | selects | evidence |
 |---|---|---|---|
 | **scope** | 1 · small · large · near-total | prune elision; whether fixed costs matter at all | measured, **share of refresh time** (locates work, does not judge it): source planning 16.2% → 0.9% → 0.0% at scope 1/100/10k, while the fused DML goes 52% → 58% → **87%**. So fixed costs only matter at scope 1, and at scale there is nowhere to look but the DML |
-| **predicate shape** | equality on all arbiter key columns · array · range · non-key | at-most-one-row proofs; whether the index supplies the lock order | measured, 94 comparisons: forcing a generic plan is **21.7% slower** overall, but the spread is the point — **36–64% faster** on range/scope-1, **55% slower** on array/scope-10000. `ORDER BY` on the pre-lock is free when the arbiter index matches the predicate column and **3.6× slower** when not, because it hands `LockRows` the heap in random rather than physical order |
+| **predicate shape** | equality on all arbiter key columns · array · range · non-key | at-most-one-row proofs; whether the index supplies the lock order | measured, 94 comparisons: forcing a generic plan is **21.7% slower** overall, but the spread is the point — **36–64% faster** on range/scope-1, **55% slower** on array/scope-10000. `ORDER BY` on the pre-lock costs **4–26% of the pre-lock when aligned** and **20–69% when not**, growing with scope on `nonkey` (20 → 35 → 56% at scope 100 → 1000 → 10000). It is not free even when aligned — it is *invisible*, because the pre-lock is only 12–15% of a refresh |
 | **index shape** | do the updated columns sit under any index? | whether an avoided write saves index maintenance or just a HOT update | measured: the row comparison is **27–53% faster** with a covering index and **makes no difference at all** without one. Treat the magnitude as an upper bound — it was measured fresh-heap (see below) — but not the presence/absence result, which compares two arms that both write |
 | **churn fraction** | share of the scope whose values actually changed | whether the row comparison pays | measured, `bench/churn.sql`, on `nonkey`/scope 10000 — **faster is better, and it runs out**: **54–56% faster** at churn 0, then 41–51 → 27–36 → 18–27 → **≈0%** at churn 5/25/50/100 (ranges are two protocols disagreeing). At full churn every comparison fails and the row-wise `IS DISTINCT FROM` is bought for nothing. Break-even ≈ 60–70% churn |
 | **heap state** | never-updated · settled · bloated | nothing about the code — it decides the *measured* value of everything above | measured, `bench/heapstate.sh`: one comparison reads **"54% faster" or "82% faster"** on identical code, data and boot. Neither number is better than the other; **54% is the honest one.** At zero churn only the un-optimized arm writes, so free space, full-page images, extension and bloat all land on one side of the ratio, and a matview `bench_setup` has just built is that arm's worst case |
@@ -193,7 +193,7 @@ is better everywhere in it, and a *slower* entry is spelled out as such.
 | **stop deparsing for the cache key** — store the qual tree, compare with `equal()`, deparse only on a miss | — | **4.5–5.3 µs faster** per refresh, **7.4%** at scope 1, again fixed. Closes **B3**: the tree carries parameter types, `$1` does not | `matview_where_cache` Test 4, already two predicates that deparse identically and need different plans |
 | **parameterise predicate `Const`s** | — | **8× faster**, by turning refreshes that would miss the plan cache into hits | oracle. Changes what the cache key *is*, so it lands first or last, never in the middle |
 | **skip the prune** when the source is **empty** — the non-empty case is now covered by derived `no_delete` below, which needs no at-most-one-row proof | 1 + 2 | unmeasured. It is the mirror of the row above — the row-trigger delete path — and it applies at *any* scope | **none yet** — see 3c |
-| **drop both `ORDER BY`s** | 1 | small, and only in the aligned case, where the index already supplies the order | oracle |
+| **drop the pre-lock's `ORDER BY`** — *not* the source's, and gated on the **lock level**, not on index alignment | 1 | **1–9% faster**, best where the predicate column is not the arbiter's leading column and the scope is large (9.4% on `nonkey`/scope 10000). Dropping the *source* `ORDER BY` as well is a **regression of 2–5%** below scope 10000 — it hands the upsert its rows in random index order | oracle, plus an isolation permutation showing two refreshes deadlocking if it is dropped under `RowExclusiveLock` |
 | **drop the prune** — `no_delete`, now **derived** rather than declared: `n_locked + n_inserted == n_source` means nothing in scope is orphaned | **2**, not 4 | **13–19% faster** at scope ≥1000, measured *on top of* the row comparison rather than instead of it; only **1.1% faster** on `expensive`, where GIN maintenance dominates | oracle, plus the `mutations.py` entry that forces the elision when the counts do *not* agree |
 | **`DO NOTHING`** (`append_only`) — the half that cannot be derived, because no count taken during a refresh proves existing rows never need rewriting | 4 | a further **10–22 points** on top of `no_delete`, taking the pair to **26–39% faster** at scope ≥1000 | sampling verifier, plus a `mutations.py` entry declaring `append_only` on a view that updates |
 
@@ -256,6 +256,11 @@ concurrency gain that will never appear in a single-client sweep.
   which is far from where the current scope-based gate sits; the gate was right
   by correlation and should stop relying on it.
 - `Const` parameterisation after that, since it redefines the cache key.
+- The pre-lock `ORDER BY` elision whenever the bare form is being worked on
+  anyway. It is 1–9%, it is a one-line condition on the lock level rather than
+  on anything about the predicate, and it is the only thing so far that cashes
+  in §4's `ExclusiveLock`. Do **not** extend it to the source `ORDER BY`, which
+  is a 2–5% regression below scope 10000.
 - `append_only` **last, or never**. It is worth 10–22 points faster on top of
   `no_delete`, which is real, but it is the only item left that needs a
   declaration — and a declaration whose failure mode is rows that silently
@@ -283,10 +288,24 @@ reach the general algorithm when the matview has at most one unique index, and
 
 The middle row is the load-bearing one, and the reason it is a lock level rather
 than a reloption is §2's Tier 4 argument in miniature: the lock *enforces* the
-condition the specialisation needs, where a declaration would merely *assert*
-it. Nothing exploits that precondition yet. It is recorded here so that the lock
-level is understood as an enabling choice rather than a conservative one, and so
-that anything later built on it can point at where the guarantee comes from.
+condition the specialisation needs, where a declaration merely *asserts* it.
+
+**The first thing to exploit it is the pre-lock's `ORDER BY`.** That clause is
+not there for speed; it gives two refreshes with overlapping scopes a
+deterministic order to take rows in, so they queue instead of deadlocking. Under
+`ExclusiveLock` there is no second refresh to deadlock with — verified rather
+than assumed: a held `ExclusiveLock` blocks both `RowExclusiveLock` (a
+`CONCURRENTLY` partial refresh) and another `ExclusiveLock` (a second bare one),
+while still admitting `AccessShareLock` readers. So for the bare form the
+ordering has no job, and dropping it is worth **1–9%**, most where the predicate
+column is not the arbiter's leading column and the scope is large.
+
+That is a small win, and it is the *shape* of it that matters: the saving is
+available exactly where it cannot be taken safely without the lock. Under
+`RowExclusiveLock` the same elision is a deadlock generator. A reloption saying
+"I never run refreshes concurrently" would have unlocked the same 1–9% and been
+wrong the first time someone ran two — which is §3e's argument arriving from the
+other direction, with a number attached.
 
 ---
 
