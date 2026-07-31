@@ -50,6 +50,30 @@ MUTATIONS = {
                 'anti_join_op = "IS NOT DISTINCT FROM";', 2),
            ]),
 
+    # The other half of B4's fix.  B4 forces IS NOT DISTINCT FROM everywhere and
+    # duplicates NULL-keyed rows; this forces plain equality everywhere and
+    # DELETES them -- on an index declared NULLS NOT DISTINCT the upsert matches
+    # a NULL-keyed row and updates it, while the anti-join's "nd.k = mv.k"
+    # evaluates to NULL, so NOT EXISTS holds and the prune removes the row the
+    # upsert just wrote.  Silent data loss, every refresh.
+    #
+    # Not invented: TimescaleDB shipped exactly this in their continuous
+    # aggregate refresh and fixed it in #8151 ("Treat null equal to null for
+    # merged CAgg refresh"), a one-line change from "=" to IS NOT DISTINCT FROM
+    # in the same anti-join position.  Their prune is DELETE ... WHERE <scope>
+    # AND NOT EXISTS (<new data>), the same statement shape as ours.
+    #
+    # Only the 'groupingsets' case can observe it: it is the one shape in the
+    # corpus whose arbiter index is NULLS NOT DISTINCT, and GROUPING SETS is
+    # what puts real NULLs in its key columns.
+    'B4b': ('B4', 'data',
+            'anti-join always uses plain equality '
+            '(deletes NULL-keyed rows -- TimescaleDB #8151)', [
+                ('anti_join_op = indexStruct->indnullsnotdistinct ?\n'
+                 '\t\t\t"IS NOT DISTINCT FROM" : "=";',
+                 'anti_join_op = "=";', 2),
+            ]),
+
     'B6': ('B6', 'data',
            'arbitrate on the wrong unique index (drop the primary-key '
            'preference)', [

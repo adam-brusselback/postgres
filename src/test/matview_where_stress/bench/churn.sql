@@ -149,6 +149,12 @@ BEGIN
   RETURN round(best, 1);
 END $fn$;
 
+\if :{?optimized}
+\else
+\echo 'usage: psql -v workload=<w> -v optimized=<true|false> -f churn.sql'
+\quit
+\endif
+
 SELECT set_config('churn.workload', :'workload', false);
 SELECT bench_setup(:'workload', 100000, 1000);
 VACUUM (ANALYZE) bench.mv;
@@ -170,7 +176,14 @@ BEGIN
                                 ':groups', '1000') || ')::bigint' INTO keymaxv;
   SELECT count(*) INTO mvrows FROM bench.mv;
 
-  FOREACH span IN ARRAY ARRAY[1, 10, 100] LOOP
+  -- Span 100 and up only.  The mutations pick their fraction with
+  -- "key %% 100 < churn", which cannot partition a 1- or 10-key range
+  -- proportionally: at span 10 a requested 10% came out as 90%, and at span 1
+  -- every non-zero request came out as 100%.  That last one is not a harness
+  -- limitation but a fact about the axis -- at scope 1 churn is binary, the row
+  -- changed or it did not -- which is worth stating rather than measuring
+  -- badly.
+  FOREACH span IN ARRAY ARRAY[100, 500] LOOP
     CONTINUE WHEN span >= keymaxv;
     IF span = 1 THEN pred := replace(w.pred1, ':k', '1');
     ELSE pred := replace(replace(w.predr, ':k', '1'), ':span', span::text);
@@ -185,7 +198,12 @@ BEGIN
     -- row comparison's best case; 100 is its worst.  The interesting question
     -- is where between them it stops paying.
     FOREACH pct IN ARRAY ARRAY[0, 1, 10, 50, 100] LOOP
-      FOREACH opt IN ARRAY ARRAY[false, true] LOOP
+      -- One setting per invocation, not both in one loop.  Running them in a
+      -- loop measured the second one on a table the first had already bloated,
+      -- and since the order was fixed that bias always fell on the same
+      -- setting: it turned a +82.5% win into a -28.5% loss.  The caller runs
+      -- this file once per setting with a VACUUM in between.
+      FOREACH opt IN ARRAY ARRAY[:optimized] LOOP
         -- Rebuild the scope from the view so both settings meet the same data:
         -- the previous iteration's refresh already absorbed its own mutation.
         EXECUTE 'REFRESH MATERIALIZED VIEW CONCURRENTLY bench.mv WHERE ' || pred;
