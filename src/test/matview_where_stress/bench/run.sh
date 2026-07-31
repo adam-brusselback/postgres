@@ -288,7 +288,8 @@ for w in $(list "$WORKLOADS"); do
                  SELECT '$LABEL','$VER','$ASSERT','$w',\$\$$ISO\$\$,
                    $scale,$GROUPS,$MVROWS,'$form','$shape',$span,
                    NULLIF($SCOPE,0),$nc,'$ov',$([ "$MUTATE" = on ] && echo true || echo false),'$SYNC',
-                   $PERXACT, $BEST_TPS, $BEST_LAT, $BEST_TXN, $FULL,
+                   $PERXACT, $BEST_TPS, $BEST_LAT, $BEST_TXN,
+                   $TOT_F, $TOT_DL, $TOT_SF, $FULL,
                    round(($BEST_LAT * 1000.0) / NULLIF($SCOPE,0), 3),
                    round((($BEST_LAT * 1000.0) / NULLIF($SCOPE,0))
                          / NULLIF(($FULL * 1000.0) / NULLIF($MVROWS,0), 0), 2)" >/dev/null
