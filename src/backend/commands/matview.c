@@ -116,7 +116,7 @@ typedef struct MatViewPartialRefreshCache
 								 * one is wrong for the other */
 
 	/* The cached plans */
-	SPIPlanPtr	lockPlan;		/* SELECT FOR UPDATE */
+	SPIPlanPtr	lockPlan;		/* SELECT ... FOR NO KEY UPDATE */
 	SPIPlanPtr	refreshPlan;	/* Fused CTE: Evaluate -> Upsert -> Delete */
 
 	bool		invalid;		/* set by the relcache callback; the entry is
@@ -583,7 +583,7 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
  *
  * 1. Partial non-concurrent (WHERE clause, no CONCURRENTLY):
  * Directly modifies the matview in-place using a two-step approach
- * (SELECT FOR UPDATE followed by a CTE upsert/delete).
+ * (SELECT ... FOR NO KEY UPDATE followed by a CTE upsert/delete).
  * Uses RowExclusiveLock, allowing concurrent reads and concurrent writes
  * to non-overlapping rows. Overlapping writes are serialized by row locks.
  *
@@ -1420,7 +1420,8 @@ matview_materialize_source(Query *sourceQuery, ParamListInfo params,
  * Concurrency is handled in two steps, each executed as a separate SPI
  * statement:
  *
- * 1. Lock existing rows matching the WHERE clause via SELECT FOR UPDATE.
+ * 1. Lock existing rows matching the WHERE clause via SELECT ... FOR NO KEY
+ * UPDATE.
  *    This serializes concurrent partial refreshes that touch overlapping
  *    rows while allowing non-overlapping refreshes to proceed in parallel.
  *
@@ -1790,9 +1791,27 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		Assert(join_clause.len > 0);
 
 		/*
-		 * Prepare the row-locking statement.  This acquires FOR UPDATE locks
-		 * on matview rows matching the WHERE clause to serialize concurrent
+		 * Prepare the row-locking statement.  This acquires row locks on the
+		 * matview rows matching the WHERE clause to serialize concurrent
 		 * partial refreshes on overlapping rows.
+		 *
+		 * FOR NO KEY UPDATE rather than FOR UPDATE.  The two are equally good
+		 * at the job this statement exists for -- FOR NO KEY UPDATE conflicts
+		 * with itself, so two refreshes over overlapping scopes still order
+		 * against each other, which is the property that stops the second one
+		 * evaluating its source from a snapshot taken before the first commits
+		 * and then writing a stale value over it.  What FOR UPDATE adds is a
+		 * conflict with FOR KEY SHARE, and it takes the key-exclusive tuple
+		 * lock rather than the weaker one the following update actually needs:
+		 * the upsert's DO UPDATE sets non-key columns only, because the key
+		 * columns are what it matched on, so it is by construction a no-key
+		 * update.  Taking the stronger lock first only escalates what has to be
+		 * recorded in xmax.
+		 *
+		 * The prune may still DELETE a row this locked, which needs the
+		 * stronger lock.  That upgrade cannot block or deadlock: this
+		 * transaction already holds a conflicting lock on the row, so no other
+		 * transaction can be holding one to wait for.
 		 *
 		 * Lock in a fixed order so that two refreshes whose predicates overlap
 		 * cannot take the same rows in opposite orders and deadlock.  When the
@@ -1801,7 +1820,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		 */
 		initStringInfo(&buf);
 		appendStringInfo(&buf,
-						 "SELECT 1 FROM %s mv WHERE (%s) ORDER BY %s FOR UPDATE",
+						 "SELECT 1 FROM %s mv WHERE (%s) ORDER BY %s "
+						 "FOR NO KEY UPDATE",
 						 matview_name, whereClauseStr, conflict_cols.data);
 
 		cacheEntry->lockPlan = SPI_prepare(buf.data, nargs, argtypes);
