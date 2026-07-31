@@ -10,6 +10,17 @@
 -- live in their own file to keep that state predictable, and they must run in
 -- the order written.
 --
+-- Every partial refresh here says CONCURRENTLY, and that is load-bearing rather
+-- than stylistic.  RefreshMatViewByOid dispatches on `qual && concurrent`, so
+-- only the CONCURRENTLY form reaches refresh_by_direct_modification() -- the one
+-- path that caches anything.  The bare form goes to refresh_by_match_merge(),
+-- which builds its SQL fresh on every call through matview_execute_spi().
+-- These tests were written before commit 0607847 swapped which form takes which
+-- path, and they were not updated with it, so for a while every one of them
+-- exercised the uncached path: they asserted that a cached plan is invalidated
+-- correctly, against a code path that caches no plans.  They passed, because
+-- there was nothing there to break.  A test that cannot fail is not a guard.
+--
 -- None of the cases in this file were reported on -hackers; the plan cache had
 -- not come up in the thread "[Patch] Add WHERE clause support to REFRESH
 -- MATERIALIZED VIEW" at all.  They were found by reviewing the cache against
@@ -46,13 +57,13 @@ CREATE MATERIALIZED VIEW mv_c AS SELECT id, v FROM mv_c_base;
 CREATE UNIQUE INDEX ON mv_c(id);
 
 -- Warm the cache for this matview and this predicate.
-REFRESH MATERIALIZED VIEW mv_c WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c WHERE id = 1;
 
 ALTER MATERIALIZED VIEW mv_c RENAME TO mv_c_renamed;
 UPDATE mv_c_base SET v = 'one-updated' WHERE id = 1;
 
 -- Must succeed and pick up the new value.
-REFRESH MATERIALIZED VIEW mv_c_renamed WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c_renamed WHERE id = 1;
 SELECT * FROM mv_c_renamed ORDER BY id;
 
 --
@@ -70,7 +81,7 @@ CREATE MATERIALIZED VIEW mv_c AS SELECT id, v FROM mv_c_decoy_base;
 CREATE UNIQUE INDEX ON mv_c(id);
 
 -- Refresh the *original* matview, by its current name.
-REFRESH MATERIALIZED VIEW mv_c_renamed WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c_renamed WHERE id = 1;
 
 -- The matview that was named is the one that moved.
 SELECT * FROM mv_c_renamed ORDER BY id;
@@ -99,7 +110,7 @@ CREATE MATERIALIZED VIEW mv_c2 AS SELECT id, v FROM mv_c2_base;
 CREATE UNIQUE INDEX ON mv_c2(id);
 
 -- Warm the cache.
-REFRESH MATERIALIZED VIEW mv_c2 WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c2 WHERE id = 1;
 
 ALTER TABLE mv_c2_base RENAME TO mv_c2_base_old;
 CREATE TABLE mv_c2_base (id int primary key, v text);
@@ -108,7 +119,7 @@ INSERT INTO mv_c2_base VALUES (1, 'decoy');
 -- mv_c2 is still defined over mv_c2_base_old.
 SELECT pg_get_viewdef('mv_c2'::pg_catalog.regclass);
 
-REFRESH MATERIALIZED VIEW mv_c2 WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c2 WHERE id = 1;
 
 -- Filled from the table the view definition names, not from the one that took
 -- over its name.
@@ -137,7 +148,7 @@ SELECT * FROM mv_c3 ORDER BY id;
 
 -- Warm the cache with an int4 parameter.
 DO $$ BEGIN
-  EXECUTE 'REFRESH MATERIALIZED VIEW mv_c3 WHERE id = $1' USING 1::int;
+  EXECUTE 'REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c3 WHERE id = $1' USING 1::int;
 END $$;
 
 UPDATE mv_c3_base SET v = 'new-small' WHERE id = 1;
@@ -146,7 +157,7 @@ UPDATE mv_c3_base SET v = 'new-large' WHERE id = 4294967297;
 -- Same deparsed predicate, but an int8 parameter.  4294967297 has 1 in its low
 -- 32 bits, so a plan expecting int4 reads the argument as 1.
 DO $$ BEGIN
-  EXECUTE 'REFRESH MATERIALIZED VIEW mv_c3 WHERE id = $1' USING 4294967297::bigint;
+  EXECUTE 'REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c3 WHERE id = $1' USING 4294967297::bigint;
 END $$;
 
 -- id = 4294967297 is the row that moved; id = 1 is untouched.  Before the fix
@@ -154,7 +165,9 @@ END $$;
 -- selected row 1.
 SELECT * FROM mv_c3 ORDER BY id;
 
--- The match/merge path builds its SQL fresh every time, so it is unaffected.
+-- Reset to a known state with a full refresh, which takes neither the partial
+-- path nor its cache, then confirm the fix holds for a second call on the same
+-- warmed entry rather than only for the first one after it.
 REFRESH MATERIALIZED VIEW mv_c3;
 UPDATE mv_c3_base SET v = 'concurrent-large' WHERE id = 4294967297;
 DO $$ BEGIN

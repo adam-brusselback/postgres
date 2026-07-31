@@ -105,6 +105,23 @@ MUTATIONS = {
     # A5 and M1 are the same edit.  A5 is the issue; M1 was the name it went by
     # in the B17 mutation matrix.  Keeping both names avoids a rename in the
     # calibration table, but they are one mutation and should be reported once.
+    # Not a bug that shipped -- it is the guard for matview_where_cache.
+    #
+    # Tests 1 to 3 in that file assert that a cached plan is thrown away when
+    # the relation it names is renamed or replaced.  For a long stretch they
+    # asserted nothing at all: every refresh in them was the bare form, and
+    # commit 0607847 had swapped the bare form onto refresh_by_match_merge(),
+    # which caches nothing.  They passed because there was no cache in the way.
+    # Having fixed that, the question is whether they can now FAIL, and this is
+    # how that gets answered: drop the relcache callback and the stale entry
+    # survives the rename.  If matview_where_cache stays green with C1 applied,
+    # the file is still not a guard and the fix did not finish the job.
+    'C1': ('-', 'cache',
+           'never invalidate the partial-refresh plan cache', [
+               ('\tCacheRegisterRelcacheCallback(InvalidateMatViewCache, (Datum) 0);',
+                '\t/* C1: callback not registered */'),
+           ]),
+
     'M1': ('A5', 'concur',
            'drop ORDER BY from the row-locking SELECT (deadlock)', [
                ('"SELECT 1 FROM %s mv WHERE (%s) ORDER BY %s FOR UPDATE"',
