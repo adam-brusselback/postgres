@@ -9,11 +9,21 @@ things that do not belong in the patch itself:
                 change safely, the change itself (string-built SQL through SPI
                 -> Query trees), the performance work that only makes sense
                 afterwards, and the path from there to a posted patch.  Read
-                this second.  Phase 1 is complete; Phase 2 is next.
+                this second.  Phase 1 is complete, Phase 2 is decided and
+                done for this cycle, and "Where we are" names the six steps
+                that remain and which of them gate the others.
 
   ISSUES.md     Review items, split into those raised on the -hackers thread
-                (A1-A9) and those found separately (B1-B20), each mapped to the
+                (A1-A9) and those found separately (B1-B25), each mapped to the
                 test that covers it.  Start here.
+
+  CACHE.md      The subplan behind PLAN.md 3.7: cache the source plan, on an
+                invalidation corrected first.  What is being cached and the one
+                line it replaces, the plancache API that fits and its in-tree
+                precedent, why B2's restructure comes first, five steps each
+                with the check that must go red before it goes green, and the
+                measurement decided in advance.  Read this when picking the
+                work back up.
 
   SAFETY.md     Which predicates are safe, established by differential testing
                 rather than by argument.  Five independent failure modes, what

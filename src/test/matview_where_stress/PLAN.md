@@ -19,6 +19,27 @@ happened in.
 
 **Phases 4–7 — untouched.**
 
+### What is next, in order
+
+The decision to ship (b) is **not yet true of the default configuration**: both
+`matview_partial_refresh_*` GUCs boot `false`, so a default build still takes
+the text path. Six steps close that, and the first three are one piece of work:
+
+| | | state |
+|---|---|---|
+| 1 | **3.7 — cache the source plan**, on a corrected invalidation | **next**; the subplan is **CACHE.md** |
+| 2 | flip the querytree default, re-run the differential harness and the benchmark sweep (2.1b) | blocked on 1 |
+| 3 | B2 / the invalidation restructure | pulled forward into 1 — CACHE.md §4 |
+| 4 | delete the text path, the two GUCs, and the oracle's A/B axis | blocked on 2 |
+| 5 | B15 — warn, error, or document the blast radius | **needs a decision**, independent |
+| 6 | B25, and derived `no_delete` | independent |
+
+Step 1 gates 2 and 4 because the Query-tree path is **24% slower warm at scope
+1** (R2) until the source plan is cached, and scope-1-warm is where D1 and D2
+live. Step 4 goes last on purpose: `safety/diff_driver.sql` compares the `text`,
+`qt` and `qtopt` arms, so deleting the GUCs deletes the oracle's comparison axis.
+They are scaffolding, but they are the scaffolding the safety net hangs from.
+
 ### Which document owns what
 
 Two facts have now been re-derived because they were recorded in one file and
@@ -38,6 +59,7 @@ and one produced a wrong correction. So:
 | blast radius and the static-check question | **SAFETY.md** |
 | what the feature is for, and its driver patterns | **USE-CASES.md** |
 | commits worth returning to | **RESTORE.md** |
+| the source plan cache: scope, steps, and the invalidation it lands on | **CACHE.md** — the subplan behind 3.7 |
 
 SPECIALIZE.md **cites** the numbers below rather than replacing them, and
 RESULTS.md indexes both. Before re-measuring anything, check RESULTS.md —
@@ -1007,7 +1029,7 @@ Verdicts:
 | | verdict | why |
 |---|---|---|
 | 3.2 parameterise `Const`s | **pursue, largest** | 6.3× on the spi path, 3.8× on the Query-tree path; turns every cold refresh warm |
-| 3.7 cache the source plan | **pursue, required** | 12.20 µs, 22% of a warm Query-tree refresh, and the entire reason it currently loses |
+| 3.7 cache the source plan | **pursue, required — NEXT.  Subplan: CACHE.md** | 12.20 µs, 22% of a warm Query-tree refresh, and the entire reason it currently loses |
 | 3.8 stop deparsing for the key | **pursue** | 4.5-5.3 µs, 9% warm.  Second-order but real, and 2.3 removes the other reason it exists anyway |
 | 3.9 arbiter index scan | **drop** | 0.00-0.08 µs.  0.2% at the very most |
 | 3.10 cache sweep | **drop** | 0.00 µs.  Below the resolution of the timer, at one cache entry |
