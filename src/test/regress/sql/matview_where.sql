@@ -570,13 +570,24 @@ DROP TABLE mv_lock_base;
 --
 -- The direct-modification path resolves collisions with ON CONFLICT against a
 -- single arbiter index, so a row set that needs a delete before an insert to
--- satisfy a *second* unique index cannot be applied that way.  The diff/merge
--- path deletes before inserting and has no such limit, so the bare spelling is
--- the way to apply such a change.  This is a real capability difference between
--- the two forms rather than something either can fix, and it belongs in the
--- documentation.
+-- satisfy a *second* unique index cannot be applied that way.
 --
--- Disposition: keep.  It pins which form can do what, and both halves matter.
+-- This used to be a capability difference between the two spellings: diff/merge
+-- deletes before inserting, so the bare form could apply such a change and
+-- CONCURRENTLY could not.  Diff/merge has since left the predicate path
+-- entirely -- it lost to direct modification at every scope from 10% to 90% of
+-- the matview, by 24-52%, so there was no crossover left to justify carrying a
+-- second algorithm -- and the capability went with it.  NEITHER spelling can
+-- apply this change now; a full refresh is the only way.
+--
+-- That is a real and deliberate loss, and it belongs in the documentation next
+-- to the unique-index requirement.  It is bounded by being loud: the refresh
+-- fails with a unique violation naming the index it could not satisfy, so no
+-- caller silently gets a half-applied change.
+--
+-- Disposition: keep.  It pins a documented limitation of the feature, and it is
+-- the test that would notice if a future statement shape (a scoped delete
+-- before the insert, say) removed the limitation again.
 --
 
 CREATE TABLE mv_multi2_base (id int primary key, email text, uname text);
@@ -593,15 +604,16 @@ CREATE UNIQUE INDEX ON mv_multi2(uname);
 UPDATE mv_multi2_base SET email = CASE id WHEN 1 THEN 'b@example.com'
                                           ELSE 'a@example.com' END;
 
--- Direct modification cannot: it arbitrates on mv_multi2_email_idx and then
--- collides on mv_multi2_uname_idx.
+-- Neither spelling can: both arbitrate on mv_multi2_email_idx and then collide
+-- on mv_multi2_uname_idx.  The matview keeps its previous contents.
 \set VERBOSITY terse
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_multi2 WHERE id IN (1, 2);
+REFRESH MATERIALIZED VIEW mv_multi2 WHERE id IN (1, 2);
 \set VERBOSITY default
 SELECT * FROM mv_multi2 ORDER BY id;
 
--- The diff/merge form deletes before inserting, so it applies the change.
-REFRESH MATERIALIZED VIEW mv_multi2 WHERE id IN (1, 2);
+-- A full refresh applies it, and is the documented way to.
+REFRESH MATERIALIZED VIEW mv_multi2;
 SELECT * FROM mv_multi2 ORDER BY id;
 
 DROP MATERIALIZED VIEW mv_multi2;
