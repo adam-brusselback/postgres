@@ -47,27 +47,33 @@
 #   timerange    2000     +3.2 / +4.7     -4.8 / -1.7    -1.9 / +0.8
 #   projection  10000     +1.2 / -1.8     -1.9 / -3.0    -1.7 / -2.0
 #
-# Three repeats cannot see an effect this size -- run-to-run spread on one cell
-# reached 7 points (window/1000: +0.4 then +7.3).  Repeating the two disagreeing
-# cells with 8 PAIRED repeats each settles both questions, and neither of the
-# readings above survives intact:
+# Result 3 -- what the noise floor actually is, which should have been measured
+# FIRST.  Ten clones of one cell, all four forms timed on EACH clone (safe: at
+# zero churn with the row comparison on, none of them writes a row -- asserted
+# at the end of each cell, and the heap was unchanged in all 40 measurements):
 #
-#   cell               drop pre-lock            drop source
-#   nonkey  1000    +5.2% mean, 7/8 faster   +4.5% mean, 8/8 faster
-#   nonkey 10000    +7.0% mean, 8/8 faster   +3.3% mean, 8/8 faster
-#   window  1000    +1.8% mean, 7/8 faster   -2.3% mean, 1/8 faster
+#   between-clone wobble of the baseline      6.8% (window) to 11.3% (nonkey)
+#   one measurement in 40                     73% above the median
+#   distinct plans across all 10 clones       1 per form -- no plan flips
+#   position within the clone                 within the wobble
 #
-# The pre-lock elision is solid: faster in 22 of 24 paired repeats.
+# So the whole-refresh effect being chased (1-7%) is smaller than the floor, and
+# every disagreement above is explained by that plus estimators that are not
+# robust to one excursion.  The single 73%-high measurement alone moved a mean
+# from +5.2% to -4.5%.  With the clone held constant the source ORDER BY comes
+# out 7/10 and 4/10 -- a coin flip -- which retires the earlier "16 of 16 on
+# nonkey, 1 of 8 on window" as an artefact of which measurements landed where.
 #
-# The source elision is NOT noise, as a first correction assumed -- it is
-# consistent within a workload and opposite BETWEEN workloads, on two matviews
-# with identical index shape.  The likely mechanism is a third alignment nobody
-# had named: whether the source's NATURAL OUTPUT ORDER already matches the
-# arbiter key.  window's view is rank() OVER (PARTITION BY region), so its rows
-# arrive in region order and the upsert hits the unique index on id at random;
-# nonkey's arrive close to id order already, so the sort is redundant work.
-# Fitted to two workloads, so a hypothesis and not a result -- but it is why
-# "drop both ORDER BYs" cannot be one decision.
+# Note also that mutability.sql's header records a 45% between-clone spread.
+# That does not reproduce here (6.8-11.3%).  Its forms differ in how much they
+# WRITE, and these four do not write at all, so the two are not in conflict --
+# but 45% should not be carried over as this measurement's expected spread.
+#
+# What survives all of it is the sub-component measurement, because there the
+# effect is 3-10x the floor: the pre-lock's ORDER BY costs 20-69% OF THE
+# PRE-LOCK when misaligned.  The pre-lock is 12-15% of a refresh, so ~3-10% of a
+# refresh is IMPLIED -- and implied is the strongest word available, because the
+# direct whole-refresh measurement cannot resolve it at scope 1000.
 #
 # And it is gated on the LOCK LEVEL, not on index alignment -- see SPECIALIZE.md
 # section 4.  Under ExclusiveLock (the bare WHERE form) no second refresh can be

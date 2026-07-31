@@ -193,7 +193,7 @@ is better everywhere in it, and a *slower* entry is spelled out as such.
 | **stop deparsing for the cache key** — store the qual tree, compare with `equal()`, deparse only on a miss | — | **4.5–5.3 µs faster** per refresh, **7.4%** at scope 1, again fixed. Closes **B3**: the tree carries parameter types, `$1` does not | `matview_where_cache` Test 4, already two predicates that deparse identically and need different plans |
 | **parameterise predicate `Const`s** | — | **8× faster**, by turning refreshes that would miss the plan cache into hits | oracle. Changes what the cache key *is*, so it lands first or last, never in the middle |
 | **skip the prune** when the source is **empty** — the non-empty case is now covered by derived `no_delete` below, which needs no at-most-one-row proof | 1 + 2 | unmeasured. It is the mirror of the row above — the row-trigger delete path — and it applies at *any* scope | **none yet** — see 3c |
-| **drop the pre-lock's `ORDER BY`** — *not* the source's, and gated on the **lock level**, not on index alignment | 1 | **+1.8 to +7.0% mean over 8 paired repeats, faster in 22 of 24**, on misaligned predicates; **nothing (−1.8 to +1.2%) when aligned**. The *source* `ORDER BY` is a separate decision with a different answer per workload — see below — and must not be bundled in | oracle, plus an isolation permutation showing two refreshes deadlocking if it is dropped under `RowExclusiveLock` |
+| **drop the pre-lock's `ORDER BY`** — *not* the source's, and gated on the **lock level**, not on index alignment | 1 | **Measured directly on the pre-lock: 20–69% of it** when misaligned, growing with scope, and 4–26% when aligned. The pre-lock is 12–15% of a refresh, so the implied whole-refresh saving is **~3–10% — implied, not measured.** Direct whole-refresh measurement cannot resolve it at scope 1000, where the effect is smaller than the harness's own ±11% wobble; only `nonkey`/scope 10000 (+4.8 to +9.4%) is plausibly resolved. Do **not** bundle the source `ORDER BY` in — see below | oracle, plus an isolation permutation showing two refreshes deadlocking if it is dropped under `RowExclusiveLock` |
 | **drop the prune** — `no_delete`, now **derived** rather than declared: `n_locked + n_inserted == n_source` means nothing in scope is orphaned | **2**, not 4 | **13–19% faster** at scope ≥1000, measured *on top of* the row comparison rather than instead of it; only **1.1% faster** on `expensive`, where GIN maintenance dominates | oracle, plus the `mutations.py` entry that forces the elision when the counts do *not* agree |
 | **`DO NOTHING`** (`append_only`) — the half that cannot be derived, because no count taken during a refresh proves existing rows never need rewriting | 4 | a further **10–22 points** on top of `no_delete`, taking the pair to **26–39% faster** at scope ≥1000 | sampling verifier, plus a `mutations.py` entry declaring `append_only` on a view that updates |
 
@@ -257,11 +257,12 @@ concurrency gain that will never appear in a single-client sweep.
   by correlation and should stop relying on it.
 - `Const` parameterisation after that, since it redefines the cache key.
 - The pre-lock `ORDER BY` elision whenever the bare form is being worked on
-  anyway. It is 3–9% on misaligned predicates, it is a one-line condition on the
-  lock level rather than on anything about the predicate, and it is the only
-  thing so far that cashes in §4's `ExclusiveLock`. Do **not** bundle the source
-  `ORDER BY` into it — that one is inside the noise and would make a measurable
-  change unmeasurable.
+  anyway. It removes a clause measured at 20–69% of the pre-lock, it is a
+  one-line condition on the lock level rather than on anything about the
+  predicate, and it is the only thing so far that cashes in §4's
+  `ExclusiveLock`. Do **not** bundle the source `ORDER BY` into it — that one
+  has never been resolved above the noise, and pairing them would make a
+  measurable change unmeasurable.
 - `append_only` **last, or never**. It is worth 10–22 points faster on top of
   `no_delete`, which is real, but it is the only item left that needs a
   declaration — and a declaration whose failure mode is rows that silently
@@ -298,9 +299,8 @@ deterministic order to take rows in, so they queue instead of deadlocking. Under
 than assumed: a held `ExclusiveLock` blocks both `RowExclusiveLock` (a
 `CONCURRENTLY` partial refresh) and another `ExclusiveLock` (a second bare one),
 while still admitting `AccessShareLock` readers. So for the bare form the
-ordering has no job, and dropping it is worth **+1.8 to +7.0% mean over 8 paired
-repeats** on every misaligned cell measured — faster in 22 of 24 — and nothing at
-all when aligned.
+ordering has no job, and dropping it removes a clause measured at 20–69% of the
+pre-lock, which is 12–15% of a refresh.
 
 That is a small win, and it is the *shape* of it that matters: the saving is
 available exactly where it cannot be taken safely without the lock. Under
@@ -309,16 +309,15 @@ available exactly where it cannot be taken safely without the lock. Under
 and been wrong the first time someone ran two — which is §3e's argument
 arriving from the other direction, with a number attached.
 
-**The source `ORDER BY` is a different question and does not follow.** Dropping
-it is consistently *faster* on `nonkey` (16 of 16 paired repeats, +3.3 to +4.5%
-mean) and consistently *slower* on `window` (1 of 8, −2.3% mean) — two
-workloads with identical index shape. The likely mechanism is a third alignment
-nobody had named: whether the source's **natural output order** already matches
-the arbiter key. `window`'s view is a `rank() OVER (PARTITION BY region)`, so
-its rows arrive in region order and the upsert would hit the unique index on
-`id` at random; `nonkey`'s arrive close to `id` order already, making the sort
-redundant. That is a hypothesis fitted to two workloads, not a result. Leave
-the source ordering alone until it has its own measurement.
+**The source `ORDER BY` is a different question, and nothing here answers it.**
+Four runs have given it four answers — a 2–5% regression, then noise, then
+16-of-16 faster on `nonkey` against 1-of-8 on `window`, then 7-of-10 and
+4-of-10 with the clone held constant. That last pair is a coin flip, which is
+the honest reading of all of them: at scope 1000 the effect is below the floor
+described in §6, and the confident-looking win counts came from estimators that
+were not robust to a single 73%-high measurement. Leave the source ordering
+alone. It needs a cell where its effect exceeds the noise, not more repeats of
+one where it does not.
 
 ---
 
@@ -458,6 +457,18 @@ optimization — and all of them plausible-looking at the time:
 - **Integer division in the reporting query.** `1 - a/b` on two integers reads
   exactly 100.0 or 0.0, which looks like an emphatic result rather than a broken
   one. It sat in `modelcheck.sh` across all 40 rows.
+- **Measuring under the noise floor.** The `ORDER BY` question was answered four
+  different ways — including two runs of one script disagreeing by 7 points —
+  before anyone asked what the floor was. Measured: on a 2.5 ms cell the
+  baseline wobbles **6.8–11.3% between clones**, and roughly one measurement in
+  40 lands **73% high**. An effect of 1–7% cannot be read off that, and win
+  counts like "16 of 16" are the first thing to look confident while meaning
+  nothing: a mean or a per-repeat ratio is not robust to one excursion, and
+  three repeats cannot detect one. What the floor rules out is worth knowing
+  before the sweep, not after: **`bench/orderby.sh` measures it directly, and
+  anything competing with it belongs on a bigger cell or on a sub-component
+  where the effect is large** — the pre-lock alone moved 20–69%, which is why
+  that number survived when the whole-refresh version of it did not.
 
 The one quantity that reproduced everywhere — three scripts, two boots, four
 protocols, ±4% — is the *optimized* arm's absolute cost. That is the signal to
