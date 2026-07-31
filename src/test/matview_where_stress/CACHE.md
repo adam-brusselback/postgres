@@ -1,355 +1,411 @@
-# The source plan cache — subplan for 3.7, and the invalidation it lands on
+# The source plan cache — subplan for 3.7
 
 Branch-local; delete with this directory.
 
 PLAN.md 3.7 is one row in a table: *"cache the source plan | pursue, required |
-12.20 µs, 22% of a warm Query-tree refresh, and the entire reason it currently
-loses."* This file is the plan behind that row, because it is more work than a
-row suggests and it touches the structure B14 lives in.
+12.20 µs … the entire reason it currently loses."* This file is the plan behind
+that row.
+
+**Revision note.** The first two drafts were reviewed by three independent
+readers against the source, and all three returned **DO NOT PROCEED**, agreeing
+on thirteen findings. The largest was that the draft's go/no-go was decided
+against the work by an argument that does not apply to the cell the work exists
+to fix. That is corrected below, and the ordering it produced — B2's
+invalidation restructure ahead of everything — is **reversed**. Findings whose
+correction leaves no trace in the text are recorded in §9.
 
 ## 0. Where this sits, and what it gates
 
 The overall order is in PLAN.md "Where we are". This is step 1 of the six-step
-tail, and steps 2–4 are blocked on it:
+tail:
 
 | | | state |
 |---|---|---|
-| **1** | **this file** — cache the source plan, on a corrected invalidation | **next**, and it opens with a **go/no-go**: §4b step 0 |
-| 2 | flip `matview_partial_refresh_querytree` to on, re-run the differential harness and the benchmark sweep | blocked on 1 |
-| 3 | B2 / the invalidation restructure | **pulled forward into 1** — see §4 |
+| **1** | **this file** — cache the source plan | **next** |
+| 2 | flip `matview_partial_refresh_querytree` on, re-measure | blocked on 1 |
+| 3 | B2 / the invalidation restructure | **its own item, no longer inside 1** — §4 |
 | 4 | delete the text path, the two GUCs, and the oracle's A/B axis | blocked on 2 |
 | 5 | B15 — warn, error, or document the blast radius | independent, needs a decision |
-| 6 | B25, task #17 (derived `no_delete`) | independent |
+| 6 | B25, derived `no_delete` | independent |
 
 **Why it gates.** Phase 2.2 decided to ship (b), the Query-tree read side. Both
-GUCs still boot `false`, so the default today is the text path, and flipping the
-default without 3.7 ships a regression: **RESULTS.md R26**, 49.7 µs text against
-61.6 µs Query-tree warm at scope 1, which is 24%, confirmed at a different
-absolute level over three alternating pairs at 60.1 against 78.4, which is 30%.
-The deficit is a fixed cost, so it is ~0 at scale, and on a *cold* cache the
-Query-tree path wins outright (233 against 315 µs) because it skips
-`pg_get_viewdef` and re-parsing the view text. It bites exactly where D1 and D2
-live: trigger and drain, small scope, warm cache. That is the primary use case,
-so "it is fine at scale" is not an answer.
+GUCs still boot `false`, so the default today is the text path, and flipping it
+without 3.7 ships a regression: **RESULTS.md R26**, 49.7 µs text against 61.6 µs
+Query-tree warm at scope 1 (24%), confirmed over three alternating pairs at 60.1
+against 78.4 (30%). The deficit is a fixed cost — R2 puts source planning at
+16.2% → 0.9% → 0.0% at scope 1/100/10k — and on a *cold* cache the Query-tree
+path wins outright (233 against 315 µs) because it skips `pg_get_viewdef`. It
+bites where D1 and D2 live: trigger and drain, small scope, warm cache.
 
-## 1. What is being cached, and the one line it replaces
+Quote the share as **16.2%** (R13, and RESULTS.md is canonical for settled
+numbers). Earlier drafts said 22%, which is neither 12.20/61.6 = 19.8% nor R13's
+figure, and carried no protocol.
+
+## 1. What is being cached, and the cell it pays in
 
 `matview_materialize_source()` (`matview.c:1371`) rewrites and plans the source
 query on **every** refresh:
 
     AcquireRewriteLocks(sourceQuery, true, false);
     rewritten = QueryRewrite(sourceQuery);
+    sourceQuery = linitial_node(Query, rewritten);
     plan = pg_plan_query(sourceQuery, NULL, CURSOR_OPT_PARALLEL_OK, params, NULL);
 
-`pg_plan_query` is the 12.20 µs. The Query it plans is built fresh each time by
-`matview_build_source_query()` from the view's `dataQuery` and the predicate,
-neither of which changes between refreshes with the same predicate.
+**The 12.20 µs is rewrite *and* plan together**, not `pg_plan_query` alone —
+`profile.py`'s `MVP_SRCPLAN` timer opens before `AcquireRewriteLocks` and closes
+after `pg_plan_query`, and PLAN.md labels the row accordingly. The split is
+unknown; §5 step 0 measures it.
 
-Nothing else in `refresh_by_direct_modification()` re-plans: the locking
-`SELECT` and the fused upsert/prune are `SPI_prepare`d once and cached. The
-source query is the only survivor, and it is half the planning work.
+### The cell this was measured in, which decides everything below
 
-## 2. The mechanism, and why it is not novel
+R26's protocol is literally `REFRESH MATERIALIZED VIEW CONCURRENTLY bench.mv
+WHERE id = 1;` **×300** (PLAN.md 3.1), on `projection`, whose span-1 predicate is
+`id = :k` (`bench/workloads.sql:45`). So the 24% deficit was measured with a
+**constant literal**, and that has three consequences the earlier drafts missed:
+
+- **The entry hits.** The key is `strcmp` on the deparsed predicate
+  (`matview.c:1586`); a constant literal deparses identically every call. PLAN.md
+  3.2 measures all three modes: varying literal **546 µs** (misses every time),
+  constant literal **72 µs** (hits), bound parameter **67 µs** (hits). Only a
+  *varying* literal misses.
+- **`params` is NULL**, so `choose_custom_plan()` returns false immediately
+  (`plancache.c:1184-1185`) — **generic plan, unconditionally, forever.** A saved
+  plansource is reused with no replanning at all.
+- Therefore **3.7 recovers essentially the whole 12.20 µs in the cell that
+  motivates it**, with no pinning, no `CURSOR_OPT_GENERIC_PLAN`, and none of
+  SPECIALIZE.md §7c's novel machinery.
+
+### What does *not* hold, and where the real residual is
+
+"Nothing else in `refresh_by_direct_modification()` re-plans" is **false when the
+predicate is parameterised.** `matview_execute_spi_plan()` hands `params` to
+`SPI_execute_plan`, so the fused DML's plansource goes through
+`choose_custom_plan()` too — and PLAN.md 4.1 measured it: `WHERE id = $1`, `auto`
+**138.7 µs** against `force_generic_plan` **51.4 µs**, *"invisible to the phase
+profile … because it happens inside `SPI_execute_plan`, counted under
+`dmlexec`."*
+
+So in the **bound-parameter** cell a cost roughly seven times the one 3.7 chases
+already dominates, and 3.7 is not the right lever there. That is 4.1's problem,
+not this one. **3.7 is scoped to the constant-literal cell**, which is what R26
+measured and what §6 re-measures.
+
+## 2. The mechanism
 
 `CreateCachedPlanForQuery(Query *analyzed_parse_tree, const char *query_string,
-CommandTag commandTag)` exists for exactly this shape: a `Query` that has
-already been through parse analysis, with no source text. Its comment says so —
-*"Currently this is used only for new-style SQL functions, where we have a Query
-from the function's prosqlbody, but no source text."*
+CommandTag commandTag)` is for exactly this shape — *"used only for new-style SQL
+functions, where we have a Query from the function's prosqlbody, but no source
+text"* (`plancache.c:254-263`). `functions.c:929` is the only in-tree caller and
+the pattern to copy. That precedent matters: SPECIALIZE.md §7b's warning is that
+a bespoke cache draws objections a standard one does not.
 
-`functions.c:929` is the pattern to copy:
+Four mechanics the sketch must not elide, each a silent behaviour change if
+dropped:
 
-    plansource = CreateCachedPlanForQuery(parsetree, src, CreateCommandTag(...));
-    AcquireRewriteLocks(parsetree, true, false);
-    queryTree_list = pg_rewrite_query(parsetree);
-    CompleteCachedPlan(plansource, queryTree_list, ...);
-    /* then SaveCachedPlan() to outlive the statement, and per call: */
-    cplan = GetCachedPlan(plansource, params, owner, queryEnv);
-    /* linitial_node(PlannedStmt, cplan->stmt_list), execute, ReleaseCachedPlan */
+- **`cursor_options`.** Today the source is planned `CURSOR_OPT_PARALLEL_OK`
+  (`matview.c:1390`). That must reach `CompleteCachedPlan()`'s `cursor_options`
+  argument, which is what `BuildCachedPlan` passes to `pg_plan_queries`. Drop it
+  and parallel source evaluation goes away — invisible at scope 1, material at
+  the scale where the source is largest in absolute terms.
+- **`SaveCachedPlan()` ordering.** It asserts `!plansource->is_saved` and calls
+  `ReleaseGenericPlan()` — *"Best thing to do seems to be to discard the plan"*
+  (`plancache.c:1666-1673`). Save **before** the first `GetCachedPlan()`, once,
+  not per refresh.
+- **ResourceOwner.** `GetCachedPlan()` errors with *"cannot apply ResourceOwner
+  to non-saved cached plan"* (`plancache.c:1309-1310`), so an unsaved plansource
+  must pass `owner = NULL` — and then nothing releases the refcount if the
+  executor throws. `refresh_by_direct_modification()`'s `PG_CATCH` restores only
+  the maintenance flags. SPECIALIZE.md §7b lists Noah Misch's *"tracking
+  resources by subtransaction"* objection as one review will raise.
+- **`pg_rewrite_query()` vs `QueryRewrite()`.** `functions.c` uses the former, we
+  use the latter. Harmless, but it changes parser-stats logging; the step A diff
+  should name the swap rather than inherit it.
 
-**This matters for review.** SPECIALIZE.md §7b's whole warning is that a bespoke
-cache draws the objection a standard one does not. There is one in-tree caller,
-which is thin, but the API is public, documented for our situation, and the
-alternative — holding a `PlannedStmt *` ourselves — has no invalidation at all.
-
-## 3. What it gets for free, and it is more than speed
+## 3. What it gets for free
 
 On revalidation, plancache handles a pre-analysed `Query` by **re-rewriting
-only** (`plancache.c:833`):
+only** (`plancache.c:833-843`) — it never re-analyses, so **names are never
+re-resolved**. That is the B1/B2 hazard, unreachable on this path without our
+writing anything. And when the plansource is still valid,
+`RevalidateCachedQuery()` returns without touching the tree at all, so even a
+custom plan skips the rewrite.
 
-    /* Source is pre-analyzed query, so we only need to rewrite */
-    analyzed_tree = copyObject(plansource->analyzed_parse_tree);
-    AcquireRewriteLocks(analyzed_tree, true, false);
-    tlist = pg_rewrite_query(analyzed_tree);
+One framing correction: plancache registers **eight** callbacks — one relcache
+plus seven syscache (`plancache.c:150-157`). And because `SPI_keepplan()` calls
+`SaveCachedPlan()`, our two SPI plans are *already* on `saved_plan_list` and
+*already* receive all eight. **B2 is not "plancache never learns" — it is "we
+never ask, and plancache's revalidation then re-analyses the raw parse tree."**
 
-It never re-analyses, so **names are never re-resolved**. That is precisely the
-B1/B2 hazard — a saved raw parse tree re-analysed after a rename resolves to a
-different object — and on this path it cannot arise, without our writing
-anything. It also inherits all **seven** of plancache's invalidation callbacks
-against the one we register.
+**One trap, smaller than the last draft claimed.** `RevalidateCachedQuery()`
+forces a replan when `SearchPathMatchesCurrentEnvironment()` is false, and
+`REFRESH` runs under `RestrictSearchPath()`. But that function uses the
+generation counter only as a fast path and then compares **by content**
+(`namespace.c:3983-4034`), and `refresh_by_direct_modification()` is reachable
+only from inside the restricted region (`matview.c:648`), so the paths match by
+content and the "every call replans" failure cannot happen the way the last draft
+described. The narrow real case: if the session's temp namespace comes into
+existence between two refreshes, the resolved path changes and the content
+comparison fails once. Step C still stands — it just is not hunting this.
 
-So 3.7 is not only the performance item. It is the first piece of the feature
-whose invalidation is correct by construction rather than by our own callback.
+## 4. B2's restructure is NOT part of this work
 
-**And one trap on the same path, which would build a cache that silently
-misses.** `RevalidateCachedQuery()` forces a replan when
-`SearchPathMatchesCurrentEnvironment(plansource->search_path)` is false, and it
-invalidates the generic plan when it does. `REFRESH` runs its query under
-`RestrictSearchPath()`. So the plansource must be **created inside the restricted
-region and used inside it**, or every single call sees a mismatch, replans, and
-the cache is a no-op that costs slightly more than no cache at all. Timing will
-not tell you — the loss is inside R12's noise floor. This is why step D exists,
-and it is the concrete failure it is looking for.
+**Reversed from the previous draft, which put it first.** Two reasons, and the
+first is that the argument for pulling it forward was refuted.
 
-## 4. Scope: the invalidation restructure comes first, not after
+**The refuted argument.** The draft said the shotgun invalidation makes the
+cache's hit rate depend on background activity, so measuring the cache before
+fixing it measures the wrong thing. The mechanism is real —
+`InvalidateMatViewCache()` ignores `relid` and marks every entry
+(`matview.c:1193-1204`) — but the project had already measured the effect and it
+does not occur: PLAN.md 3.1 says *"300 committed refreshes with a constant
+predicate call `pg_get_viewdef` **once**, not 300 times, so the plans survive
+commits and nothing re-plans"*, and the warm phase table shows `SPI_prepare` at
+**0.79 µs** sustained over 300 refreshes, which is a near-100% hit rate. ISSUES.md
+B16 adds that `ANALYZE` was *not* sufficient to mark an entry stale; it took an
+`ALTER TABLE`.
 
-**Decision: do B2's restructure as step A of this work, before the source plan
-is added.**
+**And the restructure is not the small subtraction the draft claimed.** Four
+things it has to solve that were not written down:
 
-The reasoning, so it is not relitigated. Today `MatViewPartialRefreshCache` has
-one `invalid` flag per entry, set by our own relcache callback for *every* entry
-regardless of `relid`, and cleared by `matview_cache_sweep()` freeing the whole
-entry. Adding a third cached object to that structure means writing a third
-consumer of a flag we already know is wrong — too broad (any relcache event
-anywhere) and too narrow (one callback where plancache has seven) — and then
-unwriting it.
+- **It reopens B7.** `HASH_REMOVE` appears once in `matview.c`, in
+  `matview_cache_sweep()`, whose own comment says *"Sweeping every entry rather
+  than just this refresh's own is what reclaims the plans of matviews that have
+  since been dropped."* ISSUES.md B7 is that leak by name, closed by this
+  mechanism, test coverage **none**. Gate per-plan on the caller's own entry and
+  a dropped matview's plans — three of them after 3.7 — are never reclaimed.
+  PLAN.md 3.10 proposed *narrowing* the sweep, not deleting it.
+- **Detection is only half of `ri_triggers.c`'s pattern.** `ri_FetchPreparedPlan()`
+  says *"we don't want to simply rely on plancache.c to regenerate it; rather we
+  should start from scratch and **rebuild the query text too**."* Our regenerate
+  path is gated on `lockPlan == NULL || refreshPlan == NULL` (`matview.c:1660`),
+  so an invalid-but-non-NULL plan reuses the stale text and nothing changes.
+- **The precondition is not met.** `ri_triggers.c` and `plancache.c` both warn
+  that the validity check *"is only trustworthy if the caller has already
+  locked"* the relations. At the top of the refresh only the matview is locked;
+  on the text path the fused statement's `relationOids` include base tables that
+  are not.
+- **The designated fail-first probably cannot fail.** `whereClauseStr` is
+  regenerated from the freshly analysed qual on *every* refresh
+  (`matview.c:705`) **and is simultaneously the cache key** (`matview.c:1586`).
+  After `ALTER FUNCTION f RENAME TO g` the qual holds the OID, deparses to the
+  new name, the `strcmp` fails, and the plans are rebuilt from regenerated text.
+  Two reviewers independently could find no route to a stale binding through the
+  predicate. The demonstrable B2 route is the **view definition**, text only on
+  the text path — the path step 4 deletes.
 
-The argument that actually decides it, though, is about **measurement**, not
-correctness: `InvalidateMatViewCache()` marks every entry on any relcache event
-anywhere, and the sweep then frees them at the next refresh. So the cache's hit
-rate depends on unrelated background activity — an autoanalyze on any table in
-the database drops it. Measuring a plan cache whose hit rate is set by autovacuum
-timing measures the wrong thing, and step C's whole result is a hit-rate
-measurement. Fix the invalidation first or do not believe the number.
+**So B2 goes back to being its own item**, with its own investigation of whether
+it is still reachable at all once the text path is gone. Nothing in 3.7 depends
+on it: a `CachedPlanSource` self-validates through `GetCachedPlan()`, so the
+source plan's correctness is plancache's business regardless of what our flag
+does. The one real coupling — `matview_cache_sweep()` would `DropCachedPlan()` a
+plansource that is in use — is already closed by B14's depth guard, and §5 step B
+must not undo that.
 
-The restructure is also the *smaller* diff, because it deletes:
-`InvalidateMatViewCache()`, `matview_cache_sweep()`, the `invalid` field, and
-the `CacheRegisterRelcacheCallback()` call. It replaces them with the
-`ri_triggers.c` pattern — let plancache be the detector, ask it per plan:
-
-    if (cacheEntry->lockPlan && !SPI_plan_is_valid(cacheEntry->lockPlan)) ...
-
-**A consequence worth stating.** B14's guard exists because the sweep freed
-*other* entries. With the sweep gone, nothing frees another entry's plans, and
-the mismatch branch only ever frees the caller's own (R24, and same-matview
-nesting is blocked by `CheckTableNotInUse()`). The guard becomes belt-and-braces
-rather than the fix. **Keep it anyway** — it is three lines, and "a nested
-refresh shares an entry with a caller that is mid-execution" is a shape worth
-refusing on principle, not only when we can name the free.
-
-**What is deliberately NOT in scope here**, so this does not sprawl:
-
-- widening the cache key beyond `matviewOid` — see §7, it is separable and it
-  wants a measurement first;
-- generic-versus-custom plan selection, SPECIALIZE.md §7c;
-- a bounded LRU across matviews;
-- anything in Phase 3 beyond 3.7 and 3.8.
-
-## 4b. The risk that decides whether any of this pays — settle it first
-
-**Caching a plansource does not stop planning.** `GetCachedPlan()` re-plans
-every call whenever plancache chooses a *custom* plan, and `choose_custom_plan()`
-(read, not assumed) says it usually will for our shape:
-
-- `boundParams == NULL` → **generic always**. That is a literal predicate — and a
-  literal predicate changes the cache key on every call, so it never reaches a
-  saved plansource in the first place. 3.2 (parameterise `Const`s) is what would
-  fix that, and 3.2 **is not implemented**.
-- with bound parameters → **five custom plans unconditionally**, then generic
-  only if `generic_cost < avg_custom_cost`.
-
-And R1 says what that comparison decides for us. PLAN.md 4.1: *"for `id BETWEEN
-$1 AND $1` the generic estimate assumes a wide range, so the custom plan always
-wins on estimated cost and the statement is re-planned on every"* call. A narrow
-range predicate at scope 1 is exactly the cell where the 24% deficit lives.
-
-So the plausible outcome is that 3.7 saves the rewrite and the Query
-construction — a couple of µs of the 12.20 — and **leaves most of the deficit in
-place**, because the planning it was meant to remove keeps happening under a
-custom plan. That is not a reason to skip 3.7; it is a reason not to start
-writing it until two numbers exist.
-
-### Step 0 — two measurements, before any code
-
-Neither needs the cache to exist, and together they say whether steps B–D are
-worth writing or whether this becomes a different piece of work.
-
-**0a. Split the 12.20 µs.** The phase table reports "rewrite + `pg_plan_query`
-the source" as one line, so nobody knows the ratio. Add `INSTR_TIME` either side
-of `pg_plan_query()` alone, run R2's protocol, revert the instrumentation. If
-planning is 10 of the 12.20, a custom plan keeps 10 of it and 3.7 recovers 2. If
-it is 5 of 12.20, the picture changes.
-
-**0b. What does plancache actually choose for the source query, and what does
-forcing generic cost?** Run the source query alone under `plan_cache_mode` =
-`auto`, `force_generic_plan`, `force_custom_plan`, across the `optmatrix`
-workload set. R1 answered this for the refresh *as a whole* and found forcing
-generic 21.7% slower net — but that forced generic on everything including the
-DML, so it is suggestive, not decisive, for the source query alone. R1's shape
-breakdown is the thing to look at: generic is **28.6% faster** on range/span 1
-and **33.5% slower** on array/span 100, so the answer may well be per-shape.
-
-**What each outcome means.**
-
-| 0a / 0b | what 3.7 becomes |
-|---|---|
-| planning dominates, and generic is acceptable for the source query | 3.7 as written, plus pinning generic. Proceed with B–D |
-| planning dominates, generic is *not* acceptable | 3.7 as written recovers little. The work turns into SPECIALIZE.md §7c — a pinned-generic and a pinned-custom plansource selected on the pre-lock's row count — which is **novel** and much larger. Stop and re-plan |
-| planning does not dominate | the 12.20 µs was mostly rewrite, 3.7 is cheap and pays. Proceed, and revise R26's explanation, which currently blames planning |
-
-**Record both as R27 and R28** before quoting either.
-
-### An ordering question this raises, for a decision
-
-3.2 (parameterise predicate `Const`s) is marked **"pursue, largest"** at 6.3× on
-the text path and **3.8× on the Query-tree path**, and it is not implemented.
-It addresses a different cell — cold and literal, where 3.7 addresses warm and
-parameterised — so they do not substitute for each other. But 3.2 is what turns
-a literal-predicate caller into a cache-hitting one, which is the precondition
-for 3.7 mattering to that caller at all, and it is the larger measured number.
-
-**Recommendation: keep 3.7 first anyway**, because it is what unblocks flipping
-the default, and the default is currently wrong. But this should be a decision
-rather than an accident, so it is written down here.
-
-## 5. The steps, each with the check that has to fail before it passes
-
-Step **0** is in §4b and comes before all of these; it can send the work
-somewhere else entirely. Steps A–E assume it came back "proceed".
+## 5. The steps
 
 The rule this project keeps relearning: **a test that has not been seen to fail
-is not evidence.** Each step names what must go red first.
+is not evidence.** Each step names what must go red first, or says plainly that
+nothing can.
 
-### A. Invalidation restructure (B2)
+### 0. Repair the instruments, and split the 12.20 µs
 
-Gate each cached plan on `SPI_plan_is_valid()`; delete the callback, the sweep,
-and the `invalid` field.
+Not a go/no-go any more — §1 settled that — but first, because the tooling is
+broken and the split is unknown.
 
-- *fail-first*: rename an object between two refreshes and assert the second
-  uses the new one. **Which object matters, and B2's row does not say so:** the
-  view definition is text only on the *text* path, so a function renamed there
-  reproduces under `querytree=off` and not under `querytree=on`. The predicate is
-  text on **both** paths (`pg_get_expr`), so a function used in the *predicate*
-  is the case that covers what we are actually shipping. Write both, run both GUC
-  arms, and record which combinations reproduce — that grid is the real statement
-  of B2's scope, and it is currently unknown rather than merely unwritten.
-- *if it passes on the current tree*, B2 is wrong about reachability. Stop and
-  find out why before changing anything.
-- *also*: `matview_where_cache` Tests 1–3 stay green (they cover the rename
-  cases the callback did handle), full `installcheck`, `debug_discard_caches=1`.
-- *closes*: ISSUES.md B2, and PLAN.md's "invalidation restructure" item.
+- **`profile.py` does not run against HEAD.** Its edit #3 anchors on
+  `matview_cache_sweep();` followed by the old `hash_search` call; commit
+  `49a3528` (B14's fix) moved the sweep inside `if (use_cache)` and rewrapped the
+  assignment, so `profile.py on` exits *"pattern not found"* and instruments
+  nothing. 13 of 14 edits still match. **Repair it, and give it a `--check` like
+  `mutations.py` has** — this is ISSUES.md B23's rot one file over, and B23's
+  lesson was that a silently half-applied edit still yields a plausible number.
+- **Split the 12.20 µs**: `INSTR_TIME` around `pg_plan_query()` alone, R2's
+  protocol (300 constant-literal scope-1 refreshes of `projection`), revert the
+  instrumentation. Record as **R27**. It sizes the prize and says whether R26's
+  explanation — "the whole deficit is one line" — is right.
 
-### B. Source plan through plancache, per-refresh lifetime
+### A. Source plan through plancache, per-refresh lifetime
 
-Create the plansource, complete it, get the plan, execute, drop it — every
-refresh. **No caching yet.** This separates "is plancache wired correctly" from
-"did caching help", and either question is hard enough alone.
+Create, complete, get, execute, drop — every refresh. **No caching yet**, so "is
+plancache wired correctly" is separated from "did caching help".
 
-- *expect*: timing neutral, within R12's 6.8–11.3% noise floor. A large move
-  either way means the wiring is wrong, not that it worked.
-- *verify*: `safety/rundiff.sh` quiet over all 21 shapes; `matview_where*` green;
-  both isolation specs (`matview-where-snapshot`, `matview-where-prune-gap`)
-  green, since this touches the snapshot handling around the source.
+- *expect **slower**, slightly.* This adds `copyObject` of the analysed tree
+  (`plancache.c:275`), a second copy at rewrite, `extract_query_dependencies`,
+  `GetSearchPathMatcher`, `PlanCacheComputeResultDesc`, and two context
+  create/deletes, on top of the rewrite and plan already paid. The previous draft
+  said "expect neutral; a large move either way means the wiring is wrong", which
+  would have read a correct implementation as a bug.
+- *fail-first*: **none is available** for a pure mechanism swap, and saying so is
+  better than inventing one. The gate is the differential harness: `rundiff.sh`
+  quiet across the corpus in both GUC arms, `matview_where*` green, and both
+  `matview-where-snapshot` and `matview-where-prune-gap` green, since this touches
+  the snapshot handling around the source.
 
-### C. Give it a lifetime
+### B. Give it a lifetime
 
-`SaveCachedPlan()`, a third field on the cache entry, released with the rest.
+`SaveCachedPlan()` once, a third field on the cache entry, `DropCachedPlan()` on
+release. Watch §2's four mechanics.
 
-- *fail-first*: the measurement from §6, run before and after. If the warm scope-1
-  deficit does not close, the plan is not being reused and step D will say so.
-- *verify*: as B, plus `debug_discard_caches=1`.
+- *fail-first*: **step C's probe, written first and run against step A's build**,
+  where it must go red. Do **not** use the benchmark as the gate — the effect may
+  be a few µs on a 61.6 µs cell and this protocol's floor is not yet established.
+- B14's guard must still hold: a nested refresh at depth > 0 takes no entry, so it
+  must build a private plansource and drop it rather than reach the saved one.
 
-### D. Prove the plan is actually reused
+### C. Prove the plan is reused — and that no planning happens
 
-**The step this project cannot skip.** Four times now a clean run has meant an
-absent test. A cache that silently misses looks exactly like a cache that works,
-only slower — and "slower" is inside the noise floor at scale.
+**The step this project cannot skip**, and the previous draft's version could not
+do its job.
 
-- an injection point at the reuse branch, in the style `matview_where_inject`
-  already uses; a case that refreshes twice with the same bound parameter and
-  asserts the second **hit**, and one that changes the predicate and asserts it
-  **missed**.
-- *fail-first*: the hit case must fail against step B's build, where nothing is
-  saved.
+- An injection point cannot live at "the reuse branch" in `matview.c`: that only
+  observes that the *entry* was reused, which is true even when `BuildCachedPlan`
+  re-plans. Assert on plancache's own state — `plansource->generation`,
+  `num_generic_plans`, `num_custom_plans`, `gplan` (`plancache.h:133-148`).
+- The precedent is **not** `matview_where_inject`, which is the SQL-injection
+  suite and whose header says *"Nothing here should be able to fail"* — the
+  opposite of this rule. It is `INJECTION_POINT("matview-where-locked")` and
+  `("matview-where-source-materialized")` (`matview.c:1976, 2005`), driven from
+  `src/test/modules/injection_points/specs/`. So the test needs
+  `--enable-injection-points` and will not run in a default `make check`.
+- **It cannot also run under `debug_discard_caches = 1`.** That setting calls
+  `InvalidateSystemCachesExtended()` at every invalidation-acceptance point, which
+  invalidates every saved plansource with a non-empty `relationOids`; a reuse
+  assertion must go red. Guard the case and say so, or R25's 5/5 silently becomes
+  4/5.
+- Add the case SPECIALIZE.md §3 already asked for and the draft dropped: **a base
+  table changing must invalidate the source plansource.** That is the correctness
+  failure mode of this item and the whole reason plancache was chosen over a
+  stashed `PlannedStmt`.
+
+### D. Repair what these steps break
+
+Both are calibrated instruments, both break silently, and B23 is the precedent.
+
+- **`mutations.py`.** C1 ("never invalidate the partial-refresh plan cache")
+  anchors on `CacheRegisterRelcacheCallback(InvalidateMatViewCache, (Datum) 0);`
+  (`mutations.py:156-157`). 3.7 does not delete that line — B2's restructure
+  would — but C1 needs a sibling that breaks the *source* plansource's validity,
+  or the new mechanism ships with no mutation ever seen to break it.
+  `mutations.py --check` goes from 16/16 (R20) to 17/17.
+- **`profile.py`** patches by literal match inside
+  `refresh_by_direct_modification()`, including the block step A rewrites. Update
+  it in the same commit and re-run `--check`.
 
 ### E. Hand back to the main plan
 
-Re-measure (§6), then PLAN.md step 2 — flip the default, re-run the sweep with a
-label matching `p21-O2`, per PLAN.md 2.1b.
+Re-measure (§6), then PLAN.md step 2.
 
-## 6. The measurement, decided in advance
+## 6. The measurement, decided in advance — and corrected
 
-Deciding this before measuring, because RESULTS.md's provenance-hazard list is
-what happens otherwise.
+The previous draft's protocol was broken three ways. Each is recorded because
+each looks like ordinary care.
 
-- **Arms**: `querytree=off` (text) against `querytree=on,optimized=on`, one
-  binary, alternated, on the same clone.
-- **Cell**: warm cache, **bound parameter** predicate, scope 1 — the D1/D2 shape,
-  and the only place the deficit exists. Plus scope 1000 as a control where it
-  should already be ~0 either way.
-- **Heap state**: settled heap, VACUUM before each timed refresh (R3's protocol,
-  the honest one — R5 says the alternative reads 82% where the truth is 54%).
-- **Success**: the Query-tree arm at scope 1 warm is **no worse than** the text
-  arm, outside R12's noise floor. Not "faster" — the text path is going away, so
-  parity is the bar and anything better is a bonus.
-- **Sample counts equal per arm.** The per-form adaptive budget was worth 8–9.5
-  points elsewhere.
-- Record as R26 in RESULTS.md with the protocol, before quoting it anywhere.
+- **No VACUUM before timed refreshes.** `vac_update_relstats()` updates
+  `pg_class` **in place** (`vacuum.c:1460, 1574`), which routes through
+  `CacheInvalidateHeapTupleInplace()` — whose comment says it detects *"whether a
+  relcache invalidation is implied"*. So a VACUUM before each timed refresh drops
+  the plan cache before each timed refresh, converting the **warm** cell into the
+  **cold** cell, where the Query-tree arm already wins 233 to 315 µs for an
+  unrelated reason. The measurement would report success whether or not 3.7
+  worked. R3/R5's heap-state control belongs to a comparison where one arm writes
+  and the other does not (RESULTS.md X1); both arms here write identically.
+- **Arms are `querytree=off` against `querytree=on`, not `qtopt`.**
+  `optimized=on` adds the row comparison, separately measured **18.5% slower at
+  scope 1** — the exact cell and direction of the bar — handing the arm that must
+  reach parity a handicap unrelated to 3.7. It is also not what R26 measured (the
+  phase table has two arms) nor what step 2 ships. SPECIALIZE.md §3f: *"Do not
+  bundle … pairing them would make a measurable change unmeasurable."*
+- **Cell: constant literal, scope 1, warm** — R26's cell, per §1. Not a bound
+  parameter: that cell is dominated by 4.1's DML replanning, and `bench/run.sh`
+  cannot produce it anyway. It interpolates `:k` client-side into a **varying**
+  literal (`run.sh:203-224`), which is the *miss* path, where the Query-tree arm
+  already wins. PLAN.md 3.6 — *"`run.sh` needs a `--predmode literal|param` axis
+  … nothing else in this list can be evaluated until this is fixed"* — is a
+  precondition for step E's sweep and was not listed as one.
+
+Otherwise: alternate arms on the same clone, equal sample counts per arm (the
+per-form adaptive budget was worth 8–9.5 points elsewhere), scope 1000 as a
+control where the effect should be ~0 either way.
+
+**Success**: the Query-tree arm at scope 1 warm reaches **parity** with the text
+arm — the difference *inside* the floor, not outside it. The previous draft said
+"no worse than … outside R12's noise floor", which demands the opposite of parity
+and is readable two ways.
+
+**Establish the floor first.** R12's 6.8–11.3% is a between-clone wobble on a
+**2.5 ms** cell from `bench/orderby-floor.sh`. This is a ~50–62 µs in-backend
+`INSTR_TIME` cell on one clone. Quoting R12 here breaks RESULTS.md's own rule and
+gives an acceptance band wide enough to hide the entire 12.20 µs. Measure the
+floor of *this* protocol, record it as **R28**, then set the bar.
+
+Record the result as **R29**. Not R26 — that is the "before" number this work is
+justified by, it is `settled`, and overwriting it destroys the comparison.
 
 ## 7. Recorded but not built: why one plan per matview may not be enough
 
-This came out of working through real workloads and is written down here so the
-key question is not re-derived from scratch when §4 defers it.
+Still out of scope — with one correction: deferring the key widening is **not
+neutral**, it gets worse. Step B adds a third saved object whose miss costs two
+`copyObject`s, dependency extraction and a search-path capture, on top of the
+rewrite and plan already paid. SPECIALIZE.md §7 already calls the two-caller case
+*"worse than no cache: maintenance paid for a guaranteed miss"*; 3.7 raises the
+price of each miss, and `bench/run.sh`'s varying literal is that path.
 
-The source plansource embeds the predicate, so a *different predicate* is a
-different plansource by construction — the same coarse-key problem the two SPI
-plans already have. With a **bound parameter** one plansource serves every value
-and plancache's generic/custom machinery does the rest, which is why R15's
-`Const` parameterisation was worth 8×: it turns misses into hits. The question
-is whether one entry per matview is enough when a single matview has more than
-one *caller*.
-
-Workloads where it is not:
+The workloads that want more than one plan per matview:
 
 1. **The five-join invoice.** One table in the join tree returns no rows but
-   still changes the result. Predicates that do and do not constrain that table
-   are structurally different plans over one matview.
+   still changes the result. Predicates that do and do not constrain it are
+   structurally different plans over one matview.
 2. **The sales rollup with two writers.** A scheduled job drains a queue in
    batches (`= ANY($1)`) while an on-update/delete trigger refreshes single rows
-   (`= $1`). Two callers, two predicates, one matview — they evict each other on
-   every call. SPECIALIZE.md §7 calls this "worse than no cache: maintenance paid
-   for a guaranteed miss."
-3. **Tax rules by company type.** A sale-by-customer rollup whose rules differ by
-   company type, so different predicates select genuinely different plans rather
-   than the same plan with different constants.
+   (`= $1`). Two callers, two predicates, one matview, evicting each other.
+3. **Tax rules by company type.** Different predicates select genuinely different
+   plans, not the same plan with different constants.
 
 A fourth — sales moving between customers, refreshed on both ad hoc — was raised
-and then **withdrawn**; it is recorded only so it is not re-proposed.
+and **withdrawn**; recorded so it is not re-proposed.
 
-What that implies, and what has to be measured before building any of it:
-key on `(matviewOid, predicate)` rather than `matviewOid`, which needs a bounded
-number of entries and therefore an eviction policy. `nodeMemoize.c` is the
-in-tree precedent for a backend-local bounded LRU (`dlist`), and
-`pg_stat_statements`' `entry_dealloc()` for usage-decay eviction that resists
-scans. **Do not build either until case 2 is measured** — the thrash is asserted
-from the code, not observed, and this project has a record of sizing things by
-reasoning and getting them wrong (RESULTS.md X1, X2).
+`nodeMemoize.c` is the in-tree precedent for a backend-local bounded LRU, and
+`pg_stat_statements`' `entry_dealloc()` for scan-resistant usage decay. **Do not
+build either until case 2 is measured** — the thrash is asserted from the code,
+not observed, and RESULTS.md X1 and X2 are what happens when this project sizes
+something by reasoning.
 
 ## 8. Exit criteria
 
-3.7 is done when all of:
-
-- ISSUES.md B2 closed, with the fail-first rename test in the tree;
-- `pg_plan_query()` no longer runs on a warm repeat refresh, proven by the
-  injection-point test from step D, not by timing — **or**, if step 0 came back
-  "generic is not acceptable", a recorded statement of what is saved instead and
-  why the smaller number is still worth the code;
-- R26 recorded: Query-tree arm at parity or better with the text arm, warm,
-  scope 1, bound parameter, on the protocol in §6;
-- `installcheck`, isolation, injection_points green, and the suite re-run under
-  `debug_discard_caches = 1` (SPECIALIZE.md §7b — it is not in `make check`, so
-  nothing will remind you);
-- `safety/rundiff.sh` quiet across all 21 shapes, both GUC arms.
+- **R27** (the rewrite/plan split) and **R28** (this protocol's noise floor)
+  recorded;
+- the source plan is reused **and no planning occurs** on a warm repeat refresh
+  in the constant-literal cell, proven by step C's plancache-state assertion, not
+  by timing;
+- a base-table change invalidates the source plansource, with a test;
+- **R29** recorded: Query-tree arm at parity with the text arm, warm, constant
+  literal, scope 1, arms `querytree` off/on, **no VACUUM between timed
+  refreshes**;
+- `mutations.py --check` 17/17 and `profile.py --check` green, both repaired in
+  the commits that break them;
+- `installcheck` 250/250, isolation, injection_points green;
+  `debug_discard_caches = 1` green with step C's reuse case explicitly guarded;
+  `contrib/pg_stat_statements` is **15/16** and stays that way — B25 is
+  pre-existing and deliberately red;
+- `rundiff.sh` quiet across the corpus, both GUC arms.
 
 It is **not** done because the code compiles and the tests are green. B14's first
 fix was green throughout.
+
+## 9. Corrections from the three-reviewer pass, not otherwise visible above
+
+All three reviewers returned DO NOT PROCEED and agreed on thirteen findings.
+These are the ones whose fix is a deletion or a one-word change and would
+otherwise leave no trace.
+
+| was | is |
+|---|---|
+| "a literal predicate … never reaches a saved plansource" | only a **varying** literal misses; a constant literal hits, and R26 is a constant-literal measurement (§1) |
+| "a narrow range predicate at scope 1 is exactly the cell where the deficit lives" | `projection`'s span-1 predicate is `id = :k`, the **key** shape. R1's `+28.6%` is the **range** row; key/span-1 is **−5.2%**. This is RESULTS.md's own regrouping hazard, repeated |
+| "`pg_plan_query` is the 12.20 µs" | rewrite **and** plan together; the split is R27 |
+| "nothing else re-plans … the source is half the planning work" | the fused DML re-plans per call under a bound parameter (4.1: 138.7 against 51.4 µs). Warm, the source is 12.20 against `SPI_prepare`'s 0.79 — ~94%, not half |
+| "12.20 µs, 22% of a warm refresh" | 16.2% (R13, canonical); 12.20/61.6 = 19.8%; 22% has no protocol |
+| "all seven of plancache's callbacks" | **eight**: one relcache + seven syscache |
+| "all 21 shapes" | **23 defined** (`exh.sql` 10, `exh2.sql` 3, `exh3.sql` 10), **22 in `calibrate.baseline`**. R18's run really was over 21, so it is *stale, not wrong* — flagged there, and it needs re-running before the exit criteria in §8 can cite a count |
+| step D "in the style `matview_where_inject` already uses" | that is the SQL-injection suite; the injection-*point* precedent is under `src/test/modules/injection_points/specs/` |
+| §0 "task #17" | task IDs are session-local and mean nothing in this file; refer to items by their ISSUES.md or PLAN.md name |

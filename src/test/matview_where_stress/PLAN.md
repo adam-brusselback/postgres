@@ -27,9 +27,9 @@ the text path. Six steps close that, and the first three are one piece of work:
 
 | | | state |
 |---|---|---|
-| 1 | **3.7 — cache the source plan**, on a corrected invalidation | **next**; the subplan is **CACHE.md**, and it opens with a go/no-go — caching a plansource does not stop planning when plancache picks a custom plan, and for our shape it usually will |
+| 1 | **3.7 — cache the source plan** | **next**; the subplan is **CACHE.md**.  Scoped to the **constant-literal** cell, which is what R26 measured and where `params` is NULL, so plancache serves a generic plan unconditionally and the whole 12.20 µs is recoverable |
 | 2 | flip the querytree default, re-run the differential harness and the benchmark sweep (2.1b) | blocked on 1 |
-| 3 | B2 / the invalidation restructure | pulled forward into 1 — CACHE.md §4 |
+| 3 | B2 / the invalidation restructure | **its own item.**  Pulling it into 1 was justified by an argument the project's own measurements refute (3.1), and it reopens B7 — CACHE.md §4 |
 | 4 | delete the text path, the two GUCs, and the oracle's A/B axis | blocked on 2 |
 | 5 | B15 — warn, error, or document the blast radius | **needs a decision**, independent |
 | 6 | B25, and derived `no_delete` | independent |
@@ -1029,7 +1029,7 @@ Verdicts:
 | | verdict | why |
 |---|---|---|
 | 3.2 parameterise `Const`s | **pursue, largest** | 6.3× on the spi path, 3.8× on the Query-tree path; turns every cold refresh warm |
-| 3.7 cache the source plan | **pursue, required — NEXT.  Subplan: CACHE.md, §4b first** | 12.20 µs, 22% of a warm Query-tree refresh, and the entire reason it currently loses — but recoverable only under a *generic* plan, which R1 says is a net loss on most shapes.  CACHE.md §4b is the go/no-go |
+| 3.7 cache the source plan | **pursue, required — NEXT.  Subplan: CACHE.md** | 12.20 µs, **16.2%** of a warm Query-tree refresh (R13), and the entire reason it currently loses.  Recoverable in full in the constant-literal cell R26 was measured in, where `params` is NULL and the plan is generic unconditionally |
 | 3.8 stop deparsing for the key | **pursue** | 4.5-5.3 µs, 9% warm.  Second-order but real, and 2.3 removes the other reason it exists anyway |
 | 3.9 arbiter index scan | **drop** | 0.00-0.08 µs.  0.2% at the very most |
 | 3.10 cache sweep | **drop** | 0.00 µs.  Below the resolution of the timer, at one cache entry |
