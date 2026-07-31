@@ -1088,6 +1088,44 @@ worth half the statement at 10,000.  Re-run the phase profile at scope 100 and
 10,000 before picking anything else -- there is no reason to expect the same
 list.
 
+**4.3 ANSWERED: the ranking inverts with scope, and the winner at scale was
+dismissed at scope 1.**  Re-profiled with `profile.py` at three scopes on
+`projection`, Query-tree path, share of the whole refresh:
+
+| phase | scope 1 | scope 100 | scope 10,000 |
+|---|---|---|---|
+| whole refresh | 110 µs | 7,954 µs | 1.28 s |
+| fused upsert/prune | 52.0% | 73.6% | 76.9% |
+| **locking `SELECT`** | **21.7%** | **25.1%** | **23.0%** |
+| rewrite + plan the source | 16.2% | 0.9% | 0.0% |
+| deparse for the cache key | 7.4% | 0.2% | 0.0% |
+| execute the source | 4.9% | 0.3% | 0.1% |
+| parse-analyse the predicate | 1.5% | 0.1% | 0.0% |
+
+Everything the Tier 1 list is about -- 3.7 at 16.2%, 3.8 at 7.4%, and 3.2,
+which is a cost of *preparing* -- is gone by scope 100 and unmeasurable by
+10,000.  They are small-scope optimisations, and worth having, because a
+one-row refresh is what a row trigger issues.  But they are not the shape of
+the problem at scale and should not be described as though they were.
+
+**The locking `SELECT` is 19-25% of the refresh at every scope measured.**
+That is 3.12, which the previous round dismissed as "6.5 µs of the 33 µs the
+SQL costs" -- true, at scope 1, and the reason it looked negligible.  At scope
+10,000 it is 87 ms on the text path and 293 ms on the Query-tree one.  It scans
+every row the predicate selects and takes a row lock on each, purely to fix a
+lock order, and it is the only cost besides the DML itself that does not
+disappear as the scope grows.  It should be promoted from "listed, not
+recommended" to the second candidate after 4.2, with the caveat it always had:
+A3, P1 and P2 constrain it hard and the prize is guarded by three properties.
+Worth asking whether it can lock fewer rows -- only those the refresh will
+actually write -- rather than whether it can be removed.
+
+Caveat on the numbers above: the blocks were run back to back without a vacuum
+between them, so later blocks carry the dead rows earlier ones left.  Shares
+within a block are sound; absolute figures across blocks are not, and the
+Query-tree 10,000 row block is inflated for that reason rather than because the
+path is three times slower.
+
 **4.4 The scope is scanned twice.**  The locking `SELECT` reads every row the
 predicate selects, and the prune's anti-join reads them all again.  At scope
 10,000 that is two index scans plus a hash anti-join over one set of rows.
