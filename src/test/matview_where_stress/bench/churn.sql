@@ -219,6 +219,14 @@ BEGIN
         -- the previous iteration's refresh already absorbed its own mutation.
         EXECUTE 'REFRESH MATERIALIZED VIEW CONCURRENTLY bench.mv WHERE ' || pred;
         actual := public.churn_apply(w.id, pred, pct);
+        -- BOTH GUCs.  use_optimized in matview.c is
+        --     matview_partial_refresh_querytree && matview_partial_refresh_optimized
+        -- so with querytree off the optimized flag changes nothing: both arms
+        -- emit byte-identical SQL, the cache key matches so there is not even a
+        -- replan, and the sweep reports a tidy ~0% across every churn level for
+        -- an optimization it never enabled.  That is what this file did on its
+        -- first clean run, and the answer looked entirely plausible.
+        EXECUTE 'SET matview_partial_refresh_querytree = on';
         EXECUTE 'SET matview_partial_refresh_optimized = ' ||
                 CASE WHEN opt THEN 'on' ELSE 'off' END;
 
@@ -247,6 +255,7 @@ BEGIN
     -- the least-bloated iteration is the one reported.
   END LOOP;
   RESET matview_partial_refresh_optimized;
+  RESET matview_partial_refresh_querytree;
 END $outer$;
 
 RESET matview_partial_refresh_optimized;
