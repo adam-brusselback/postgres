@@ -58,6 +58,25 @@
 # class at all.  The violation is only visible while it is happening, which is
 # the same reason P1 needs a reader rather than an end-state assertion.
 #
+# CALIBRATION, most recent (calibrate-fuzz.sh, ITER=25 REFRESHERS=4).  Every
+# mutation is applied to matview.c, the tree rebuilt, and the whole fuzzer run
+# against it:
+#
+#   M1  CAUGHT   p2 + nest   72 of 100 deadlocked
+#   M2  CAUGHT   p3          25 of 50 deadlocked
+#   M3  CAUGHT   serial      32 lost updates
+#   M6  CAUGHT   serial      27 lost updates
+#   C2  CAUGHT   nest        50 of 100 executed the inner matview's plan
+#   A4  CAUGHT   all four    100 of 100 refreshes failed
+#   B4  MISSED   --          see below
+#   pristine     QUIET
+#
+# B4's miss is a fixture limitation and not a hole to fix here.  It duplicates
+# NULL-keyed rows, and this fixture is `id int PRIMARY KEY` with a unique index
+# on id, so the mutation has nothing to act on.  Data shapes with NULL keys and
+# multiple unique indexes belong to the differential corpus (23 of them), which
+# is where they are.  This instrument's job is concurrency.
+#
 # Probabilistic, and honest about it: absence of a failure over N iterations is
 # not proof.  It is a correctness gate -- it fails when the matview is wrong and
 # not when it is merely built differently -- which is the property that matters.
