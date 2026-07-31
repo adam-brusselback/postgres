@@ -103,6 +103,28 @@ MUTATIONS = {
                  'anti_join_op = "=";', 2),
             ]),
 
+    # The row comparison must stay null-safe.  IS DISTINCT FROM looks like an
+    # obvious candidate for "optimize to <>", and the anti-join a few lines away
+    # really does pick = when the arbiter index allows it, which makes the idea
+    # look sanctioned.  It is not: if a non-key column is NULL on either side,
+    # (a,b) <> (c,d) is NULL rather than true, the WHERE is not satisfied, and
+    # the row is silently left stale -- no error, no divergence in the row
+    # count, just a matview that disagrees with its query forever.
+    #
+    # Nor can it be gated the way the anti-join is.  A matview column never
+    # carries attnotnull, even when every source column is NOT NULL and even for
+    # one derived from a primary key, so there is no catalog fact to prove
+    # non-nullness from.
+    #
+    # Needs the optimized GUC on to be reachable at all, which needs querytree
+    # on too -- see the note on use_optimized.
+    'B7': ('-', 'data',
+           'row comparison uses <> instead of IS DISTINCT FROM '
+           '(NULL-valued rows silently never update)', [
+               ('appendStringInfo(&buf, "WHERE (%s) IS DISTINCT FROM (%s) ",',
+                'appendStringInfo(&buf, "WHERE (%s) <> (%s) ",', 1),
+           ]),
+
     'B6': ('B6', 'data',
            'arbitrate on the wrong unique index (drop the primary-key '
            'preference)', [

@@ -167,7 +167,16 @@ SELECT set_config('churn.workload', :'workload', false);
 -- inside a dollar-quoted block, so the DO block below would see the literal
 -- text and fail to parse.
 SELECT set_config('churn.optimized', :'optimized', false);
+SELECT set_config('churn.span', :'span', false);
+SELECT set_config('churn.pct', :'pct', false);
+\if :setup
 SELECT bench_setup(:'workload', 100000, 1000);
+\endif
+-- Between cells, not just at setup.  Without it the arm that rewrites every
+-- row in every cell arrives at the later cells far more bloated than the arm
+-- that skips writes, and the gap is read as the optimization getting better
+-- with churn when it is the table getting worse.  VACUUM cannot run inside the
+-- DO block, which is why the cell loop was moved out here.
 VACUUM (ANALYZE) bench.mv;
 CHECKPOINT;
 
@@ -194,7 +203,7 @@ BEGIN
   -- limitation but a fact about the axis -- at scope 1 churn is binary, the row
   -- changed or it did not -- which is worth stating rather than measuring
   -- badly.
-  FOREACH span IN ARRAY ARRAY[100, 500] LOOP
+  FOREACH span IN ARRAY ARRAY[current_setting('churn.span')::int] LOOP
     CONTINUE WHEN span >= keymaxv;
     IF span = 1 THEN pred := replace(w.pred1, ':k', '1');
     ELSE pred := replace(replace(w.predr, ':k', '1'), ':span', span::text);
@@ -208,7 +217,7 @@ BEGIN
     -- 0 is the case every existing measurement already covers, and it is the
     -- row comparison's best case; 100 is its worst.  The interesting question
     -- is where between them it stops paying.
-    FOREACH pct IN ARRAY ARRAY[0, 1, 10, 50, 100] LOOP
+    FOREACH pct IN ARRAY ARRAY[current_setting('churn.pct')::int] LOOP
       -- One setting per invocation, not both in one loop.  Running them in a
       -- loop measured the second one on a table the first had already bloated,
       -- and since the order was fixed that bias always fell on the same
