@@ -1026,17 +1026,41 @@ scope-1 refreshes with `WHERE id = $1`:
 | `force_custom_plan` | 162.1 µs |
 | **`force_generic_plan`** | **51.4 µs** |
 
-**2.7×, and larger than everything in the previous list put together.**  It is
-also faster than the constant-literal case, which still re-parses.
-`SPI_prepare_cursor(src, nargs, argtypes, CURSOR_OPT_GENERIC_PLAN)` is a
-one-line change from the `SPI_prepare()` calls today.
+**REJECTED on the full matrix.  The 2.7× was one case and did not survive.**
+Measured properly -- `bench/optmatrix.sql`, seven workloads, three predicate
+shapes, three spans, both implementations, six warm-up executions so the plan
+cache has made its choice before the clock starts, 94 comparisons:
 
-Do not adopt it on this measurement alone.  A generic plan is the wrong answer
-where a custom one is genuinely better -- a skewed predicate column, an
-`= ANY(array)` whose selectivity varies with the array -- and `auto` exists
-because of those cases.  Measure across all eight workloads and all three
-predicate shapes first, and expect the answer to be "generic, except when",
-not "generic".
+| | |
+|---|---|
+| generic faster | 30 of 94 |
+| generic slower | 63 of 94 |
+| **net across the matrix** | **-21.7%** |
+
+The sign follows the predicate shape, so it is not noise either way:
+
+| shape | span | n | generic faster by |
+|---|---|---|---|
+| **range** | **1** | 14 | **+28.6%** (best +72.8%) |
+| range | 10 | 14 | -1.2% |
+| range | 100 | 12 | -6.3% |
+| key | 1 | 14 | -5.2% |
+| array | 1 | 14 | -8.3% |
+| array | 10 | 14 | -22.5% |
+| array | 100 | 12 | -33.5% (worst -97.2%) |
+
+An array predicate needs the actual array to estimate its selectivity and a
+generic plan cannot see it -- `auto` gets that case right, and forcing generic
+costs up to 97%.  What `auto` gets wrong is a *narrow range* predicate: for
+`id BETWEEN $1 AND $1` the generic estimate assumes a wide range, so the custom
+plan always wins on estimated cost and the statement is re-planned on every
+execution.  `projection range/1` costs 497 us under `auto` against 135 us
+generic; `expensive` 490 against 149; `join_agg` 496 against 192.
+
+So: do not force generic.  The finding worth keeping is that **a narrow range
+predicate pays ~3.7x for per-call re-planning**, which is core plancache
+estimation behaviour rather than anything this patch controls.  A fix narrow
+enough to leave the array case alone is not a one-line change.
 
 **4.2 Suppress the write when the row has not changed.**  The upsert writes a
 new row version for every row in scope whether or not anything about it
