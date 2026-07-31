@@ -141,14 +141,19 @@ be orphaned and the anti-join cannot delete. If the source is empty, the mirror
 holds and the refresh is the `DELETE` alone.
 
 The oracle is single-session and will not see the hazard, which is concurrent:
-another session inserting the key between the materialise and the DML. **No
-existing spec covers that window.** The five in the tree — `lockorder`,
-`insertorder`, `deadlock`, `serialize`, `write-skew` — all test overlapping
-refreshes end to end; none of them observes the interval between materialising
-the source and running the DML, which is the interval this elision widens. A new
-`matview-where-prune-gap.spec` has to be written, and **shown to fail against a
-deliberately naive implementation before it is trusted with a correct one** — a
-detector that has never gone red is indistinguishable from a test that cannot.
+another session inserting the key between the materialise and the DML. Two specs
+already sit on that seam, both under `src/test/modules/injection_points/specs/`
+rather than `src/test/isolation/specs/`: `matview-where-snapshot` pins the gap
+between the locking SELECT and the DML, and `matview-where-prune-gap` pins the
+prune against a row another refresh committed mid-flight. The latter drives a
+key the matview does not yet hold, because a key with no row locks nothing —
+which is the only way to be inside the window at all, and the reason the fuzzer
+cannot stand in for it.
+
+What is missing is a **permutation with the elision enabled**, and it must be
+**shown to fail against a deliberately naive elision before it is trusted with a
+correct one** — a detector that has never gone red is indistinguishable from a
+test that cannot.
 
 ### 3e. What must not be specialised, on any axis
 

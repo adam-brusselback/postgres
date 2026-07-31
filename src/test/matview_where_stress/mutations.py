@@ -122,6 +122,26 @@ MUTATIONS = {
                 '\t/* C1: callback not registered */'),
            ]),
 
+    # The guard for matview-where-prune-gap.
+    #
+    # On the Query-tree path the source is evaluated into a tuplestore by a
+    # separate executor run, so the DML that reads it has to run under the SAME
+    # snapshot the evaluation used -- otherwise the prune compares a matview read
+    # at one instant against source rows computed at another, and deletes
+    # whatever appeared in between.  Passing InvalidSnapshot makes SPI take a
+    # fresh one, which is exactly that gap.
+    #
+    # The spec's header claims it was verified against a build with the bug
+    # present.  This is that claim made re-runnable rather than remembered.
+    'S1': ('-', 'concur',
+           'run the fused DML under a fresh snapshot, not the one the source '
+           'was evaluated under (reopens the prune gap)', [
+               ('\t\tif (matview_execute_spi_plan(cacheEntry->refreshPlan, params,\n'
+                '\t\t\t\t\t\t\t\t\t snapshot, false) < 0)',
+                '\t\tif (matview_execute_spi_plan(cacheEntry->refreshPlan, params,\n'
+                '\t\t\t\t\t\t\t\t\t InvalidSnapshot, false) < 0)'),
+           ]),
+
     'M1': ('A5', 'concur',
            'drop ORDER BY from the row-locking SELECT (deadlock)', [
                ('"SELECT 1 FROM %s mv WHERE (%s) ORDER BY %s FOR UPDATE"',
