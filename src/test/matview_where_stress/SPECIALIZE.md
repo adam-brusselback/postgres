@@ -11,18 +11,43 @@ invalidating a recommendation already made.
 
 ---
 
+## 0. Reading the numbers
+
+Four different quantities appear below and **they do not share a direction.**
+Earlier drafts wrote them all as bare `+`/`−` percentages, which meant a reader
+had to already know which way each one pointed. They are now spelled out:
+
+| written as | is | which way is good |
+|---|---|---|
+| **"N% faster"** / **"N% slower"** | change in how long one refresh takes | faster |
+| **"N points"** | the gap between two percentages, added to a saving that is already there — not a ratio | more |
+| **"N× the throughput"** | pgbench transactions per second, one setting over another | higher |
+| **"N% of refresh time"** | where the time goes *inside* one refresh | **neither** — it says where work sits, not whether that is good |
+
+Two traps worth naming, because both have caught this document before:
+
+- **A share is not a saving.** "The fused DML is 87% of a large refresh" says
+  where to look for wins. It does not say a win is available there, and reading
+  it as though it did is exactly how mutability came to be called the largest
+  saving available before anyone measured it (§1, mutability).
+- **A ratio's denominator has a direction too.** Where one arm writes and the
+  other does not, everything that makes writing expensive inflates the saving.
+  See the heap-state axis, and §6 for what it cost.
+
+---
+
 ## 1. The axes
 
 | axis | values | selects | evidence |
 |---|---|---|---|
-| **scope** | 1 · small · large · near-total | prune elision; whether fixed costs matter at all | measured: source planning 16.2% → 0.9% → 0.0% of the refresh at scope 1/100/10k, while the fused DML goes 52% → 58% → **87%** |
-| **predicate shape** | equality on all arbiter key columns · array · range · non-key | at-most-one-row proofs; whether the index supplies the lock order | measured: generic plan +28.6% on range/1, −33.5% on array/100. `ORDER BY` on the lock is free when the arbiter index matches the predicate column, **3.6×** when not — it hands `LockRows` the heap in random rather than physical order |
-| **index shape** | do the updated columns sit under any index? | whether an avoided write saves index maintenance or just a HOT update | measured: row comparison worth 27–53% with a covering index, **nothing** without. The magnitude is fresh-heap and overstated (see heap state); the *presence/absence* result is not, since both arms of it write |
-| **churn fraction** | share of the scope whose values actually changed | whether the row comparison pays | measured, `bench/churn.sql`: on `nonkey`/scope 10000 the saving runs **54–56 → 41–51 → 27–36 → 18–27 → ≈0%** at churn 0/5/25/50/100 (range = two protocols). Monotonic, and it reaches zero — at full churn every comparison fails and the row-wise `IS DISTINCT FROM` is bought for nothing. Break-even ≈ 60–70% |
-| **heap state** | never-updated · settled · bloated | nothing — but it decides the *measured* value of everything above | measured, `bench/heapstate.sh`: **the same comparison reads 54% or 82% depending on it.** At zero churn only the un-optimized arm writes, so free space, full-page images, extension and bloat all land on one side. A matview `bench_setup` just built is that arm's worst case; every figure taken straight after a setup is inflated |
-| **driver pattern** | D1 statement trigger · D2 queue drain · D3 scheduled window | frequency, transaction context, and the priors for every axis above | measured, `--perxact`: amortising the commit over 20 refreshes (D1) is worth **3.5–3.7× at scope 1**, **2.1–3.1× at scope 10**, **1.25–1.9× at scope 100** — then *inverts*, costing **2.1× at scope 1000 and 3.3× at scope 10000**, because 20 successive rewrites of one scope inside one transaction build update chains nothing can prune until it commits. D1 is not "D2 minus the commit" |
-| **overlap probability** | none · concurrent-disjoint · concurrent-overlapping | whether the lock and its ordering buy anything | measured, 54 cells: **zero deadlocks, zero failed transactions, zero serialization failures.** Disjoint scopes scale 3.4–5.9× from 1 to 4 clients and flatten at 16. Overlapping is where it bites — `nonkey` range/scope 1000 hot goes 161 → 141 → **26** tps as clients go 1 → 4 → 16, a collapse the lock is doing on purpose |
-| **mutability** | append-only · no-delete · general | whether the prune exists at all | measured, `bench/mutability.sql`, against the row comparison already on: dropping the prune (`no_delete`) is worth **13–19%** at scope ≥1000 (1.1% on `expensive`, where GIN maintenance dominates), and `DO NOTHING` on top of it (`append_only`) adds **10–22 points** for a total of **26–39%**. Fresh-heap protocol, but at zero churn every form compared writes little, so the bias is small here |
+| **scope** | 1 · small · large · near-total | prune elision; whether fixed costs matter at all | measured, **share of refresh time** (locates work, does not judge it): source planning 16.2% → 0.9% → 0.0% at scope 1/100/10k, while the fused DML goes 52% → 58% → **87%**. So fixed costs only matter at scope 1, and at scale there is nowhere to look but the DML |
+| **predicate shape** | equality on all arbiter key columns · array · range · non-key | at-most-one-row proofs; whether the index supplies the lock order | measured, 94 comparisons: forcing a generic plan is **21.7% slower** overall, but the spread is the point — **36–64% faster** on range/scope-1, **55% slower** on array/scope-10000. `ORDER BY` on the pre-lock is free when the arbiter index matches the predicate column and **3.6× slower** when not, because it hands `LockRows` the heap in random rather than physical order |
+| **index shape** | do the updated columns sit under any index? | whether an avoided write saves index maintenance or just a HOT update | measured: the row comparison is **27–53% faster** with a covering index and **makes no difference at all** without one. Treat the magnitude as an upper bound — it was measured fresh-heap (see below) — but not the presence/absence result, which compares two arms that both write |
+| **churn fraction** | share of the scope whose values actually changed | whether the row comparison pays | measured, `bench/churn.sql`, on `nonkey`/scope 10000 — **faster is better, and it runs out**: **54–56% faster** at churn 0, then 41–51 → 27–36 → 18–27 → **≈0%** at churn 5/25/50/100 (ranges are two protocols disagreeing). At full churn every comparison fails and the row-wise `IS DISTINCT FROM` is bought for nothing. Break-even ≈ 60–70% churn |
+| **heap state** | never-updated · settled · bloated | nothing about the code — it decides the *measured* value of everything above | measured, `bench/heapstate.sh`: one comparison reads **"54% faster" or "82% faster"** on identical code, data and boot. Neither number is better than the other; **54% is the honest one.** At zero churn only the un-optimized arm writes, so free space, full-page images, extension and bloat all land on one side of the ratio, and a matview `bench_setup` has just built is that arm's worst case |
+| **driver pattern** | D1 statement trigger · D2 queue drain · D3 scheduled window | frequency, transaction context, and the priors for every axis above | measured, `--perxact`, as **D1's throughput over D2's — above 1× D1 wins, below 1× it loses**: **3.5–3.7×** at scope 1, **2.1–3.1×** at scope 10, **1.25–1.9×** at scope 100, then it *inverts* to **0.47× (2.1× slower)** at scope 1000 and **0.30× (3.3× slower)** at scope 10000. Twenty rewrites of one scope inside one transaction build update chains nothing can prune until it commits. D1 is not "D2 minus the commit" |
+| **overlap probability** | none · concurrent-disjoint · concurrent-overlapping | whether the lock and its ordering buy anything | measured, 54 cells. Correctness first, **lower is better and all three are zero**: no deadlocks, no failed transactions, no serialization failures. Then throughput at 4 clients over 1, **higher is better**: disjoint scopes reach **3.4–5.9×**, flattening by 16 clients. Overlapping scopes go the other way — `nonkey` range/scope 1000 hot falls **161 → 141 → 26 tps** at 1 → 4 → 16 clients, which is the lock serialising on purpose, not a defect |
+| **mutability** | append-only · no-delete · general | whether the prune exists at all | measured, `bench/mutability.sql`, **on top of the row comparison rather than instead of it** — these do not add to the figures above, they are what is left after them. Dropping the prune (`no_delete`) is **13–19% faster** at scope ≥1000, and only **1.1% faster** on `expensive`, where GIN maintenance dominates. `DO NOTHING` (`append_only`) adds **10–22 points** on top, reaching **26–39% faster** in total |
 
 What mutability turns on is whether the view's output *for a scope* can lose a
 row: **no-delete** kills the prune and keeps `DO UPDATE`, removing the anti-join
@@ -158,16 +183,19 @@ Each states what it changes, which tier decides it, and **which detector
 catches it if it is wrong** — a detector nobody has watched catch anything is
 the same defect as a test that cannot fail.
 
-| specialisation | tier | effect | detector |
+The **effect** column is always "how much faster one refresh gets", so higher
+is better everywhere in it, and a *slower* entry is spelled out as such.
+
+| specialisation | tier | effect (higher = better) | detector |
 |---|---|---|---|
-| **row comparison** — `WHERE (mv.cols) IS DISTINCT FROM (EXCLUDED.cols)` on the `DO UPDATE`. *Implemented*, currently a GUC; should be T3 churn with a T1 veto when no index covers a written column | 3 + 1 | **+25–54% at zero churn**, scope ≥1000, covering index, settled heap; falls to **−9%** at full churn; **−18.5% at scope 1**; nil without the index. Quote the protocol with the number — see the heap-state axis in §1 | oracle — 22 shapes, 1636 mutations, 0 divergences |
-| **cache the source plan** — removes rewrite + plan from every refresh | — | 12.2 µs, 16.2% at scope 1, ~0 at scale | `matview_where_cache` 1–3, which need a **base-table** variant: a stashed `PlannedStmt` is not revalidated when a base table changes, so this must go through the plancache, not a pointer |
-| **stop deparsing for the cache key** — store the qual tree, compare with `equal()`, deparse only on a miss | — | 4.5–5.3 µs, 7.4% at scope 1. Closes **B3**: the tree carries parameter types, `$1` does not | `matview_where_cache` Test 4, already two predicates that deparse identically and need different plans |
-| **parameterise predicate `Const`s** | — | **8×**, by turning cold refreshes warm | oracle. Changes what the cache key *is*, so it lands first or last, never in the middle |
-| **skip the prune** when the source is **empty** — the non-empty case is now covered by derived `no_delete` below, which needs no at-most-one-row proof | 1 + 2 | the mirror of the row above: this is the row-trigger delete path, and it applies at *any* scope | **none yet** — see 3c |
-| **drop both `ORDER BY`s** | 1 | small: the index already supplies the order in the aligned case | oracle |
-| **drop the prune** — `no_delete`, now **derived** rather than declared: `n_locked + n_inserted == n_source` means nothing in scope is orphaned | **2**, not 4 | **13–19%** at scope ≥1000 on top of the row comparison; 1.1% on `expensive`, where GIN maintenance dominates everything | oracle, plus the `mutations.py` entry that forces the elision when the counts do *not* agree |
-| **`DO NOTHING`** (`append_only`) — the half that cannot be derived, because no count taken during a refresh proves existing rows never need rewriting | 4 | a further **10–22 points**, taking the pair to 26–39% at scope ≥1000 | sampling verifier, plus a `mutations.py` entry declaring `append_only` on a view that updates |
+| **row comparison** — `WHERE (mv.cols) IS DISTINCT FROM (EXCLUDED.cols)` on the `DO UPDATE`. *Implemented*, currently a GUC; should be T3 churn with a T1 veto when no index covers a written column | 3 + 1 | **25–54% faster** at zero churn — scope ≥1000, covering index, settled heap. Degrades with churn to **9% slower** at full churn, and is **18.5% slower** at scope 1, where the comparison costs more than the write it avoids. No effect at all without a covering index. Always quote the protocol with the number — see heap state in §1 | oracle — 22 shapes, 1636 mutations, 0 divergences |
+| **cache the source plan** — removes rewrite + plan from every refresh | — | **12.2 µs faster** per refresh — worth **16.2%** at scope 1 and nothing at scale, because it is a fixed cost | `matview_where_cache` 1–3, which need a **base-table** variant: a stashed `PlannedStmt` is not revalidated when a base table changes, so this must go through the plancache, not a pointer |
+| **stop deparsing for the cache key** — store the qual tree, compare with `equal()`, deparse only on a miss | — | **4.5–5.3 µs faster** per refresh, **7.4%** at scope 1, again fixed. Closes **B3**: the tree carries parameter types, `$1` does not | `matview_where_cache` Test 4, already two predicates that deparse identically and need different plans |
+| **parameterise predicate `Const`s** | — | **8× faster**, by turning refreshes that would miss the plan cache into hits | oracle. Changes what the cache key *is*, so it lands first or last, never in the middle |
+| **skip the prune** when the source is **empty** — the non-empty case is now covered by derived `no_delete` below, which needs no at-most-one-row proof | 1 + 2 | unmeasured. It is the mirror of the row above — the row-trigger delete path — and it applies at *any* scope | **none yet** — see 3c |
+| **drop both `ORDER BY`s** | 1 | small, and only in the aligned case, where the index already supplies the order | oracle |
+| **drop the prune** — `no_delete`, now **derived** rather than declared: `n_locked + n_inserted == n_source` means nothing in scope is orphaned | **2**, not 4 | **13–19% faster** at scope ≥1000, measured *on top of* the row comparison rather than instead of it; only **1.1% faster** on `expensive`, where GIN maintenance dominates | oracle, plus the `mutations.py` entry that forces the elision when the counts do *not* agree |
+| **`DO NOTHING`** (`append_only`) — the half that cannot be derived, because no count taken during a refresh proves existing rows never need rewriting | 4 | a further **10–22 points** on top of `no_delete`, taking the pair to **26–39% faster** at scope ≥1000 | sampling verifier, plus a `mutations.py` entry declaring `append_only` on a view that updates |
 
 ### 3c. The at-most-one-row proof, and why it needs a new detector
 
@@ -228,7 +256,7 @@ concurrency gain that will never appear in a single-client sweep.
   which is far from where the current scope-based gate sits; the gate was right
   by correlation and should stop relying on it.
 - `Const` parameterisation after that, since it redefines the cache key.
-- `append_only` **last, or never**. It is worth 10–22 points on top of
+- `append_only` **last, or never**. It is worth 10–22 points faster on top of
   `no_delete`, which is real, but it is the only item left that needs a
   declaration — and a declaration whose failure mode is rows that silently
   never leave has to earn its surface against that number, not against zero.
@@ -271,22 +299,25 @@ matters, what its numbers are still worth — is below.
    no-delete matview. Largest saving, zero data.~~ Closed by
    `bench/mutability.sql`, which hand-writes the six statement forms and times
    them against a plain-heap clone, because the code cannot emit four of them
-   yet. Against the row comparison already on: `no_delete` **13–19%** at scope
-   ≥1000, `append_only` a further **10–22 points**. It was billed as the largest
+   yet. Measured on top of the row comparison rather than instead of it:
+   `no_delete` is **13–19% faster** at scope ≥1000, and `append_only` adds a
+   further **10–22 points**. It was billed as the largest
    saving available; it is real but it is not that. The bigger consequence is
    §2: the `no_delete` half does not need declaring at all, which leaves
    `append_only` as the only declared thing in the design.
 2. ~~**Concurrency** — `--clients 4,16 --overlap hot`, plus `fuzz.sh`.~~ Closed,
    54 cells: **zero deadlocks, zero failed transactions, zero serialization
    failures** at 1/4/16 clients across both overlap settings. Disjoint scales
-   3.4–5.9× to 4 clients then flattens. Overlapping collapses where it should —
-   `nonkey` range/scope 1000 hot falls to 26 tps at 16 clients — and that
+   to **3.4–5.9× the throughput** at 4 clients then flattens. Overlapping goes
+   the other way — `nonkey` range/scope 1000 hot falls to 26 tps at 16 clients,
+   down from 161 at one client — and that
    collapse is the lock working, not failing. `--overlap hot` is still one point
    ("everyone fights over keys 1–10") rather than a sweep of intersection
    probability, which is the part left undone.
 3. ~~**Churn** — `--mutate on` across a varying changed-fraction.~~ Closed by
-   `bench/churn.sql`: 54–56 → 41–51 → 27–36 → 18–27 → ≈0% at churn
-   0/5/25/50/100 on `nonkey`/scope 10000, break-even ≈ 60–70%. The gate is on
+   `bench/churn.sql`, as percent faster: **54–56 → 41–51 → 27–36 → 18–27 →
+   ≈0** at churn 0/5/25/50/100 on `nonkey`/scope 10000. Break-even ≈ 60–70%
+   churn, past which it is not worth turning on. The gate is on
    scope, and scope is still a proxy — but the proxy now has the curve behind
    it rather than an argument about driver patterns. Remaining weakness:
    `churn.sql` measures one arm per invocation, so the comparison is
@@ -295,16 +326,22 @@ matters, what its numbers are still worth — is below.
    Cells where the two arms are close need an alternating harness.
 4. ~~**The match/merge crossover** — needs a deliberate 50/75/90/100% sweep with
    the `run.sh` ≥90% guard lifted.~~ Closed, and **there is no crossover.**
-   Direct modification wins at every scope swept, and by a widening margin:
+   Throughput of direct modification over match/merge — **above 1× direct
+   modification wins, and it never gets near 1×**:
 
-   | scope of matview | 10% | 25% | 50% | 75% | 90% |
+   | predicate covers … of the matview | 10% | 25% | 50% | 75% | 90% |
    |---|---|---|---|---|---|
-   | `aggregate` (1000 rows) | +63% | +43% | +31% | +34% | +34% |
-   | `timerange` (20001 rows) | +68% | +101% | +106% | +109% | +95% |
+   | `aggregate` (1000 rows) | 1.63× | 1.43× | 1.31× | 1.35× | 1.34× |
+   | `timerange` (20001 rows) | 1.68× | 2.01× | 2.06× | 2.09× | 1.95× |
 
-   Match/merge builds a transient heap of the whole scope and diffs it whatever
-   happens; direct modification's cost tracks what actually changed. So the
-   region where match/merge should have won is the region where it loses worst.
+   The margin does not close as the predicate widens: it narrows a little on
+   `aggregate` (1.63× to 1.34×) and widens on `timerange` (1.68× to 1.95×),
+   with no sign of converging on either. Match/merge builds a transient heap of
+   the whole scope and diffs it no matter what; direct modification's cost
+   tracks what actually changed. So the region where match/merge should have
+   won — near-total scopes, where it does the same work either way — is the
+   region where it loses by the most on the larger matview.
+
    It keeps its place in the code for the case the fast path cannot serve — more
    than one unique index, where there is no single arbiter to conflict on — and
    that is a capability boundary, not a performance one.
@@ -338,18 +375,20 @@ deliberately (§4). `FOR NO KEY UPDATE` on the pre-lock.
 **Sized, unimplemented** — source plan caching, deparse elision, `Const`
 parameterisation, derived `no_delete`, `append_only`.
 
-**Measured and rejected** — forcing a generic plan (net −21.7% over 94
-comparisons), the arbiter index scan (0.08 µs), the cache sweep (below timer
-resolution), bypassing SPI (~2 µs per statement, not the ~20 a noisy run
-suggested).
+**Measured and rejected** — forcing a generic plan (**21.7% slower** overall,
+time-weighted over 94 comparisons; faster only on range/scope-1), the arbiter
+index scan (0.08 µs), the cache sweep (below timer resolution), bypassing SPI
+(~2 µs per statement, not the ~20 a noisy run suggested).
 
-**Benchmark `p3opt`** — 4 of 7 workloads: `nonkey` +26–35%, others +4–16% at
-scope ≥100, −18.5% at scope 1. **Do not quote the positive figures.** The label
-covers two runs 2h43m apart (01:36–01:56 and 04:39–04:55) with server restarts
-at 03:20 and 03:27 between them, so its two halves were measured on different
-postmaster incarnations. It predates `bench_result.server_start`, which is why
-this had to be reconstructed from the server log rather than read off the row.
-The −18.5% at scope 1 is corroborated elsewhere; the rest needs re-measuring.
+**Benchmark `p3opt`** — 4 of 7 workloads: `nonkey` **26–35% faster**, others
+**4–16% faster** at scope ≥100, and **18.5% slower** at scope 1. **Do not quote
+the faster figures.** The label covers two runs 2h43m apart (01:36–01:56 and
+04:39–04:55) with server restarts at 03:20 and 03:27 between them, so its two
+halves were measured on different postmaster incarnations. It predates
+`bench_result.server_start`, which is why this had to be reconstructed from the
+server log rather than read off the row.
+The 18.5%-slower result at scope 1 is corroborated elsewhere; the rest needs
+re-measuring.
 
 **Provenance of the gap runs** — `gaps-concurrency`, `gaps-crossover`,
 `gaps-txn-d1` and `gaps-txn-d2` also predate `server_start`, but the log puts
