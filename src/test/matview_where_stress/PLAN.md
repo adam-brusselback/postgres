@@ -27,16 +27,18 @@ the text path. Six steps close that, and the first three are one piece of work:
 
 | | | state |
 |---|---|---|
-| 1 | **3.7 — cache the source plan** | **next**; the subplan is **CACHE.md**.  Scoped to the **constant-literal** cell, which is what R26 measured and where `params` is NULL, so plancache serves a generic plan unconditionally and the whole 12.20 µs is recoverable |
+| 1 | **3.7 — cache the source plan** | **in progress**; the subplan is **CACHE.md**, step 0 done.  Scoped to the **constant-literal** cell, where `params` is NULL so plancache serves a generic plan unconditionally.  Planning is **97.3%** of the source line (R27), but it is only **56%** of the deficit (R28) — necessary, not sufficient |
 | 2 | flip the querytree default, re-run the differential harness and the benchmark sweep (2.1b) | blocked on 1 |
 | 3 | B2 / the invalidation restructure | **its own item.**  Pulling it into 1 was justified by an argument the project's own measurements refute (3.1), and it reopens B7 — CACHE.md §4 |
 | 4 | delete the text path, the two GUCs, and the oracle's A/B axis | blocked on 2 |
 | 5 | B15 — warn, error, or document the blast radius | **needs a decision**, independent |
 | 6 | B25, and derived `no_delete` | independent |
 
-Step 1 gates 2 and 4 because the Query-tree path is **24% slower warm at scope
-1** (R2) until the source plan is cached, and scope-1-warm is where D1 and D2
-live. Step 4 goes last on purpose: `safety/diff_driver.sql` compares the `text`,
+Step 1 gates 2 and 4 because the Query-tree path is slower warm at scope 1 until
+the source plan is cached, and scope-1-warm is where D1 and D2 live.  **The
+magnitude is unsettled**: R26 recorded 24%, a re-run on the same protocol gives
+98% (R28), and R26 is now `provisional` — the direction holds, the number does
+not. Step 4 goes last on purpose: `safety/diff_driver.sql` compares the `text`,
 `qt` and `qtopt` arms, so deleting the GUCs deletes the oracle's comparison axis.
 They are scaffolding, but they are the scaffolding the safety net hangs from.
 

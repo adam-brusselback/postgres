@@ -51,10 +51,37 @@ query on **every** refresh:
     sourceQuery = linitial_node(Query, rewritten);
     plan = pg_plan_query(sourceQuery, NULL, CURSOR_OPT_PARALLEL_OK, params, NULL);
 
-**The 12.20 µs is rewrite *and* plan together**, not `pg_plan_query` alone —
-`profile.py`'s `MVP_SRCPLAN` timer opens before `AcquireRewriteLocks` and closes
-after `pg_plan_query`, and PLAN.md labels the row accordingly. The split is
-unknown; §5 step 0 measures it.
+**The 12.20 µs was rewrite *and* plan together**, not `pg_plan_query` alone —
+`profile.py`'s timer opened before `AcquireRewriteLocks` and closed after
+`pg_plan_query`. **Measured** (R27): the plan is **97.3%** of that line, the
+rewrite **2.7%** (41.25 µs against 1.13 µs). So the prize is the plan half, and
+the rewrite is not worth designing around.
+
+### Two things step 0 found that change what 3.7 can claim
+
+**3.7 is necessary but not sufficient (R28).** In one run, both arms, same clone
+and boot: text **75.42 µs** against Query-tree **149.58 µs** per refresh, a
+**74.16 µs** deficit. `srcplan` is **41.25 µs of it — 56%**. `srcbuild` (5.30)
+and `srcexec` (9.94) are most of the remainder, and `srcexec` is work the text
+arm does inside `dmlexec`, so it is not a like-for-like saving. **R26's
+explanation — "the whole deficit is one line" — is false.** Caching the source
+plan closes a bit over half the gap; something else has to close the rest, and
+step E's re-measurement must be read with that in mind rather than as a
+pass/fail on parity.
+
+**R26's magnitude did not reproduce, and it is now `provisional`.** The recorded
+deficit is 24%; on this container, on R26's own protocol, it is **98%**. Both
+arms slowed — text 1.52×, Query-tree 2.43× — so it is not a uniform environment
+shift. The container is not the one R2 ran on and the tree has changed since;
+the cause is unestablished. **The direction and sign hold and the case for 3.7 is
+stronger, not weaker. Do not quote 24% again until it is re-measured.** This is
+RESULTS.md's cross-boot hazard, and the fix is to re-measure both arms in one
+run — which step E does anyway.
+
+**And the cache is not being dropped (R29).** `prepare = 0.0` in all nine warm
+bands of both arms: over 270 refreshes each, the plans were prepared once and
+never rebuilt. That is direct confirmation of PLAN.md 3.1 and of §4's reason for
+taking B2's restructure out of this work — observed now, not inferred.
 
 ### The cell this was measured in, which decides everything below
 
@@ -207,22 +234,27 @@ The rule this project keeps relearning: **a test that has not been seen to fail
 is not evidence.** Each step names what must go red first, or says plainly that
 nothing can.
 
-### 0. Repair the instruments, and split the 12.20 µs
+### 0. Repair the instruments, and split the 12.20 µs — **DONE**
 
-Not a go/no-go any more — §1 settled that — but first, because the tooling is
-broken and the split is unknown.
+Returned R27 (the split), R28 (necessary but not sufficient) and R29 (the cache
+survives). Both findings that change the plan are in §1. What was done:
 
-- **`profile.py` does not run against HEAD.** Its edit #3 anchors on
-  `matview_cache_sweep();` followed by the old `hash_search` call; commit
-  `49a3528` (B14's fix) moved the sweep inside `if (use_cache)` and rewrapped the
-  assignment, so `profile.py on` exits *"pattern not found"* and instruments
-  nothing. 13 of 14 edits still match. **Repair it, and give it a `--check` like
-  `mutations.py` has** — this is ISSUES.md B23's rot one file over, and B23's
-  lesson was that a silently half-applied edit still yields a plausible number.
-- **Split the 12.20 µs**: `INSTR_TIME` around `pg_plan_query()` alone, R2's
-  protocol (300 constant-literal scope-1 refreshes of `projection`), revert the
-  instrumentation. Record as **R27**. It sizes the prize and says whether R26's
-  explanation — "the whole deficit is one line" — is right.
+- **`profile.py` had not instrumented anything since `49a3528`** — this session's
+  own B14 fix moved the sweep its edit anchored on. 13 of 14 patterns matched, so
+  `on` exited having written nothing, and the only symptom would have been a
+  phase profile that never appeared. Repaired, and given a `--check` that reports
+  **every** miss rather than the first: 15/15. This was ISSUES.md B23's rot one
+  file over.
+- The sweep edit became **two** edits, which is not cosmetic:
+  `MVP_STOP(MVP_ARBITER)` must fire before `if (use_cache)`, because a nested
+  refresh takes the `else` arm and would otherwise leave that timer running
+  across the whole refresh. Re-anchoring the old pattern inside the branch would
+  have reintroduced that quietly.
+- **A GUC trap worth recording**, because it is the same shape as the ones the
+  reviews caught: the first version of the measurement script set no GUCs, and
+  `matview_materialize_source()` — where both new timers live — is reached only
+  when `querytree=on`, which boots `false`. It would have run cleanly and
+  reported zeros.
 
 ### A. Source plan through plancache, per-refresh lifetime
 
@@ -327,18 +359,20 @@ Otherwise: alternate arms on the same clone, equal sample counts per arm (the
 per-form adaptive budget was worth 8–9.5 points elsewhere), scope 1000 as a
 control where the effect should be ~0 either way.
 
-**Success**: the Query-tree arm at scope 1 warm reaches **parity** with the text
-arm — the difference *inside* the floor, not outside it. The previous draft said
-"no worse than … outside R12's noise floor", which demands the opposite of parity
-and is readable two ways.
+**Success**: R28 says parity is **not achievable by 3.7 alone** — `srcplan` is
+56% of the deficit. So the bar is a **measured reduction of the deficit by
+roughly the `srcplan` share**, with the residual attributed. Claiming parity as
+the target would fail a working implementation. (The previous draft additionally
+said "no worse than … outside R12's noise floor", which demands the opposite of
+parity and is readable two ways.)
 
 **Establish the floor first.** R12's 6.8–11.3% is a between-clone wobble on a
 **2.5 ms** cell from `bench/orderby-floor.sh`. This is a ~50–62 µs in-backend
 `INSTR_TIME` cell on one clone. Quoting R12 here breaks RESULTS.md's own rule and
 gives an acceptance band wide enough to hide the entire 12.20 µs. Measure the
-floor of *this* protocol, record it as **R28**, then set the bar.
+floor of *this* protocol, record it as **R30**, then set the bar.
 
-Record the result as **R29**. Not R26 — that is the "before" number this work is
+Record the result as **R31**. Not R26 — that is the "before" number this work is
 justified by, it is `settled`, and overwriting it destroys the comparison.
 
 ## 7. Recorded but not built: why one plan per matview may not be enough
@@ -372,13 +406,14 @@ something by reasoning.
 
 ## 8. Exit criteria
 
-- **R27** (the rewrite/plan split) and **R28** (this protocol's noise floor)
-  recorded;
+- **R27** (the split), **R28** (necessary-not-sufficient) and **R29** (the cache
+  survives) recorded — **done**; this protocol's noise floor still outstanding
+  and now **R30**;
 - the source plan is reused **and no planning occurs** on a warm repeat refresh
   in the constant-literal cell, proven by step C's plancache-state assertion, not
   by timing;
 - a base-table change invalidates the source plansource, with a test;
-- **R29** recorded: Query-tree arm at parity with the text arm, warm, constant
+- **R31** recorded: Query-tree arm measurably closer to the text arm, warm, constant
   literal, scope 1, arms `querytree` off/on, **no VACUUM between timed
   refreshes**;
 - `mutations.py --check` 17/17 and `profile.py --check` green, both repaired in
