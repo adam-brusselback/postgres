@@ -22,11 +22,13 @@
 #           INSERTs rather than UPDATEs, and the conflict is between two
 #           speculative insertions of the same key.  Signal: deadlock.
 #
-#   nest    A refresh whose view definition issues another REFRESH ... WHERE.
-#           COVERAGE, NOT A CALIBRATED DETECTOR -- see the note on its own
-#           section.  Nothing else in the tree exercises nesting under
-#           concurrency, and its end-state assertions are real, but it has NOT
-#           been shown to catch the bug it was written for.
+#   nest    A refresh whose view definition issues another REFRESH ... WHERE,
+#           run concurrently with a separate backend committing DDL so the
+#           invalidations arrive on their own.  B14's class, which nothing else
+#           covers.  CALIBRATED: catches C2 in 5 runs of 5, 49-50 of 100 -- i.e.
+#           essentially every refresh in the querytree arm.  Signal: an error
+#           naming the inner matview, a dead backend, or either matview
+#           disagreeing with itself.
 #
 #   serial  Overlapping refreshes serialize (what A3's FOR UPDATE is for).
 #           A writer drives the base monotonically upward while N sessions
@@ -120,6 +122,28 @@ check_plans() {
 
 deadlocks_in() { grep -c 'deadlock detected' "$1" 2>/dev/null || true; }
 
+# Errors that are NOT deadlocks.
+#
+# p2 and p3 counted deadlocks, and deadlocks only.  A mutation that stops every
+# refresh from running at all therefore reported a clean pass: measured with A4
+# applied, which drops ON CONFLICT so each refresh dies of a unique violation --
+# 40 of 40 failed, the transactions rolled back, the matview was consequently
+# still correct, and the run said "ok: no deadlocks" and "matview matches its
+# definition" and exited 0.  Two green assertions, zero refreshes.
+#
+# Deadlocks stay counted separately because for p2 and p3 they are the SIGNAL,
+# not a failure of the harness.
+# NB the anchor.  psql -f prefixes every message with "psql:FILE:LINE: ", so a
+# '^ERROR:' pattern matches output from -c and silently never matches output
+# from -f.  That bug is not hypothetical: it is what made the nest mode below
+# report nine consecutive clean runs against a build with the guard removed,
+# and the negative calibration written on the strength of those runs was wrong.
+# Match both forms, and only the ERROR line, so DETAIL and CONTEXT are not
+# counted as separate failures.
+other_errors_in() {
+    grep -E '(^|: )ERROR:' "$1" 2>/dev/null | grep -vc 'deadlock detected' || true
+}
+
 # A backend that died takes its output with it, so "no deadlocks" from a file
 # that ends early is not a pass.
 crashed_in() {
@@ -184,13 +208,19 @@ mode_p2() {
     done
     wait $pp
 
-    d=0
+    d=0; e=0
     j=1
     while [ "$j" -le "$REFRESHERS" ]; do
         d=$(( d + $(deadlocks_in "$WORKDIR/p2-$j.out") ))
+        e=$(( e + $(other_errors_in "$WORKDIR/p2-$j.out") ))
         j=$((j + 1))
     done
 
+    if [ "$e" -gt 0 ]; then
+        say "  FAIL: $e of $((ITER * REFRESHERS)) refreshes failed (not a deadlock)"
+        grep -hE '(^|: )ERROR:' "$WORKDIR"/p2-*.out 2>/dev/null | grep -v deadlock | head -2
+        fail=1
+    fi
     if [ "$d" -gt 0 ]; then
         say "  FAIL: $d of $((ITER * REFRESHERS)) refreshes deadlocked"
         fail=1
@@ -209,7 +239,7 @@ mode_p3() {
     setup
     check_plans || { say "  SKIP"; return 0; }
 
-    d=0
+    d=0; e=0
     i=0
     while [ "$i" -lt "$ITER" ]; do
         $PSQL -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<SQL
@@ -226,9 +256,14 @@ SQL
         pb=$!
         wait $pa $pb
         d=$(( d + $(deadlocks_in "$WORKDIR/pa.out") + $(deadlocks_in "$WORKDIR/pb.out") ))
+        e=$(( e + $(other_errors_in "$WORKDIR/pa.out") + $(other_errors_in "$WORKDIR/pb.out") ))
         i=$((i + 1))
     done
 
+    if [ "$e" -gt 0 ]; then
+        say "  FAIL: $e of $((ITER * 2)) refreshes failed (not a deadlock)"
+        fail=1
+    fi
     if [ "$d" -gt 0 ]; then
         say "  FAIL: $d of $((ITER * 2)) refreshes deadlocked"
         fail=1
@@ -308,12 +343,18 @@ SQL
     wait $pw $pm
 
     v=$($PSQL -Atc "SELECT count(*) FROM fz_viol")
-    d=0
+    d=0; e=0
     j=1
     while [ "$j" -le "$REFRESHERS" ]; do
         d=$(( d + $(deadlocks_in "$WORKDIR/r$j.out") ))
+        e=$(( e + $(other_errors_in "$WORKDIR/r$j.out") ))
         j=$((j + 1))
     done
+    if [ "$e" -gt 0 ]; then
+        say "  FAIL: $e of $((ITER * REFRESHERS)) refreshes failed (not a deadlock)"
+        grep -hE '(^|: )ERROR:' "$WORKDIR"/r*.out 2>/dev/null | grep -v deadlock | head -2
+        fail=1
+    fi
 
     if [ "${v:-0}" -gt 0 ]; then
         say "  FAIL: $v lost updates (matview total went backwards)"
@@ -364,32 +405,22 @@ SQL
 # swallows it, and the nested refresh never runs at all.  That is exactly how
 # the first version of Test 5 passed against the unfixed code -- RESULTS.md R23.
 #
-# CALIBRATION RESULT, AND IT IS NEGATIVE.  Read this before trusting a green run.
+# CALIBRATION: catches mutations.py C2 -- the B14 guard removed, so a nested
+# refresh shares the session cache and the use-after-free is live -- in 5 runs of
+# 5, at 49-50 of 100, which is essentially every refresh in the querytree arm.
 #
-# Measured against a build with mutations.py C2 applied -- the B14 guard removed,
-# so a nested refresh shares the session cache and the use-after-free is live.
-# One run reported every on-arm refresh executing the inner matview's plan.  It
-# has not reproduced since: 0 in 6 at 4 sessions x 25, and 0 in 3 at 8 sessions
-# x 60, on the same binary.  The single fire is unexplained and is not claimed
-# as a rate.
+# An earlier version of this comment recorded the opposite, on nine consecutive
+# clean runs against that same broken build, and concluded the mode could not
+# gate B14's class.  That was wrong, and the cause was one character of grep:
+# the wrong-plan counter was anchored '^ERROR:', psql prefixes every message
+# from -f with "psql:FILE:LINE: ", and the pattern therefore could not match the
+# output this mode produces.  The mode had been working the whole time.
 #
-# So this mode does NOT gate B14's class, and the honest reading is that
-# concurrency makes that class HARDER to hit rather than easier.  The
-# single-session test lands it deterministically because it controls the
-# ordering: matview_where_cache Test 5 issues the invalidating ALTER TABLE from
-# the refreshing backend itself, at a fixed point inside the nested call, so the
-# free always falls inside the enclosing refresh's execution.  Here the DDL
-# commits elsewhere and has to be picked up in a window microseconds wide.  That
-# is the same shape as the insert-driven P1 mode this file's header records
-# deleting -- "the window is microseconds wide ... chance does not land there".
-#
-# It is kept rather than deleted because, unlike that one, it is not only a
-# detector.  It asserts that both matviews still match their definitions, that
-# no unexpected error reaches the client, and that no backend died -- which hold
-# whatever the cause, and nothing else in the tree runs a nested refresh
-# concurrently at all.  Treat a green run as coverage, not as evidence.
-#
-# The deterministic gate for this class is matview_where_cache Test 5.
+# Worth stating plainly, because it is the fourth instrument in this directory
+# to fail silently: a detector reporting zero is indistinguishable from a
+# detector that cannot report.  The only defence is running it against a build
+# where the bug is known to be present -- which is what calibrate-fuzz.sh is
+# for, and what should have been done before writing any calibration down.
 #
 # Three signals, because the failure has three faces (RESULTS.md R22):
 #   wrong plan   the outer refresh executes the INNER matview's plan and reports
@@ -504,12 +535,12 @@ SQL
     errs=0; crash=0; wrongplan=0
     j=1
     while [ "$j" -le "$REFRESHERS" ]; do
-        errs=$((  errs  + $(grep -c '^ERROR:' "$WORKDIR/n$j.out" 2>/dev/null || true) ))
+        errs=$((  errs  + $(grep -cE '(^|: )ERROR:' "$WORKDIR/n$j.out" 2>/dev/null || true) ))
         crash=$(( crash + $(crashed_in "$WORKDIR/n$j.out") ))
         # Anchor on the ERROR line.  A bare match counts the CONTEXT line too
         # and reports exactly double, which looks like a rate rather than a
         # miscount and would have been quoted as one.
-        wrongplan=$(( wrongplan + $(grep -c '^ERROR:.*fz_nest_inner' "$WORKDIR/n$j.out" 2>/dev/null || true) ))
+        wrongplan=$(( wrongplan + $(grep -cE '(^|: )ERROR:.*fz_nest_inner' "$WORKDIR/n$j.out" 2>/dev/null || true) ))
         j=$((j + 1))
     done
 
@@ -521,11 +552,11 @@ SQL
         fail=1
     elif [ "$wrongplan" -gt 0 ]; then
         say "  FAIL: $wrongplan of $((ITER * REFRESHERS)) refreshes executed the INNER matview's plan"
-        grep -m2 -A1 '^ERROR:' "$WORKDIR"/n*.out 2>/dev/null | head -6
+        grep -m2 -A1 -E '(^|: )ERROR:' "$WORKDIR"/n*.out 2>/dev/null | head -6
         fail=1
     elif [ "$errs" -gt 0 ]; then
         say "  FAIL: $errs unexpected error(s) reached the client"
-        grep -m3 '^ERROR:' "$WORKDIR"/n*.out 2>/dev/null
+        grep -m3 -E '(^|: )ERROR:' "$WORKDIR"/n*.out 2>/dev/null
         fail=1
     else
         say "  ok: no errors in $((ITER * REFRESHERS)) nested refreshes"
