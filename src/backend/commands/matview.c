@@ -264,18 +264,90 @@ leakproof_checker(Oid func_id, void *context)
 	return !get_func_leakproof(func_id);
 }
 
+/*
+ * Is this node something a non-owner may have evaluated with the matview
+ * owner's privileges?
+ *
+ * This is an allowlist, and it has to be.  The previous version of this walker
+ * flagged known-bad functions and let through every node type it did not
+ * recognise, which meant a caller holding only MAINTAIN could read any table
+ * the owner could:
+ *
+ *   REFRESH MATERIALIZED VIEW CONCURRENTLY mv WHERE id = (SELECT val FROM secret)
+ *
+ * The subquery runs as the owner, and the caller then reads back which row the
+ * refresh touched -- an oracle that yields the value a row at a time.  Every
+ * sublink spelling reached it (scalar, EXISTS, ANY, one buried in a CASE), and
+ * so did a cast to a domain whose CHECK constraint calls a non-leakproof
+ * function, because that function is not in the expression tree at all.
+ *
+ * Leakproofness is the wrong question for those nodes rather than a question
+ * answered wrongly: it constrains what a FUNCTION may reveal about its
+ * arguments, and says nothing about which RELATIONS an expression may read.  So
+ * anything that can reach a relation, or reach a function that is not visible
+ * here, is refused outright and the caller must own the matview.
+ *
+ * Modelled on contain_leaked_vars_walker() in clauses.c, which solves the same
+ * problem for row-level security and defaults to unsafe for the same reason.
+ */
 static bool
 contains_non_leakproof_walker(Node *node, void *context)
 {
 	if (node == NULL)
 		return false;
-	if (check_functions_in_node(node, leakproof_checker, context))
-		return true;
+
+	switch (nodeTag(node))
+	{
+		/*
+		 * These cannot call a function or read a relation themselves, though
+		 * something below them might, so keep walking.
+		 */
+		case T_Var:
+		case T_Const:
+		case T_Param:
+		case T_BoolExpr:
+		case T_RelabelType:
+		case T_CollateExpr:
+		case T_CaseExpr:
+		case T_CaseTestExpr:
+		case T_ArrayExpr:
+		case T_RowExpr:
+		case T_CoalesceExpr:
+		case T_MinMaxExpr:
+		case T_NullTest:
+		case T_BooleanTest:
+		case T_FieldSelect:
+		case T_NamedArgExpr:
+		case T_SQLValueFunction:
+		case T_List:
+			break;
+
+		/* These call functions; every one of them must be leakproof. */
+		case T_FuncExpr:
+		case T_OpExpr:
+		case T_DistinctExpr:
+		case T_NullIfExpr:
+		case T_ScalarArrayOpExpr:
+		case T_CoerceViaIO:
+		case T_ArrayCoerceExpr:
+		case T_RowCompareExpr:
+			if (check_functions_in_node(node, leakproof_checker, context))
+				return true;
+			break;
+
+		/*
+		 * Everything else -- notably T_SubLink, which reads relations, and
+		 * T_CoerceToDomain, whose CHECK constraints are not part of this tree.
+		 */
+		default:
+			return true;
+	}
+
 	return expression_tree_walker(node, contains_non_leakproof_walker, context);
 }
 
 /*
- * True if every function reachable from the expression is leakproof.
+ * True if the expression is one a non-owner may have evaluated as the owner.
  */
 static bool
 refresh_where_clause_is_leakproof(Node *qual)

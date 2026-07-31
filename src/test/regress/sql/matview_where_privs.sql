@@ -191,7 +191,98 @@ DROP MATERIALIZED VIEW matview_mw_driver;
 DROP TABLE matview_mw_base;
 
 --
--- Test 3: matview_maintenance_depth must not leak when a refresh fails
+-- Test 3: The leakproof gate must be an allowlist, not a denylist
+--
+-- Not reported on -hackers.  Found by auditing the gate added in reply to
+-- Zsolt Parragi's report above: that gate refuses a predicate whose functions
+-- are not all leakproof, but it was written as a walker that flagged known-bad
+-- FUNCTIONS and let through every node type it did not recognise.
+--
+-- Leakproofness is the wrong question for a subquery rather than a question
+-- answered wrongly.  It constrains what a function may reveal about its
+-- arguments; it says nothing about which RELATIONS an expression may read.  A
+-- sublink reads relations as the matview owner, so a caller holding only
+-- MAINTAIN could read anything the owner could -- and then learn the value by
+-- observing which row the refresh touched.  Every sublink spelling reached it,
+-- and so did a cast to a domain whose CHECK constraint calls a non-leakproof
+-- function, because that function never appears in the expression tree.
+--
+-- The gate is now modelled on contain_leaked_vars_walker() in clauses.c, which
+-- solves the same problem for row-level security: an explicit list of node
+-- types that cannot reach a relation, and everything else refused.
+--
+
+CREATE ROLE regress_mvlp_owner;
+CREATE ROLE regress_mvlp_maint;
+CREATE SCHEMA mvlp AUTHORIZATION regress_mvlp_owner;
+GRANT USAGE ON SCHEMA mvlp TO regress_mvlp_maint;
+
+SET ROLE regress_mvlp_owner;
+CREATE TABLE mvlp.base (id int PRIMARY KEY, v text);
+INSERT INTO mvlp.base VALUES (1, 'a'), (2, 'b');
+-- The caller has no privileges on this at all.
+CREATE TABLE mvlp.secret (val int);
+INSERT INTO mvlp.secret VALUES (2);
+CREATE MATERIALIZED VIEW mvlp.mv AS SELECT id, v FROM mvlp.base;
+CREATE UNIQUE INDEX ON mvlp.mv (id);
+GRANT MAINTAIN, SELECT ON mvlp.mv TO regress_mvlp_maint;
+CREATE FUNCTION mvlp.peek(int) RETURNS bool LANGUAGE sql STABLE AS
+  $$SELECT $1 <= (SELECT val FROM mvlp.secret)$$;
+CREATE DOMAIN mvlp.dom AS int CHECK (mvlp.peek(VALUE));
+RESET ROLE;
+
+SET ROLE regress_mvlp_maint;
+
+-- Control: the caller genuinely cannot read the table.
+SELECT * FROM mvlp.secret;
+
+-- Control: a predicate over the matview's own columns is still allowed.
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvlp.mv WHERE id = 1;
+
+-- Each of these ran the subquery as the owner before the fix.  42501 is
+-- insufficient_privilege.
+DO $$
+DECLARE
+  stmt text;
+  probes text[] := ARRAY[
+    'WHERE id = (SELECT val FROM mvlp.secret)',
+    'WHERE EXISTS (SELECT 1 FROM mvlp.secret WHERE val = id)',
+    'WHERE id = ANY (SELECT val FROM mvlp.secret)',
+    'WHERE CASE WHEN id > 0 THEN id = (SELECT val FROM mvlp.secret) ELSE false END',
+    'WHERE id IN (SELECT generate_series(1, 2))',
+    'WHERE id = (1::mvlp.dom)::int'];
+  p text;
+BEGIN
+  FOREACH p IN ARRAY probes LOOP
+    BEGIN
+      EXECUTE 'REFRESH MATERIALIZED VIEW CONCURRENTLY mvlp.mv ' || p;
+      RAISE NOTICE 'ALLOWED (must not be): %', p;
+    EXCEPTION WHEN insufficient_privilege THEN
+      RAISE NOTICE 'refused: %', p;
+    END;
+  END LOOP;
+END $$;
+
+RESET ROLE;
+
+-- The owner may still use all of them: for the owner the predicate runs with
+-- the privileges it already has, so there is nothing to escalate.
+SET ROLE regress_mvlp_owner;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvlp.mv WHERE id = (SELECT val FROM mvlp.secret);
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvlp.mv WHERE id = (1::mvlp.dom)::int;
+RESET ROLE;
+
+DROP MATERIALIZED VIEW mvlp.mv;
+DROP DOMAIN mvlp.dom;
+DROP FUNCTION mvlp.peek(int);
+DROP TABLE mvlp.secret;
+DROP TABLE mvlp.base;
+DROP SCHEMA mvlp;
+DROP ROLE regress_mvlp_maint;
+DROP ROLE regress_mvlp_owner;
+
+--
+-- Test 4: matview_maintenance_depth must not leak when a refresh fails
 --
 -- Reported on -hackers by Zsolt Parragi: "There's also another issue where an
 -- error during refresh removes the modification restrictions."  Diagnosed by

@@ -142,6 +142,24 @@ MUTATIONS = {
                 '\t\t\t\t\t\t\t\t\t InvalidSnapshot, false) < 0)'),
            ]),
 
+    # The guard for matview_where_privs Test 3.
+    #
+    # Reverts the leakproof gate from an allowlist to the denylist it used to
+    # be: flag known-bad functions, let every unrecognised node type through.
+    # With this applied a caller holding only MAINTAIN can put a subquery in
+    # the predicate, have it read any relation the matview owner can read, and
+    # learn the value by observing which row the refresh touched.
+    'P1': ('-', 'privs',
+           'leakproof gate flags bad functions instead of allowing known-safe '
+           'nodes (sublinks and domain casts escape)', [
+               ('\tswitch (nodeTag(node))\n\t{\n\t\t/*\n\t\t * These cannot call a function or read a relation themselves, though\n\t\t * something below them might, so keep walking.\n\t\t */',
+                '\tif (check_functions_in_node(node, leakproof_checker, context))\n'
+                '\t\treturn true;\n'
+                '\treturn expression_tree_walker(node, contains_non_leakproof_walker, context);\n'
+                '\t/* P1: original denylist reinstated; the switch below is dead */\n'
+                '\tswitch (nodeTag(node))\n\t{\n\t\t/*\n\t\t * These cannot call a function or read a relation themselves, though\n\t\t * something below them might, so keep walking.\n\t\t */'),
+           ]),
+
     'M1': ('A5', 'concur',
            'drop ORDER BY from the row-locking SELECT (deadlock)', [
                ('"SELECT 1 FROM %s mv WHERE (%s) ORDER BY %s FOR UPDATE"',
