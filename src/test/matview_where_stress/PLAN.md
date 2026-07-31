@@ -1126,6 +1126,62 @@ within a block are sound; absolute figures across blocks are not, and the
 Query-tree 10,000 row block is inflated for that reason rather than because the
 path is three times slower.
 
+### The locking SELECT, researched -- and it is not the target after all
+
+The 19-25% reported above was inflated by bloat: those blocks ran hundreds of
+refreshes back to back with no vacuum.  Re-profiled with a `VACUUM` between
+every counted refresh, Query-tree path:
+
+| phase | scope 100 | scope 10,000 |
+|---|---|---|
+| whole refresh | 936 µs | 68.4 ms |
+| **fused upsert/prune** | **58.3%** | **87.0%** |
+| locking `SELECT` | 17.8% | 10.3% |
+| `SPI_prepare` | 12.8% | 0.2% |
+| rewrite + plan the source | 6.5% | 0.1% |
+| execute the source | 3.1% | 2.3% |
+| deparse | 2.2% | 0.0% |
+
+So the lock *declines* as a share with scope, and the fused DML is 87% at
+10,000 rows.  Correcting the record: the DML is the target at scale, by a
+distance, and 4.2 attacks exactly it.
+
+The lock is worth understanding anyway, because it is the only other thing
+left.  On a clean 100,000-row table, scope 10,000:
+
+| | |
+|---|---|
+| index-only scan of the keys, no lock | 1.11 ms, 0 heap fetches |
+| **the statement as generated** (`ORDER BY key FOR UPDATE`) | **6.47 ms** |
+| without the `ORDER BY` | 6.05 ms |
+| `FOR NO KEY UPDATE` instead | 6.45 ms |
+
+Four things follow, and three of them close doors:
+
+- **The cost is the locking, not the scan.**  `FOR UPDATE` defeats the
+  index-only scan -- every row's heap tuple has to be visited to be locked --
+  and that is 5.4 ms of the 6.5.  It is inherent to taking a row lock and
+  there is nothing to optimise in it.
+- **`FOR NO KEY UPDATE` is not cheaper.**  6.45 against 6.47 ms.  It conflicts
+  less, so it is still worth having for concurrency (4.5), but it will not show
+  up in a single-client sweep and should not be sold as if it would.
+- **The `ORDER BY` is free when the arbiter index matches the predicate's
+  column** -- the index scan already yields key order and there is no Sort node
+  at all.  P2's ordering requirement costs nothing in the aligned case.
+- **It is not free when they differ**, and that is worse than a sort.  Predicate
+  on `cust`, arbiter on `id`, 100 rows: 0.230 ms without the `ORDER BY` and
+  0.833 ms with it -- **3.6×** -- and the Sort node itself accounts for 0.03 ms
+  of that.  The rest is that ordering by the arbiter key hands `LockRows` the
+  heap in random order where the bitmap scan had handed it physical order.  The
+  deterministic lock order costs cache locality, not sort time.  `nonkey`, the
+  workload whose entire point is a predicate on a non-key column, pays it.
+
+And one door that stays open only in combination: every row in scope is either
+updated or deleted, so locking the whole scope is not over-locking today.  It
+becomes over-locking under 4.2, where an unchanged row is not written and does
+not need a lock -- but knowing which rows are unchanged means reading them,
+which is the scan being avoided.  Worth a look only after 4.2 lands.
+
 **4.4 The scope is scanned twice.**  The locking `SELECT` reads every row the
 predicate selects, and the prune's anti-join reads them all again.  At scope
 10,000 that is two index scans plus a hash anti-join over one set of rows.
