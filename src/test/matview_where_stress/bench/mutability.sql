@@ -55,10 +55,15 @@ CREATE TABLE IF NOT EXISTS public.mut_result(
   span       int,
   scope_rows bigint,
   mv_rows    bigint,
-  form       text,      -- A | B | B2 | C
+  form       text,      -- A | Aopt | B | Bopt | B2 | C
   iters      int,
-  us         numeric    -- best of iters
+  us         numeric,   -- best over every repeat
+  us_hi      numeric    -- worst repeat: the cell's spread, recorded rather
+                        -- than averaged away.  Between-clone variance reaches
+                        -- 45% on some forms, and a single best-of-N run per
+                        -- cell produced one -23.6% where repeats give +32.7%.
 );
+ALTER TABLE public.mut_result ADD COLUMN IF NOT EXISTS us_hi numeric;
 
 -- Reproduce the DML that refresh_by_direct_modification() would build, in the
 -- four mutability variants.  Derived from the live catalog the same way the C
@@ -235,6 +240,7 @@ DO $outer$
 DECLARE
   w bench_workload; span int; pred text; arr text; scope bigint; mvrows bigint;
   keymaxv bigint; form text; iters int; us numeric; diverged bigint;
+  rep int; best numeric; worst numeric;
 BEGIN
   SELECT * INTO w FROM bench_workload WHERE id = current_setting('mut.workload');
   EXECUTE 'SELECT (' || replace(replace(w.keymax, ':scale', '100000'),
@@ -282,16 +288,27 @@ BEGIN
                         form, w.id, span, diverged;
       END IF;
 
-      PERFORM public.mut_clone();
-      us := public.mut_time(form, pred, 3);
-      -- ~1s of measurement, never fewer than 8 samples.  At a 200ms
-      -- budget the slow cells got three, and three samples of a 60ms
-      -- statement produced apparent 31% SPEEDUPS from adding work.
-      iters := GREATEST(8, LEAST(60, (1000000 / GREATEST(us, 1))::int));
-      us := public.mut_time(form, pred, iters);
+      -- Best-of-N inside one clone does not cover the variance that matters.
+      -- The clone's physical layout and the statistics ANALYZE happens to
+      -- sample decide the plan, and that varies BETWEEN clones: measured over
+      -- ten clones of one cell, the spread was 11% on one form and 45% on
+      -- another.  So repeat the whole clone-and-measure cycle and keep the
+      -- best, recording the worst alongside it.
+      best := NULL; worst := NULL;
+      FOR rep IN 1..3 LOOP
+        PERFORM public.mut_clone();
+        us := public.mut_time(form, pred, 3);
+        -- ~1s of measurement, never fewer than 8 samples.  At a 200ms
+        -- budget the slow cells got three, and three samples of a 60ms
+        -- statement produced apparent 31% SPEEDUPS from adding work.
+        iters := GREATEST(8, LEAST(60, (1000000 / GREATEST(us, 1))::int));
+        us := public.mut_time(form, pred, iters);
+        IF best  IS NULL OR us < best  THEN best  := us; END IF;
+        IF worst IS NULL OR us > worst THEN worst := us; END IF;
+      END LOOP;
       INSERT INTO public.mut_result(workload, span, scope_rows, mv_rows,
-                                    form, iters, us)
-        VALUES (w.id, span, scope, mvrows, form, iters, us);
+                                    form, iters, us, us_hi)
+        VALUES (w.id, span, scope, mvrows, form, iters, best, worst);
     END LOOP;
   END LOOP;
 END $outer$;
