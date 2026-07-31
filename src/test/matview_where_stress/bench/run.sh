@@ -25,6 +25,33 @@
 #   --clients    1,4,16                     concurrent sessions
 #   --overlap    disjoint,hot               disjoint scopes, or all fighting
 #   --mutate     on|off                     change the base data first
+#   --maxscope   90                         skip any combination whose scope is
+#                                           this percent of the matview or more.
+#                                           90 is right for measuring PARTIAL
+#                                           refresh -- but it also removes
+#                                           exactly the region where match/merge
+#                                           could beat direct modification, so
+#                                           finding that crossover means raising
+#                                           it to 100 deliberately.
+#   --perxact    1                          refreshes per pgbench transaction.
+#                                           At 1 every refresh pays its own
+#                                           commit, which is driver pattern D2
+#                                           (queue drain).  Raising it amortises
+#                                           the commit over N refreshes, which is
+#                                           what D1 (statement trigger, already
+#                                           inside the writer's transaction)
+#                                           actually experiences.  Reported
+#                                           latency is per refresh, not per
+#                                           transaction.
+#                                           Only meaningful with --mutate off:
+#                                           the N refreshes share one k, so if
+#                                           the base data were changing, the
+#                                           first would absorb the change and
+#                                           the rest would be measuring a
+#                                           no-op.  With nothing changing, all N
+#                                           evaluate the source and run the same
+#                                           DML, and the commit is the only
+#                                           thing shared -- which is the point.
 #   --sync       on|off   default off       synchronous_commit for the run.
 #                                           pgbench commits once per refresh, so with
 #                                           sync on every measurement carries a WAL
@@ -49,6 +76,7 @@ set -e
 WORKLOADS=; SCALES=100000; GROUPS=1000; SPANS=1,10,100
 FORMS=conc,bare; SHAPES=key; CLIENTS=1; OVERLAP=disjoint; MUTATE=off
 SYNC=off
+MAXSCOPE=90; PERXACT=1
 MINTXN=30; MAXTIME=45
 TIME=10; REPEAT=3; LABEL=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo run)
 PORT=5610; DB=postgres; BINDIR=/home/user/pgsql-opt/bin
@@ -61,6 +89,7 @@ while [ $# -gt 0 ]; do
     --clients)   CLIENTS=$2;   shift 2;;  --overlap) OVERLAP=$2; shift 2;;
     --mutate)    MUTATE=$2;    shift 2;;  --time)    TIME=$2;    shift 2;;
     --sync)      SYNC=$2;      shift 2;;
+    --maxscope)  MAXSCOPE=$2;  shift 2;;  --perxact) PERXACT=$2; shift 2;;
     --mintxn)    MINTXN=$2;    shift 2;;  --maxtime) MAXTIME=$2; shift 2;;
     --repeat)    REPEAT=$2;    shift 2;;  --label)   LABEL=$2;   shift 2;;
     --port)      PORT=$2;      shift 2;;  --db)      DB=$2;      shift 2;;
@@ -147,9 +176,10 @@ for w in $(list "$WORKLOADS"); do
     # guard above can still select nearly every row.  timerange span=100 chose
     # 99% of its matview and was recorded as a partial refresh for a whole run.
     if [ -n "$SCOPE" ] && [ "$SCOPE" -gt 0 ] 2>/dev/null &&
-       [ $((SCOPE * 100 / MVROWS)) -ge 90 ] 2>/dev/null; then
+       [ $((SCOPE * 100 / MVROWS)) -ge "$MAXSCOPE" ] 2>/dev/null; then
       echo "   skip $w $shape span=$span: scope $SCOPE is "\
-           "$((SCOPE * 100 / MVROWS))% of the matview"; continue; fi
+           "$((SCOPE * 100 / MVROWS))% of the matview, at or over --maxscope"\
+           "$MAXSCOPE"; continue; fi
     if [ -z "$SCOPE" ] || [ "$SCOPE" = 0 ] 2>/dev/null; then
       echo "   WARNING $w $shape span=$span: the scope probe selected no rows,"
       echo "        so this combination cannot be normalised.  Its key space"
@@ -178,12 +208,25 @@ for w in $(list "$WORKLOADS"); do
          if [ "$MUTATE" = on ]; then
            $PSQL -Atc "SELECT sql FROM bench_mutation WHERE id='$w'" | sed 's/$/;/'
          fi
-         echo "REFRESH MATERIALIZED VIEW ${CONC}bench.mv WHERE $PREDT;"
+         # pgbench wraps a script with no explicit BEGIN in one transaction, so
+         # at --perxact 1 every refresh carries a commit.  Above 1 the commit is
+         # shared, and the difference between the two is the commit's share of
+         # what every measurement in this suite has been reporting.
+         if [ "$PERXACT" -gt 1 ] 2>/dev/null; then
+           echo "BEGIN;"
+           j=0; while [ $j -lt "$PERXACT" ]; do
+             echo "REFRESH MATERIALIZED VIEW ${CONC}bench.mv WHERE $PREDT;"
+             j=$((j+1))
+           done
+           echo "END;"
+         else
+           echo "REFRESH MATERIALIZED VIEW ${CONC}bench.mv WHERE $PREDT;"
+         fi
        } | sed "s/:span/$span/g; s/:arraylit/$ARRLIT/g" > "$S"
 
        settle                       # bloat from the previous combination is
                                     # not an input to this one
-       BEST_TPS=0; BEST_LAT=; BEST_TXN=0
+       BEST_TPS=0; BEST_LAT=; BEST_TXN=0; TOT_F=0; TOT_DL=0; TOT_SF=0
        # Carried across repeats: the first one discovers how long this
        # combination needs to reach MINTXN, and resetting it per repeat made
        # every repeat re-walk the same ladder from 5s.
@@ -203,13 +246,35 @@ for w in $(list "$WORKLOADS"); do
            L=$(echo "$OUT" | sed -n 's/^latency average = \([0-9.]*\).*/\1/p' | head -1)
            N=$(echo "$OUT" | sed -n 's/^number of transactions actually processed: \([0-9]*\).*/\1/p' | head -1)
            [ -n "$N" ] || N=0
+           # Concurrency is the axis the row lock and its ORDER BY exist to
+           # serve, and its failure mode is a deadlock, not a slow refresh.  A
+           # sweep that records only tps would show a deadlocking configuration
+           # as merely fast -- the aborted transactions never reach the average.
+           F=$(echo "$OUT" | sed -n 's/^number of failed transactions: \([0-9]*\).*/\1/p' | head -1)
+           DL=$(echo "$OUT" | sed -n 's/^number of deadlock failures: \([0-9]*\).*/\1/p' | head -1)
+           SF=$(echo "$OUT" | sed -n 's/^number of serialization failures: \([0-9]*\).*/\1/p' | head -1)
+           [ -n "$F" ]  || F=0
+           [ -n "$DL" ] || DL=0
+           [ -n "$SF" ] || SF=0
            if [ "$N" -ge "$MINTXN" ] 2>/dev/null || [ "$t" -ge "$MAXTIME" ] 2>/dev/null; then
              break; fi
            t=$(( t * MINTXN / (N > 0 ? N : 1) + 1 ))
            [ "$t" -gt "$MAXTIME" ] && t=$MAXTIME
            echo "   extend $w $shape span=$span $form: $N txns, retrying at ${t}s"
          done
+         # A transaction now holds PERXACT refreshes; normalise both metrics
+         # back to one refresh so a --perxact run is comparable with every
+         # number already in bench_result.
+         if [ "$PERXACT" -gt 1 ] 2>/dev/null && [ -n "$T" ]; then
+           T=$(echo "$T * $PERXACT" | bc -l)
+           L=$(echo "$L / $PERXACT" | bc -l)
+           N=$((N * PERXACT))
+         fi
          [ -n "$T" ] || continue
+         # Failures accumulate over every repeat rather than following the
+         # best one: a configuration that deadlocked in two runs out of three
+         # deadlocks, and reporting the clean run's zero would hide that.
+         TOT_F=$((TOT_F + F)); TOT_DL=$((TOT_DL + DL)); TOT_SF=$((TOT_SF + SF))
          if [ "$(echo "$T > $BEST_TPS" | bc -l 2>/dev/null || echo 1)" = 1 ]; then
            BEST_TPS=$T; BEST_LAT=$L; BEST_TXN=$N
          fi
@@ -218,16 +283,20 @@ for w in $(list "$WORKLOADS"); do
 
        $PSQL -c "INSERT INTO bench_result(run_label,pg_version,assertions,workload,isolates,
                    scale,groups,mv_rows,form,predshape,span,scope_rows,clients,overlap,mutate,sync,
-                   tps,latency_ms,txns,full_ms,us_per_scope_row,vs_full_per_row)
+                   perxact,tps,latency_ms,txns,failed_txns,deadlocks,ser_failures,
+                   full_ms,us_per_scope_row,vs_full_per_row)
                  SELECT '$LABEL','$VER','$ASSERT','$w',\$\$$ISO\$\$,
                    $scale,$GROUPS,$MVROWS,'$form','$shape',$span,
                    NULLIF($SCOPE,0),$nc,'$ov',$([ "$MUTATE" = on ] && echo true || echo false),'$SYNC',
-                   $BEST_TPS, $BEST_LAT, $BEST_TXN, $FULL,
+                   $PERXACT, $BEST_TPS, $BEST_LAT, $BEST_TXN, $FULL,
                    round(($BEST_LAT * 1000.0) / NULLIF($SCOPE,0), 3),
                    round((($BEST_LAT * 1000.0) / NULLIF($SCOPE,0))
                          / NULLIF(($FULL * 1000.0) / NULLIF($MVROWS,0), 0), 2)" >/dev/null
-       printf '   %-10s %-6s span=%-5s scope=%-7s %-4s c=%-3s %-8s  %8.1f tps  %7.2f ms\n' \
-         "$w" "$shape" "$span" "$SCOPE" "$form" "$nc" "$ov" "$BEST_TPS" "$BEST_LAT"
+       FAILNOTE=
+       [ "$TOT_F" -gt 0 ] 2>/dev/null &&
+         FAILNOTE="  FAILED=$TOT_F deadlock=$TOT_DL ser=$TOT_SF"
+       printf '   %-10s %-6s span=%-5s scope=%-7s %-4s c=%-3s %-8s  %8.1f tps  %7.2f ms%s\n' \
+         "$w" "$shape" "$span" "$SCOPE" "$form" "$nc" "$ov" "$BEST_TPS" "$BEST_LAT" "$FAILNOTE"
       done
      done
     done

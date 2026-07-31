@@ -31,6 +31,15 @@ CREATE TABLE IF NOT EXISTS bench_result(
 );
 
 ALTER TABLE bench_result ADD COLUMN IF NOT EXISTS txns int;
+-- Refreshes per transaction.  1 means every refresh paid its own commit, which
+-- is what every measurement taken before this column existed did; recording it
+-- keeps those rows readable rather than merely old.
+ALTER TABLE bench_result ADD COLUMN IF NOT EXISTS perxact int DEFAULT 1;
+-- Summed over every repeat, not taken from the best one.  A configuration that
+-- deadlocks intermittently deadlocks; the clean repeat's zero is not the answer.
+ALTER TABLE bench_result ADD COLUMN IF NOT EXISTS failed_txns int DEFAULT 0;
+ALTER TABLE bench_result ADD COLUMN IF NOT EXISTS deadlocks int DEFAULT 0;
+ALTER TABLE bench_result ADD COLUMN IF NOT EXISTS ser_failures int DEFAULT 0;
 
 -- How each workload's base data is mutated, when --mutate is on.  Uses :k.
 DROP TABLE IF EXISTS bench_mutation;

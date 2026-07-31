@@ -66,6 +66,32 @@ checks AS (
          (SELECT count(*) FROM r WHERE full_ms IS NULL OR full_ms <= 0)::text ||
          ' missing or zero',
          NOT EXISTS (SELECT 1 FROM r WHERE full_ms IS NULL OR full_ms <= 0)
+
+  -- A concurrent run that deadlocks looks FASTER than one that does not: the
+  -- aborted transactions never reach the latency average.  Recording zero and
+  -- recording nothing are indistinguishable once the run is over, so the column
+  -- has to be populated before the numbers are read.
+  UNION ALL SELECT 9, 'failure counts recorded',
+         (SELECT count(*) FROM r WHERE failed_txns IS NULL)::text || ' null',
+         NOT EXISTS (SELECT 1 FROM r WHERE failed_txns IS NULL)
+
+  -- Latency is per refresh only if the refreshes per transaction are known.
+  UNION ALL SELECT 10, 'per-refresh normalisation known',
+         'perxact ' || coalesce((SELECT string_agg(DISTINCT perxact::text, ',')
+                                   FROM r), 'unrecorded'),
+         NOT EXISTS (SELECT 1 FROM r WHERE perxact IS NULL)
+
+  -- Not a pass/fail: a run that swept concurrency and found no deadlocks has
+  -- said something, and a run that never left one client has not.  Stating
+  -- which is which stops the first being read into the second.
+  UNION ALL SELECT 11, 'concurrency exercised',
+         CASE WHEN (SELECT max(clients) FROM r) > 1
+              THEN 'clients up to ' || (SELECT max(clients) FROM r)::text ||
+                   ', ' || (SELECT sum(deadlocks) FROM r)::text ||
+                   ' deadlocks, ' || (SELECT sum(failed_txns) FROM r)::text ||
+                   ' failed'
+              ELSE 'single client only -- says nothing about overlap' END,
+         true
 )
 SELECT CASE WHEN ok THEN 'pass' ELSE 'FAIL' END AS result,
        "check", detail
