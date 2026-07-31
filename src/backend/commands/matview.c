@@ -631,6 +631,7 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	ObjectAddress address;
 	Node	   *qual = NULL;
 	char	   *qual_str = NULL;
+	int			nUniqueIndexes = 0;
 
 	matviewRel = table_open(matviewOid, NoLock);
 	relowner = matviewRel->rd_rel->relowner;
@@ -707,6 +708,22 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	/*
 	 * Check that there is a unique index with no WHERE clause on one or more
 	 * columns of the materialized view if CONCURRENTLY is specified.
+	 *
+	 * Count the unique indexes as well, because more than one changes which
+	 * algorithm a partial refresh can use.  Direct modification applies its
+	 * changes with ON CONFLICT against a single arbiter index, one row at a
+	 * time, and every row it writes must satisfy every unique index the moment
+	 * it is written.  A change that needs a row deleted before another can be
+	 * inserted -- two rows swapping their values on a unique index that is not
+	 * the arbiter -- cannot be expressed that way, and no choice of arbiter
+	 * helps: whichever index arbitrates, the swap collides on the other one.
+	 * Diff/merge deletes before it inserts and has no such limit.
+	 *
+	 * With exactly one unique index the collision is impossible rather than
+	 * unlikely, so the fast path is provably safe there, which is the
+	 * overwhelming majority of matviews.  Partial and expression unique indexes
+	 * are counted even though they cannot arbitrate, because a write still has
+	 * to satisfy them.
 	 */
 	if (concurrent || qual)
 	{
@@ -720,12 +737,19 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 		{
 			Oid			indexoid = lfirst_oid(indexoidscan);
 			Relation	indexRel;
+			Form_pg_index indexStruct;
 
 			indexRel = index_open(indexoid, AccessShareLock);
-			hasUniqueIndex = is_usable_unique_index(indexRel);
+			indexStruct = indexRel->rd_index;
+
+			/* Anything unique and enforced constrains what the upsert writes. */
+			if (indexStruct->indisunique && indexStruct->indisvalid &&
+				indexStruct->indimmediate)
+				nUniqueIndexes++;
+
+			if (!hasUniqueIndex)
+				hasUniqueIndex = is_usable_unique_index(indexRel);
 			index_close(indexRel, AccessShareLock);
-			if (hasUniqueIndex)
-				break;
 		}
 
 		list_free(indexoidlist);
@@ -775,10 +799,14 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	 * The two spellings still differ, but now in lock level rather than
 	 * algorithm -- see ExecRefreshMatView().
 	 *
+	 * The exception is a matview carrying more than one unique index, where
+	 * the upsert cannot express a change that needs a delete before an insert;
+	 * those fall through to diff/merge.  See the index scan above.
+	 *
 	 * (WITH NO DATA is rejected together with a WHERE clause long before here,
 	 * so !skipData is belt and braces.)
 	 */
-	if (qual && !skipData)
+	if (qual && !skipData && nUniqueIndexes <= 1)
 	{
 		processed = refresh_by_direct_modification(matviewOid, relowner,
 												   save_sec_context, dataQuery,
@@ -786,9 +814,10 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	}
 
 	/*
-	 * STRATEGY 2: FULL CONCURRENT REFRESH
+	 * STRATEGY 2: FULL CONCURRENT REFRESH, or a partial one on a matview with
+	 * more than one unique index.
 	 */
-	else if (concurrent)
+	else if (concurrent || qual)
 	{
 		Oid			tableSpace;
 		char		relpersistence;

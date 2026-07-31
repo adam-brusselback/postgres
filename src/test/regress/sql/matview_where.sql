@@ -572,22 +572,21 @@ DROP TABLE mv_lock_base;
 -- single arbiter index, so a row set that needs a delete before an insert to
 -- satisfy a *second* unique index cannot be applied that way.
 --
--- This used to be a capability difference between the two spellings: diff/merge
--- deletes before inserting, so the bare form could apply such a change and
--- CONCURRENTLY could not.  Diff/merge has since left the predicate path
--- entirely -- it lost to direct modification at every scope from 10% to 90% of
--- the matview, by 24-52%, so there was no crossover left to justify carrying a
--- second algorithm -- and the capability went with it.  NEITHER spelling can
--- apply this change now; a full refresh is the only way.
+-- No choice of arbiter avoids it: whichever unique index arbitrates, the swap
+-- collides on the other one.  Diff/merge deletes before it inserts and has no
+-- such limit, which is why it is still here -- it lost to direct modification
+-- at every scope from 10% to 90% of the matview, by 24-52%, so it earns its
+-- place on capability rather than on speed.
 --
--- That is a real and deliberate loss, and it belongs in the documentation next
--- to the unique-index requirement.  It is bounded by being loud: the refresh
--- fails with a unique violation naming the index it could not satisfy, so no
--- caller silently gets a half-applied change.
+-- The two are selected by counting unique indexes, not by spelling.  With one,
+-- the collision is impossible rather than unlikely, so direct modification is
+-- provably safe and both spellings use it.  With more than one, both spellings
+-- use diff/merge and pay for the capability.  A matview that does not need the
+-- second unique index gets the fast path back by dropping it.
 --
--- Disposition: keep.  It pins a documented limitation of the feature, and it is
+-- Disposition: keep.  It pins the routing rule in both directions, and it is
 -- the test that would notice if a future statement shape (a scoped delete
--- before the insert, say) removed the limitation again.
+-- before the insert, say) let direct modification express this after all.
 --
 
 CREATE TABLE mv_multi2_base (id int primary key, email text, uname text);
@@ -604,16 +603,28 @@ CREATE UNIQUE INDEX ON mv_multi2(uname);
 UPDATE mv_multi2_base SET email = CASE id WHEN 1 THEN 'b@example.com'
                                           ELSE 'a@example.com' END;
 
--- Neither spelling can: both arbitrate on mv_multi2_email_idx and then collide
--- on mv_multi2_uname_idx.  The matview keeps its previous contents.
-\set VERBOSITY terse
+-- Two unique indexes, so both spellings route to diff/merge and both apply it.
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_multi2 WHERE id IN (1, 2);
-REFRESH MATERIALIZED VIEW mv_multi2 WHERE id IN (1, 2);
-\set VERBOSITY default
 SELECT * FROM mv_multi2 ORDER BY id;
 
--- A full refresh applies it, and is the documented way to.
-REFRESH MATERIALIZED VIEW mv_multi2;
+-- Swap them back, this time with the bare spelling.
+UPDATE mv_multi2_base SET email = CASE id WHEN 1 THEN 'a@example.com'
+                                          ELSE 'b@example.com' END;
+REFRESH MATERIALIZED VIEW mv_multi2 WHERE id IN (1, 2);
+SELECT * FROM mv_multi2 ORDER BY id;
+
+-- Drop the second unique index and the same matview takes the fast path again
+-- -- and still applies the swap, because with only the arbiter left there is
+-- nothing for it to collide with: the upsert matches each row by the very
+-- column being swapped and updates it in place.  That is the point of the
+-- routing rule.  The collision needs a unique index that is NOT the arbiter,
+-- which needs a second unique index, which is exactly the case that routes to
+-- diff/merge.  So the fast path is not merely safe here, it is complete: no
+-- capability is given up by taking it.
+DROP INDEX mv_multi2_uname_idx;
+UPDATE mv_multi2_base SET email = CASE id WHEN 1 THEN 'b@example.com'
+                                          ELSE 'a@example.com' END;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_multi2 WHERE id IN (1, 2);
 SELECT * FROM mv_multi2 ORDER BY id;
 
 DROP MATERIALIZED VIEW mv_multi2;
