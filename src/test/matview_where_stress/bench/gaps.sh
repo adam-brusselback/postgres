@@ -56,8 +56,20 @@ $DIR/run.sh --workloads projection,aggregate,nonkey \
             --shapes key,range --spans 1,10,100 --forms conc \
             --perxact 20 --label "$P-txn-d1" $COMMON
 
+echo "===== finishing p3opt: the three workloads it never covered ====="
+# p3opt compares the text/SPI path, the Query-tree path and the optimised
+# Query-tree path on one binary.  It covers four of the eight workloads, and
+# the three missing here are the ones with the largest scopes -- exactly where
+# SPECIALIZE.md says the ranking inverts, so the existing four cannot stand in
+# for them.  Same parameters as the original run, appended to the same label.
+# 'recursive' stays out: its predicate cannot push into the recursive term, so
+# every form evaluates the whole closure and measures that instead.
+$DIR/run.sh --workloads window,timerange,expensive \
+            --shapes key,array,range --spans 1,10,100 \
+            --forms spi,querytree,qtopt --label p3opt $COMMON
+
 echo "===== verifying every label before anything is read ====="
-for l in "$P-concurrency" "$P-crossover" "$P-txn-d2" "$P-txn-d1"; do
+for l in "$P-concurrency" "$P-crossover" "$P-txn-d2" "$P-txn-d1" p3opt; do
   echo "--- $l"
   # Checks 1 and 6 are expected to fail for the targeted labels: these sweeps
   # deliberately cover a subset of workloads, and the crossover sweep exists to

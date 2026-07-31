@@ -66,9 +66,12 @@ CREATE TABLE IF NOT EXISTS public.churn_result(
 CREATE TABLE IF NOT EXISTS public.bench_churn(id text PRIMARY KEY, sql text);
 TRUNCATE public.bench_churn;
 INSERT INTO public.bench_churn VALUES
- -- mv row == base row: touch the row itself.  status is a non-key mv column and
- -- the new value cannot collide with the generator's 'S'||(g%5).
- ('projection', $$UPDATE bench.ord SET status = 'C'||(id%7)
+ -- mv row == base row: touch the row itself.  Appending rather than assigning
+ -- because every mutation here is applied once per timed iteration, and an
+ -- idempotent one would change nothing after the first -- the iterations would
+ -- then be measuring churn 0 while claiming to measure the requested fraction.
+ -- Every other mutation below is an increment for the same reason.
+ ('projection', $$UPDATE bench.ord SET status = status || 'x'
                    WHERE (%1$s) AND id %% 100 < %2$s$$),
 
  -- mv row == one group: touch exactly one base row per selected group, so the
@@ -155,6 +158,7 @@ DO $outer$
 DECLARE
   w bench_workload; span int; pred text; scope bigint; mvrows bigint;
   keymaxv bigint; pct int; opt bool; iters int; us numeric; actual numeric;
+  rep int;
 BEGIN
   SELECT * INTO w FROM bench_workload WHERE id = current_setting('churn.workload');
   IF NOT EXISTS (SELECT 1 FROM public.bench_churn WHERE id = w.id) THEN
@@ -193,7 +197,7 @@ BEGIN
         -- churn_time warms with three refreshes, which would absorb it.  So
         -- re-apply the mutation before each counted iteration instead.
         us := NULL;
-        FOR iters IN 1..5 LOOP
+        FOR rep IN 1..5 LOOP
           DECLARE t0 timestamptz; one numeric;
           BEGIN
             PERFORM public.churn_apply(w.id, pred, pct);
