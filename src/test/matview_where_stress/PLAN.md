@@ -235,18 +235,9 @@ deletion at Phase 4.
 
 ### 1.1 Differential mode in the safety oracle — the highest-value item
 
-Today the oracle compares a partial refresh against a full refresh. During the
-rewrite it can do something far stronger: **compare the old implementation
-against the new one, over the same 3272 mutations.**
-
-Keep both paths reachable behind a developer GUC for the duration of the
-rewrite. For each mutation, run it under old and under new and diff the
-resulting matview. Any divergence is a rewrite bug, localised to one mutation,
-with no need to reason about whether the old behaviour was correct.
-
-This turns "did I preserve semantics" from a judgement call into a test. It is
-the single thing that makes the rewrite tractable, and it should exist before
-the first line of Phase 2.
+Compare the old implementation against the new one over the same 3272
+mutations, rather than either against a full refresh — so "did I preserve
+semantics" is a test rather than a judgement call.
 
 **Built and calibrated, against the pair that exists today.**
 `safety/diff_driver.sql` and `safety/rundiff.sh`. For each mutation it stands up
@@ -496,16 +487,12 @@ longer" is the intuitive knob and it was the useless one in both cases.
 
 ### 1.2 Move structural invariants from tests into the code
 
-The `pg_stat_statements` block asserted things that are genuinely load-bearing —
-one materialised `new_data`, upsert and prune fused, locking `SELECT` ordered —
-but it asserted them by pattern-matching SQL text, which is why it could not
-survive, and why it would have gone red against a correct rewrite.
-
-The invariants themselves are worth keeping — as `Assert()`s at the point the
-guarantee is established, each naming the fix it protects (A3, A5). An assertion
-says "this implementation delivers P1"; the deleted test said "this
-implementation delivers P1 *by writing a CTE*". The first survives any
-mechanism; the second forbids all but one.
+The invariants the deleted `pg_stat_statements` block was reaching for (see
+above) are worth keeping — as `Assert()`s at the point the guarantee is
+established, each naming the fix it protects. An assertion says "this
+implementation delivers P1"; the deleted test said "this implementation delivers
+P1 *by writing a CTE*". The first survives any mechanism; the second forbids all
+but one.
 
 **Done, and smaller than the heading promises.** Two assertions went in, both
 preconditions rather than restatements of the SQL:
@@ -543,19 +530,10 @@ write; anything else is someone's work in progress and needs `--force`.
 
 ### 1.3 Write down the contract as one black-box file
 
-The feature's promises are currently spread across 16 regression tests, four
-isolation specs and several thousand words of prose in this directory. Before
-rewriting the thing that implements them, they should exist in one place as
-executable, implementation-blind assertions:
-
-- a refresh makes its scope match a full refresh, for every safe predicate shape
-- rows outside the scope are untouched
-- readers never block
-- overlapping refreshes serialize; disjoint ones do not
-- a row leaving the scope is deleted (documented, deliberate — see B15)
-- the rowcount reported is the number of rows changed
-
-That file is the acceptance criterion for Phase 2.
+The promises were spread across 16 regression tests, four isolation specs and
+several thousand words of prose here. They now exist in one place as
+executable, implementation-blind assertions, and that file is Phase 2's
+acceptance criterion.
 
 **Done:** `src/test/regress/sql/matview_where_contract.sql`. Six promises in
 one session — scope matches the view, out-of-scope rows untouched, rows leaving
