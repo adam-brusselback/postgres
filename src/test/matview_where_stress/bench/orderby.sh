@@ -35,21 +35,39 @@
 # the pre-lock is only 12-15% of a refresh.  And the misaligned penalty is
 # 1.2-1.7x, not the 3.6x that was written down.
 #
-# Result 2 -- the two clauses pull opposite ways, which measuring them together
-# hid.  Against a baseline of keeping both:
+# Result 2 -- the pre-lock's ORDER BY is the only one worth dropping, and the
+# source's is inside the noise.  Two independent runs of THIS SCRIPT, against a
+# baseline of keeping both:
 #
-#   workload    scope    drop pre-lock   drop source   drop both
-#   nonkey       1000        +3.3%          -2.3%        +3.5%
-#   nonkey      10000        +9.4%          +5.9%       +10.6%
-#   window       1000        +0.4%          -4.8%        +0.1%
-#   window      10000        +4.6%          +1.8%        +4.3%
-#   timerange    2000        +3.2%          -4.8%        -1.9%
-#   projection  10000        +1.2%          -1.9%        -1.7%
+#   workload    scope    drop pre-lock    drop source     drop both
+#   nonkey       1000     +3.3 / +8.8     -2.3 / +2.1    +3.5 / +5.0
+#   nonkey      10000     +9.4 / +4.8     +5.9 / +2.0   +10.6 / +8.0
+#   window       1000     +0.4 / +7.3     -4.8 / +1.5    +0.1 / +3.9
+#   window      10000     +4.6 / +3.5     +1.8 / -1.0    +4.3 / +2.7
+#   timerange    2000     +3.2 / +4.7     -4.8 / -1.7    -1.9 / +0.8
+#   projection  10000     +1.2 / -1.8     -1.9 / -3.0    -1.7 / -2.0
 #
-# Dropping the SOURCE ordering is a regression below scope 10000: it hands
-# INSERT ... ON CONFLICT its rows in random index order and index maintenance
-# pays for it.  "Drop both ORDER BYs" was one saving and one regression partly
-# cancelling.  The specialisation is "drop the pre-lock's", alone.
+# Three repeats cannot see an effect this size -- run-to-run spread on one cell
+# reached 7 points (window/1000: +0.4 then +7.3).  Repeating the two disagreeing
+# cells with 8 PAIRED repeats each settles both questions, and neither of the
+# readings above survives intact:
+#
+#   cell               drop pre-lock            drop source
+#   nonkey  1000    +5.2% mean, 7/8 faster   +4.5% mean, 8/8 faster
+#   nonkey 10000    +7.0% mean, 8/8 faster   +3.3% mean, 8/8 faster
+#   window  1000    +1.8% mean, 7/8 faster   -2.3% mean, 1/8 faster
+#
+# The pre-lock elision is solid: faster in 22 of 24 paired repeats.
+#
+# The source elision is NOT noise, as a first correction assumed -- it is
+# consistent within a workload and opposite BETWEEN workloads, on two matviews
+# with identical index shape.  The likely mechanism is a third alignment nobody
+# had named: whether the source's NATURAL OUTPUT ORDER already matches the
+# arbiter key.  window's view is rank() OVER (PARTITION BY region), so its rows
+# arrive in region order and the upsert hits the unique index on id at random;
+# nonkey's arrive close to id order already, so the sort is redundant work.
+# Fitted to two workloads, so a hypothesis and not a result -- but it is why
+# "drop both ORDER BYs" cannot be one decision.
 #
 # And it is gated on the LOCK LEVEL, not on index alignment -- see SPECIALIZE.md
 # section 4.  Under ExclusiveLock (the bare WHERE form) no second refresh can be
