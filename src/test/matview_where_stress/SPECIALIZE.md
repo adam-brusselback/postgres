@@ -18,7 +18,8 @@ invalidating a recommendation already made.
 | **scope** | 1 · small · large · near-total | prune elision; whether fixed costs matter at all | measured: source planning 16.2% → 0.9% → 0.0% of the refresh at scope 1/100/10k, while the fused DML goes 52% → 58% → **87%** |
 | **predicate shape** | equality on all arbiter key columns · array · range · non-key | at-most-one-row proofs; whether the index supplies the lock order | measured: generic plan +28.6% on range/1, −33.5% on array/100. `ORDER BY` on the lock is free when the arbiter index matches the predicate column, **3.6×** when not — it hands `LockRows` the heap in random rather than physical order |
 | **index shape** | do the updated columns sit under any index? | whether an avoided write saves index maintenance or just a HOT update | measured: row comparison worth 27–53% with a covering index, **nothing** without |
-| **churn fraction** | share of the scope whose values actually changed | whether the row comparison pays | **unmeasured** — only the 100%-unchanged extreme. Scope was used as a proxy; it correlates (D1 small/high-churn, D3 large/low-churn) so the gate is right by luck, not argument |
+| **churn fraction** | share of the scope whose values actually changed | whether the row comparison pays | measured, `bench/churn.sql`: on `nonkey`/scope 10000 the saving runs **54–56 → 41–51 → 27–36 → 18–27 → ≈0%** at churn 0/5/25/50/100 (range = two protocols). Monotonic, and it reaches zero — at full churn every comparison fails and the row-wise `IS DISTINCT FROM` is bought for nothing. Break-even ≈ 60–70% |
+| **heap state** | never-updated · settled · bloated | nothing — but it decides the *measured* value of everything above | measured, `bench/heapstate.sh`: **the same comparison reads 54% or 82% depending on it.** At zero churn only the un-optimized arm writes, so free space, full-page images, extension and bloat all land on one side. A matview `bench_setup` just built is that arm's worst case; every figure taken straight after a setup is inflated |
 | **driver pattern** | D1 statement trigger · D2 queue drain · D3 scheduled window | frequency, transaction context, and the priors for every axis above | `USE-CASES.md` §157. D1 runs inside the writer's transaction; D2 commits per refresh (**12×**, and it is commit cost — the re-planning hypothesis was tested and disproven); D3 runs nightly. **`bench/run.sh` commits per refresh, so every number so far describes D2 alone** |
 | **overlap probability** | none · concurrent-disjoint · concurrent-overlapping | whether the lock and its ordering buy anything | **unmeasured** — every run has been `--clients 1 --overlap disjoint` and both knobs have existed throughout. Cost/benefit is inverted: the lock costs most where it buys least (D3, one refresher, huge scope) |
 | **mutability** | append-only · no-delete · general | whether the prune exists at all | **unmeasured**, and barely covered — `USE-CASES.md` mentions append-only once, about a ledger *base table*. Different property: a ledger is append-only and its `GROUP BY` roll-up is rewritten constantly |
@@ -123,7 +124,7 @@ the same defect as a test that cannot fail.
 
 | specialisation | tier | effect | detector |
 |---|---|---|---|
-| **row comparison** — `WHERE (mv.cols) IS DISTINCT FROM (EXCLUDED.cols)` on the `DO UPDATE`. *Implemented*, currently a GUC; should be T3 churn with a T1 veto when no index covers a written column | 3 + 1 | +27–53% at scope ≥100 with a covering index; **−18.5% at scope 1**; nil without the index | oracle — 22 shapes, 1636 mutations, 0 divergences |
+| **row comparison** — `WHERE (mv.cols) IS DISTINCT FROM (EXCLUDED.cols)` on the `DO UPDATE`. *Implemented*, currently a GUC; should be T3 churn with a T1 veto when no index covers a written column | 3 + 1 | **+25–54% at zero churn**, scope ≥1000, covering index, settled heap; falls to **−9%** at full churn; **−18.5% at scope 1**; nil without the index. Quote the protocol with the number — see the heap-state axis in §1 | oracle — 22 shapes, 1636 mutations, 0 divergences |
 | **cache the source plan** — removes rewrite + plan from every refresh | — | 12.2 µs, 16.2% at scope 1, ~0 at scale | `matview_where_cache` 1–3, which need a **base-table** variant: a stashed `PlannedStmt` is not revalidated when a base table changes, so this must go through the plancache, not a pointer |
 | **stop deparsing for the cache key** — store the qual tree, compare with `equal()`, deparse only on a miss | — | 4.5–5.3 µs, 7.4% at scope 1. Closes **B3**: the tree carries parameter types, `$1` does not | `matview_where_cache` Test 4, already two predicates that deparse identically and need different plans |
 | **parameterise predicate `Const`s** | — | **8×**, by turning cold refreshes warm | oracle. Changes what the cache key *is*, so it lands first or last, never in the middle |
@@ -207,7 +208,15 @@ decision, and they will go red at convergence, correctly.
    the lock exists to serve. Metric is throughput, deadlock rate and lost
    updates, not latency. Note `--overlap hot` today means "everyone fights over
    keys 1–10", one point rather than a sweep of intersection probability.
-3. **Churn** — `--mutate on` across a varying changed-fraction.
+3. ~~**Churn** — `--mutate on` across a varying changed-fraction.~~ Closed by
+   `bench/churn.sql`: 54–56 → 41–51 → 27–36 → 18–27 → ≈0% at churn 0/5/25/50/100
+   on `nonkey`/scope 10000, break-even ≈ 60–70%. The gate is on scope, and scope
+   is still a proxy — but the proxy now has the curve behind it rather than an
+   argument about driver patterns. Remaining weakness: `churn.sql` measures one
+   arm per invocation, so the comparison is cross-process; at the 100% end, where
+   the true difference is a few percent, that variance swamps the signal and the
+   sign flips between runs. Cells where the two arms are close need an
+   alternating harness.
 4. **The match/merge crossover** — `run.sh` now skips any scope ≥90% of the
    matview, which is right for measuring partial refresh and removes exactly the
    region where match/merge would win if it wins anywhere. Needs a deliberate
@@ -232,4 +241,36 @@ resolution), bypassing SPI (~2 µs per statement, not the ~20 a noisy run
 suggested).
 
 **Benchmark `p3opt`** — 4 of 7 workloads: `nonkey` +26–35%, others +4–16% at
-scope ≥100, −18.5% at scope 1.
+scope ≥100, −18.5% at scope 1. **Provenance unknown**: the run spans 01:36–04:55
+across an observed container restart and predates `bench_result.server_start`,
+so it may mix two machines. The `−18.5% at scope 1` is corroborated elsewhere;
+the positive figures are not, and should be re-measured before being quoted.
+
+### How these numbers were checked
+
+Every figure above that compares an arm which writes against an arm which does
+not is a ratio whose denominator is the fragile half. Four hazards produced
+wrong answers here, all of them in the same direction — flattering the
+optimization — and all of them plausible-looking at the time:
+
+- **Cross-boot comparison.** The container restarts without warning. Two arms
+  measured either side of one showed a uniform 3–38% "regression" that vanished
+  when both were run on one boot. `bench_result.server_start` now records the
+  incarnation; a run that straddles a restart is detectable rather than
+  something the reader must remember to worry about. Replaying an old protocol
+  on a new boot reproduced it to within 10%, so the hazard is real but was not,
+  in the end, contaminating these cells.
+- **Fresh-heap bias.** `bench_setup` hands the writing arm a heap with no free
+  space and nothing dirtied since the last checkpoint. Worth 14–25 points.
+  `bench/heapstate.sh` maps it; `churn.sql` now settles the heap first.
+- **Per-arm sample counts.** An adaptive best-of-N budget gave the faster form
+  4× the draws. Worth 8–9.5 points, and 1.6 points on the one cell where the
+  rule happened to give both forms the same count — which is the control that
+  identifies the cause.
+- **Integer division in the reporting query.** `1 - a/b` on two integers reads
+  exactly 100.0 or 0.0, which looks like an emphatic result rather than a broken
+  one. It sat in `modelcheck.sh` across all 40 rows.
+
+The one quantity that reproduced everywhere — three scripts, two boots, four
+protocols, ±4% — is the *optimized* arm's absolute cost. That is the signal to
+trust. Anything divided by the un-optimized arm needs its protocol stated.

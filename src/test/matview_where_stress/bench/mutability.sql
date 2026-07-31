@@ -45,6 +45,29 @@
 -- same work.  Cloning the indexes is not optional: SPECIALIZE.md has the row
 -- comparison worth 27-53% with a covering index and nothing at all without one,
 -- so a clone missing them would measure a different question.
+--
+-- What may NOT be quoted from this file
+-- -------------------------------------
+-- Every form here differs from the others in how much it WRITES, and mut_clone()
+-- hands each one a heap that CREATE TABLE AS has just built: no free space in the
+-- FSM, no page dirtied since the last checkpoint.  The writing forms therefore
+-- pay relation extension and a full-page image per page that a matview in a
+-- refresh loop does not pay, and the non-writing forms pay neither.  The bias
+-- lands entirely on one side of every comparison here, always in the same
+-- direction, and it is large: bench/heapstate.sh measures the same A-vs-Aopt
+-- ratio at 82% on a heap straight out of CTAS and 54% on a settled one.
+--
+-- So the ratios in mut_result are FRESH-HEAP ratios, roughly 10-15 points above
+-- what the same statements deliver against a matview that has been refreshed
+-- before.  Two rules follow:
+--
+--   Differences between the low-write forms -- Aopt, Bopt, C, which at zero
+--   churn all write nothing -- are what this file exists to size, and they are
+--   not exposed to the bias, because neither side of those comparisons writes.
+--
+--   Anything measured against form A is not.  A-vs-Aopt is quotable only as
+--   "the row comparison on a matview being refreshed for the first time", and
+--   the real command has to supply the steady-state number.
 
 \set ON_ERROR_STOP on
 \pset footer off
@@ -268,6 +291,24 @@ BEGIN
     -- a full refresh wearing a WHERE clause.
     CONTINUE WHEN scope * 100 / GREATEST(mvrows, 1) >= 90;
 
+    -- One sample count for the whole cell, chosen from the SLOWEST form.
+    --
+    -- It used to be chosen per form, from that form's own probe time, which
+    -- made it a function of the thing being measured: on nonkey/span=100 form A
+    -- got 10 samples and form Aopt got 40.  Both report a minimum, and the
+    -- minimum of 40 draws sits below the minimum of 10 from the same
+    -- distribution, so the harness handed the faster form a discount on top of
+    -- whatever it had actually earned.  Measured, it was worth 8-9.5 points on
+    -- the three cells where the counts differed -- and 1.6 points on the one
+    -- cell where the adaptive rule happened to give both forms 60, which is the
+    -- control that says the effect is the asymmetry and not something else.
+    --
+    -- Form A is the slowest in every cell measured, so budgeting from it keeps
+    -- the ~1s-per-form target while giving every form the same number of draws.
+    PERFORM public.mut_clone();
+    us := public.mut_time('A', pred, 3);
+    iters := GREATEST(8, LEAST(60, (1000000 / GREATEST(us, 1))::int));
+
     FOREACH form IN ARRAY ARRAY['A','Aopt','B','Bopt','B2','C'] LOOP
       PERFORM public.mut_clone();       -- same rows, same layout, every form
 
@@ -297,11 +338,10 @@ BEGIN
       best := NULL; worst := NULL;
       FOR rep IN 1..3 LOOP
         PERFORM public.mut_clone();
-        us := public.mut_time(form, pred, 3);
-        -- ~1s of measurement, never fewer than 8 samples.  At a 200ms
+        -- iters comes from the cell, not from this form: see above.  It is
+        -- still ~1s of measurement and never fewer than 8 samples -- at a 200ms
         -- budget the slow cells got three, and three samples of a 60ms
         -- statement produced apparent 31% SPEEDUPS from adding work.
-        iters := GREATEST(8, LEAST(60, (1000000 / GREATEST(us, 1))::int));
         us := public.mut_time(form, pred, iters);
         IF best  IS NULL OR us < best  THEN best  := us; END IF;
         IF worst IS NULL OR us > worst THEN worst := us; END IF;

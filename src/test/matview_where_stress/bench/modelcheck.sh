@@ -34,6 +34,20 @@
 # on arm skips them, so without it the second arm is measured on a table the
 # first bloated.  That artefact previously turned a real churn curve into a
 # fictional one.
+#
+# What the agreement does NOT establish
+# -------------------------------------
+# Both sides of this comparison measure a heap that was built moments earlier and
+# never updated -- bench_setup() for the real arm, mut_clone() for the model.
+# That state is the writing arm's worst case (no free space in the FSM, no page
+# dirtied since the last checkpoint) and only the writing arm feels it, so both
+# ratios are inflated by the same mechanism.  They agree because they share it.
+#
+# bench/heapstate.sh measures the size of the shared bias: on nonkey/span=100 the
+# real command reads 72-75% straight after a bench_setup and 54% once the heap has
+# settled.  So a cell agreeing here means the model reproduces the command in the
+# regime this script samples; it does not mean that regime is the one to quote.
+# For steady-state figures use churn.sql, which settles the heap before timing.
 set -e
 
 P=/home/user/pgsql-opt/bin/psql
