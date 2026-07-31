@@ -2,7 +2,7 @@
 #
 # Concurrent correctness fuzzer for REFRESH MATERIALIZED VIEW ... WHERE ...
 #
-#   ./fuzz.sh [PORT] [DB] [MODE ...]      modes: p2 p3 serial   (default: all)
+#   ./fuzz.sh [PORT] [DB] [MODE ...]   modes: p2 p3 serial nest   (default: all)
 #
 # The safety oracle in safety/ is single-session, so it cannot see any bug that
 # needs two sessions to be a bug.  Calibration measured exactly that: it catches
@@ -21,6 +21,12 @@
 #           Same shape, but the rows are absent from the matview so the refresh
 #           INSERTs rather than UPDATEs, and the conflict is between two
 #           speculative insertions of the same key.  Signal: deadlock.
+#
+#   nest    A refresh whose view definition issues another REFRESH ... WHERE.
+#           COVERAGE, NOT A CALIBRATED DETECTOR -- see the note on its own
+#           section.  Nothing else in the tree exercises nesting under
+#           concurrency, and its end-state assertions are real, but it has NOT
+#           been shown to catch the bug it was written for.
 #
 #   serial  Overlapping refreshes serialize (what A3's FOR UPDATE is for).
 #           A writer drives the base monotonically upward while N sessions
@@ -58,7 +64,7 @@ set -u
 PORT=${1:-5610}
 DB=${2:-postgres}
 shift 2 2>/dev/null || true
-MODES=${*:-p2 p3 serial}
+MODES=${*:-p2 p3 serial nest}
 
 : "${PSQL_BIN:=psql}"
 ITER=${ITER:-40}
@@ -114,6 +120,39 @@ check_plans() {
 
 deadlocks_in() { grep -c 'deadlock detected' "$1" 2>/dev/null || true; }
 
+# A backend that died takes its output with it, so "no deadlocks" from a file
+# that ends early is not a pass.
+crashed_in() {
+    grep -cE 'server closed the connection|terminating connection due to|server process .* was terminated' \
+         "$1" 2>/dev/null || true
+}
+
+# The matview must equal its own definition.  p2 and p3 counted deadlocks and
+# NOTHING else, so a concurrency bug that corrupted rows without deadlocking was
+# invisible to them -- the same shape as a test that cannot fail, one level up.
+# Both modes leave the base and the matview in agreement when they finish (p2
+# never writes the base; p3's last act before the race is to restore it), so
+# this is a cheap end-state gate and not a new fixture.
+#
+# It is an end-state check and therefore blind to anything that repairs itself,
+# which is why `serial` watches for a decrease instead.  Both are needed.
+assert_matches() {
+    n=$($PSQL -Atc "
+      SELECT (SELECT count(*) FROM (SELECT id, tag, v FROM fz_base
+                                    EXCEPT ALL
+                                    SELECT id, tag, v FROM fz_mv) d)
+           + (SELECT count(*) FROM (SELECT id, tag, v FROM fz_mv
+                                    EXCEPT ALL
+                                    SELECT id, tag, v FROM fz_base) d)")
+    if [ "${n:-x}" != "0" ]; then
+        say "  FAIL: matview disagrees with its definition in ${n:-?} rows"
+        fail=1
+        return 1
+    fi
+    say "  matview matches its definition"
+    return 0
+}
+
 # ------------------------------------------------------------------- p2 ----
 # More sessions, not more iterations.  Measured under M1: ITER=40 over two
 # sessions found 4 deadlocks, ITER=150 over the same two found 1 -- the rate is
@@ -158,6 +197,7 @@ mode_p2() {
     else
         say "  ok: no deadlocks in $((ITER * REFRESHERS)) refreshes"
     fi
+    assert_matches
 }
 
 # ------------------------------------------------------------------- p3 ----
@@ -195,6 +235,7 @@ SQL
     else
         say "  ok: no deadlocks in $((ITER * 2)) refreshes"
     fi
+    assert_matches
 }
 
 # --------------------------------------------------------------- serial ----
@@ -286,18 +327,254 @@ SQL
     fi
 }
 
+
+# ----------------------------------------------------------------- nest ----
+# B14's class, under concurrency: a refresh whose own view definition issues
+# another REFRESH ... WHERE.
+#
+# Why this mode exists.  ISSUES.md's note on B14 says the declared suite was
+# green throughout, on an assertions build, while a nested partial refresh could
+# execute another matview's plan -- "no test in it nests a refresh, so nothing
+# could have caught this".  matview_where_cache Test 5 closed that for a single
+# session.  This closes it for concurrent ones, and they are not the same test.
+#
+# What concurrency adds, specifically -- and the first version of this mode got
+# it wrong, which is worth recording.  The draft assumed concurrent refreshes
+# would supply the relcache invalidations that make the sweep bite, so no DDL
+# was needed.  They do not: ISSUES.md B16 established that a partial refresh
+# emits NO relcache invalidation, because SetMatViewPopulatedState() early-
+# returns when the state already matches and an in-place pg_class update queues
+# its invalidation for commit rather than delivering it mid-transaction.  Run
+# that way the mode passed with the guard deliberately removed -- a detector
+# watched not to detect, which is what this file's header says an earlier mode
+# was deleted for.
+#
+# So there is an invalidator session, and it is what makes this a different test
+# from Test 5 rather than a slower copy of it.  Test 5 issues its own ALTER
+# TABLE from the refreshing backend, at a fixed point inside the nested call.
+# Here the DDL commits in ANOTHER backend and is picked up wherever this one
+# next calls AcceptInvalidationMessages() -- which LockRelationOid() does, so
+# the nested refresh's own table_open() is one such point.  That is
+# SPECIALIZE.md 7a's observation used as a weapon: holding a lock does not stop
+# your own backend from processing queued invalidations.
+#
+# Both names inside the function are schema-qualified, and that is load-bearing
+# rather than tidy.  REFRESH runs its query under RestrictSearchPath(), so an
+# unqualified name does not resolve, the statement raises, the EXCEPTION block
+# swallows it, and the nested refresh never runs at all.  That is exactly how
+# the first version of Test 5 passed against the unfixed code -- RESULTS.md R23.
+#
+# CALIBRATION RESULT, AND IT IS NEGATIVE.  Read this before trusting a green run.
+#
+# Measured against a build with mutations.py C2 applied -- the B14 guard removed,
+# so a nested refresh shares the session cache and the use-after-free is live.
+# One run reported every on-arm refresh executing the inner matview's plan.  It
+# has not reproduced since: 0 in 6 at 4 sessions x 25, and 0 in 3 at 8 sessions
+# x 60, on the same binary.  The single fire is unexplained and is not claimed
+# as a rate.
+#
+# So this mode does NOT gate B14's class, and the honest reading is that
+# concurrency makes that class HARDER to hit rather than easier.  The
+# single-session test lands it deterministically because it controls the
+# ordering: matview_where_cache Test 5 issues the invalidating ALTER TABLE from
+# the refreshing backend itself, at a fixed point inside the nested call, so the
+# free always falls inside the enclosing refresh's execution.  Here the DDL
+# commits elsewhere and has to be picked up in a window microseconds wide.  That
+# is the same shape as the insert-driven P1 mode this file's header records
+# deleting -- "the window is microseconds wide ... chance does not land there".
+#
+# It is kept rather than deleted because, unlike that one, it is not only a
+# detector.  It asserts that both matviews still match their definitions, that
+# no unexpected error reaches the client, and that no backend died -- which hold
+# whatever the cause, and nothing else in the tree runs a nested refresh
+# concurrently at all.  Treat a green run as coverage, not as evidence.
+#
+# The deterministic gate for this class is matview_where_cache Test 5.
+#
+# Three signals, because the failure has three faces (RESULTS.md R22):
+#   wrong plan   the outer refresh executes the INNER matview's plan and reports
+#                "cannot change materialized view fz_nest_inner" -- an error
+#                naming a matview the statement never mentioned
+#   crash        a backend dies on freed memory
+#   corruption   neither of the above, but the matview no longer matches its
+#                own definition
+# The nested refresh always fails legitimately -- rows in a second matview
+# cannot be locked while the first is being maintained -- and that error is
+# trapped, so on a correct build NO error should reach the client.
+mode_nest() {
+    say "== nest: concurrent refreshes whose view definition nests a refresh"
+    say "        ($REFRESHERS sessions x $ITER)"
+
+    $PSQL -v ON_ERROR_STOP=1 >/dev/null <<SQL || exit 2
+DROP MATERIALIZED VIEW IF EXISTS public.fz_nest_mv;
+DROP MATERIALIZED VIEW IF EXISTS public.fz_nest_inner;
+DROP TABLE IF EXISTS public.fz_nest_base, public.fz_nest_ibase, public.fz_nest_stop CASCADE;
+DROP PROCEDURE IF EXISTS public.fz_nest_churn();
+DROP FUNCTION IF EXISTS public.fz_nest_f(int);
+
+CREATE TABLE public.fz_nest_base (id int PRIMARY KEY, v bigint);
+CREATE TABLE public.fz_nest_ibase (id int PRIMARY KEY, v bigint);
+INSERT INTO public.fz_nest_base  SELECT g, g FROM generate_series(1, 200) g;
+INSERT INTO public.fz_nest_ibase SELECT g, g FROM generate_series(1, 200) g;
+
+CREATE MATERIALIZED VIEW public.fz_nest_inner AS
+  SELECT id, v FROM public.fz_nest_ibase;
+CREATE UNIQUE INDEX ON public.fz_nest_inner(id);
+
+-- Defined as a no-op first, so creating the outer matview does not itself nest.
+-- That leaves the inner matview with no cache entry when the nesting starts,
+-- which is the state the reproducer needed.
+CREATE FUNCTION public.fz_nest_f(x int) RETURNS int LANGUAGE plpgsql VOLATILE
+AS \$\$ BEGIN RETURN x; END \$\$;
+
+CREATE MATERIALIZED VIEW public.fz_nest_mv AS
+  SELECT id, public.fz_nest_f(v::int) AS v FROM public.fz_nest_base;
+CREATE UNIQUE INDEX ON public.fz_nest_mv(id);
+
+CREATE OR REPLACE FUNCTION public.fz_nest_f(x int) RETURNS int LANGUAGE plpgsql
+VOLATILE AS \$\$
+BEGIN
+  BEGIN
+    REFRESH MATERIALIZED VIEW CONCURRENTLY public.fz_nest_inner WHERE id = 1;
+  EXCEPTION WHEN OTHERS THEN
+    NULL;
+  END;
+  RETURN x;
+END \$\$;
+
+CREATE TABLE public.fz_nest_stop(x bool);
+
+-- The invalidator.  ALTER TABLE ... SET is used rather than ANALYZE for the
+-- reason B16 records: ANALYZE was measured NOT to be sufficient to mark an
+-- entry stale, because its pg_class update is in-place and queues for commit.
+-- This one commits each time, so the message is delivered to other backends.
+CREATE OR REPLACE PROCEDURE public.fz_nest_churn() LANGUAGE plpgsql AS \$\$
+DECLARE flip bool := true;
+BEGIN
+  LOOP
+    EXECUTE format('ALTER TABLE public.fz_nest_ibase SET (autovacuum_enabled = %s)',
+                   flip);
+    flip := NOT flip;
+    COMMIT;
+    EXIT WHEN EXISTS (SELECT 1 FROM public.fz_nest_stop);
+  END LOOP;
+END \$\$;
+SQL
+
+    # Both GUC arms, and which one is the detector is not symmetric.  On the
+    # TEXT path the freed plan keeps executing -- SPI is handed the pointer once
+    # and cacheEntry is never re-read -- so the damage is a garbage query_string
+    # or a crash, and on a -O2 build without CLOBBER_FREED_MEMORY the freed
+    # bytes are usually still intact and nothing shows.  On the QUERY-TREE path
+    # the enclosing refresh picks up the nested matview's plan out of the reused
+    # element and says so, by name.  Run both; expect the second to be the one
+    # that fires.  matview_where_cache Test 5 records the same asymmetry.
+    #
+    # The GUC has to be set explicitly: it boots false, and a version of this
+    # mode that forgot ran clean against a build with the guard removed.
+    for arm in off on; do
+        : > "$WORKDIR/n-$arm.sql"
+        echo "SET matview_partial_refresh_querytree = $arm;" >> "$WORKDIR/n-$arm.sql"
+        i=0
+        while [ "$i" -lt "$ITER" ]; do
+            # Vary the scope so adjacent sessions do not settle into lockstep,
+            # the same reason p2 adds sessions rather than iterations.
+            echo "REFRESH MATERIALIZED VIEW CONCURRENTLY public.fz_nest_mv WHERE id <= $(( (i % 5) * 20 + 20 ));" \
+                >> "$WORKDIR/n-$arm.sql"
+            i=$((i + 1))
+        done
+    done
+
+    $PSQL -c "CALL public.fz_nest_churn();" > "$WORKDIR/nc.out" 2>&1 &  pc=$!
+
+    np=''
+    j=1
+    while [ "$j" -le "$REFRESHERS" ]; do
+        # Alternate the arms across sessions so both run under the same
+        # invalidation traffic rather than in separate quieter windows.
+        a=$([ $((j % 2)) -eq 1 ] && echo on || echo off)
+        $PSQL -f "$WORKDIR/n-$a.sql" > "$WORKDIR/n$j.out" 2>&1 &
+        np="$np $!"
+        j=$((j + 1))
+    done
+    wait $np
+    $PSQL -c "INSERT INTO public.fz_nest_stop VALUES (true)" >/dev/null 2>&1
+    wait $pc
+
+    errs=0; crash=0; wrongplan=0
+    j=1
+    while [ "$j" -le "$REFRESHERS" ]; do
+        errs=$((  errs  + $(grep -c '^ERROR:' "$WORKDIR/n$j.out" 2>/dev/null || true) ))
+        crash=$(( crash + $(crashed_in "$WORKDIR/n$j.out") ))
+        # Anchor on the ERROR line.  A bare match counts the CONTEXT line too
+        # and reports exactly double, which looks like a rate rather than a
+        # miscount and would have been quoted as one.
+        wrongplan=$(( wrongplan + $(grep -c '^ERROR:.*fz_nest_inner' "$WORKDIR/n$j.out" 2>/dev/null || true) ))
+        j=$((j + 1))
+    done
+
+    # The outer statement never names the inner matview, so seeing it in an
+    # error from a refresh of fz_nest_mv means the outer executed the inner's
+    # cached plan.  That is B14's first and worst symptom.
+    if [ "$crash" -gt 0 ]; then
+        say "  FAIL: $crash session(s) lost the connection -- backend died"
+        fail=1
+    elif [ "$wrongplan" -gt 0 ]; then
+        say "  FAIL: $wrongplan of $((ITER * REFRESHERS)) refreshes executed the INNER matview's plan"
+        grep -m2 -A1 '^ERROR:' "$WORKDIR"/n*.out 2>/dev/null | head -6
+        fail=1
+    elif [ "$errs" -gt 0 ]; then
+        say "  FAIL: $errs unexpected error(s) reached the client"
+        grep -m3 '^ERROR:' "$WORKDIR"/n*.out 2>/dev/null
+        fail=1
+    else
+        say "  ok: no errors in $((ITER * REFRESHERS)) nested refreshes"
+    fi
+
+    n=$($PSQL -Atc "
+      SELECT (SELECT count(*) FROM (SELECT id, v FROM public.fz_nest_base
+                                    EXCEPT ALL
+                                    SELECT id, v FROM public.fz_nest_mv) d)
+           + (SELECT count(*) FROM (SELECT id, v FROM public.fz_nest_mv
+                                    EXCEPT ALL
+                                    SELECT id, v FROM public.fz_nest_base) d)")
+    if [ "${n:-x}" != "0" ]; then
+        say "  FAIL: outer matview disagrees with its definition in ${n:-?} rows"
+        fail=1
+    else
+        say "  outer matview matches its definition"
+    fi
+
+    # The nested refresh can never succeed, so the inner matview must be
+    # untouched.  If it moved, the guard let a nested refresh commit.
+    m=$($PSQL -Atc "
+      SELECT count(*) FROM (SELECT id, v FROM public.fz_nest_ibase
+                            EXCEPT ALL
+                            SELECT id, v FROM public.fz_nest_inner) d")
+    if [ "${m:-x}" != "0" ]; then
+        say "  FAIL: inner matview moved -- a nested refresh committed"
+        fail=1
+    fi
+}
+
 # ------------------------------------------------------------------ main ----
 for m in $MODES; do
     case "$m" in
     p2)     mode_p2 ;;
     p3)     mode_p3 ;;
     serial) mode_serial ;;
+    nest)   mode_nest ;;
     *)      say "unknown mode $m"; exit 2 ;;
     esac
 done
 
 $PSQL -c "DROP MATERIALIZED VIEW IF EXISTS fz_mv" \
-      -c "DROP TABLE IF EXISTS fz_base, fz_viol" >/dev/null 2>&1
+      -c "DROP MATERIALIZED VIEW IF EXISTS public.fz_nest_mv" \
+      -c "DROP MATERIALIZED VIEW IF EXISTS public.fz_nest_inner" \
+      -c "DROP TABLE IF EXISTS fz_base, fz_viol" \
+      -c "DROP TABLE IF EXISTS public.fz_nest_base, public.fz_nest_ibase, public.fz_nest_stop" \
+      -c "DROP PROCEDURE IF EXISTS public.fz_nest_churn()" \
+      -c "DROP FUNCTION IF EXISTS public.fz_nest_f(int)" >/dev/null 2>&1
 
 [ "$fail" -eq 0 ] && say "PASS" || say "FAIL"
 exit $fail

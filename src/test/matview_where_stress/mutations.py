@@ -152,6 +152,26 @@ MUTATIONS = {
     # how that gets answered: drop the relcache callback and the stale entry
     # survives the rename.  If matview_where_cache stays green with C1 applied,
     # the file is still not a guard and the fix did not finish the job.
+    # The guard for B14's second fix, and for fuzz.sh's nest mode.
+    #
+    # A nested partial refresh must not touch the session cache: matview_cache_
+    # sweep() would free the plans the ENCLOSING refresh is still executing from,
+    # and dynahash hands the removed element straight back to the nested call.
+    # Restoring `use_cache = true` reinstates exactly that.
+    #
+    # C1's sibling, and it exists because C1 alone leaves the newer guard with no
+    # mutation that has ever broken it.  matview_where_cache Test 5 should fail
+    # with this applied, and so should fuzz.sh's nest mode -- Test 5 manufactures
+    # the invalidation with an ALTER TABLE, nest gets it from other backends
+    # committing, and a guard that survived only one of those is worth knowing
+    # about.
+    'C2': ('B14', 'cache',
+           'let a nested refresh share the session plan cache '
+           '(reopens the use-after-free)', [
+               ('\tuse_cache = (matview_maintenance_depth == 0);',
+                '\tuse_cache = true;\t\t\t/* C2 */', 1),
+           ]),
+
     'C1': ('-', 'cache',
            'never invalidate the partial-refresh plan cache', [
                ('\tCacheRegisterRelcacheCallback(InvalidateMatViewCache, (Datum) 0);',
