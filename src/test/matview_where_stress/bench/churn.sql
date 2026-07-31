@@ -156,6 +156,10 @@ END $fn$;
 \endif
 
 SELECT set_config('churn.workload', :'workload', false);
+-- Passed through a GUC, not interpolated: psql does not substitute :vars
+-- inside a dollar-quoted block, so the DO block below would see the literal
+-- text and fail to parse.
+SELECT set_config('churn.optimized', :'optimized', false);
 SELECT bench_setup(:'workload', 100000, 1000);
 VACUUM (ANALYZE) bench.mv;
 CHECKPOINT;
@@ -203,7 +207,7 @@ BEGIN
       -- and since the order was fixed that bias always fell on the same
       -- setting: it turned a +82.5% win into a -28.5% loss.  The caller runs
       -- this file once per setting with a VACUUM in between.
-      FOREACH opt IN ARRAY ARRAY[:optimized] LOOP
+      FOREACH opt IN ARRAY ARRAY[current_setting('churn.optimized')::bool] LOOP
         -- Rebuild the scope from the view so both settings meet the same data:
         -- the previous iteration's refresh already absorbed its own mutation.
         EXECUTE 'REFRESH MATERIALIZED VIEW CONCURRENTLY bench.mv WHERE ' || pred;
