@@ -14,6 +14,50 @@ compiled with instead of trusting make.
 
 ---
 
+## Navigating the history
+
+267 commits since the patch was posted to -hackers. **Ten of them touch
+`src/backend/commands/matview.c`** — that is the entire feature, and it fits on
+one screen. 80 touch this directory, which is deleted before posting. What feels
+unnavigable is the scaffolding sitting between the ten.
+
+Use paths, and **anchor at `c8beb05`** — the posted patch. Unanchored, these
+commands reach back into upstream PostgreSQL history and return hundreds of
+irrelevant commits:
+
+    # the feature itself — ten commits, the whole story
+    git log --oneline c8beb05..HEAD -- src/backend/commands/matview.c
+
+    # everything shippable: code, grammar, tests, docs
+    git log --oneline c8beb05..HEAD -- src/backend src/include src/test/regress \
+                         src/test/isolation src/test/modules doc contrib
+
+    # this directory alone
+    git log --oneline c8beb05..HEAD -- src/test/matview_where_stress
+
+Two of those ten are worth knowing by name. `0c16eaf` is the original
+use-after-free fix in the plan cache — the one ISSUES.md B14 has since reopened,
+because it deferred the free to "the next refresh" and a nested refresh is the
+next refresh. `9a5195b` is Phase 2.1, where the read side stopped being text.
+
+**The path filter is the reliable view; the prefix is only a convenience.**
+Going forward, `matview stress:` marks a commit touching nothing but this
+directory and `matview:` marks one that does not — but 33 of the older commits
+predate that convention and are research-only while carrying no prefix, so
+`--grep` alone will mislead. Rewriting pushed history to fix that is not worth
+it; the path filter already gives the right answer for every commit.
+
+### What the submission actually gets
+
+Not this branch. -hackers receives a patch series generated with
+`git format-patch` from a curated, squashed set with this directory removed —
+probably four to six patches split by subsystem (grammar, `matview.c`, tests,
+docs). So there is no reason to shape the development history toward
+submission, and every reason not to curate it twice: that happens once, at
+Phase 4/7.
+
+---
+
 ## `phase-2.1b` — `1d58a82`
 
 Phase 2.1 complete, measured, and injection-tested.  The state to return to
