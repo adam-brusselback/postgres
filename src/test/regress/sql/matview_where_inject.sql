@@ -338,6 +338,45 @@ SELECT * FROM refresh_forms(
        FROM inj8_mv$r$);
 
 --
+-- Test 9: a hostile name on the MATCH/MERGE path
+--
+-- Tests 1 to 8 all put their matview behind a single unique index, so routing
+-- (`qual && !skipData && nUniqueIndexes <= 1`) sends every one of them to
+-- refresh_by_direct_modification().  That leaves quote_qualified_identifier()
+-- in refresh_by_match_merge() covered by nothing, and it is a separate call
+-- site: mutation Q2 drops it and the whole file stays green, while Q1 and Q3 --
+-- the same defect on the direct-modification path -- are both caught.  Found by
+-- calibrate-all.sh; ISSUES.md B28.
+--
+-- Two unique indexes are what reaches the other path, and that is the only
+-- structural difference from Test 1.  The bare form is used deliberately: with
+-- more than one unique index BOTH spellings route to match/merge, so this does
+-- not need refresh_forms()'s three-way sweep to get there.
+--
+-- Disposition: keep.  It is the only coverage of identifier quoting on the
+-- match/merge path, and that path survives even if the direct-modification one
+-- is rewritten.
+--
+CREATE TABLE inj9_base (id int PRIMARY KEY, alt int, v int);
+INSERT INTO inj9_base SELECT g, g + 100, g * 10 FROM generate_series(1, 5) g;
+
+CREATE MATERIALIZED VIEW "mv9"";INSERT INTO victim VALUES('pwned-merge');--"
+  AS SELECT id, alt, v FROM inj9_base;
+-- Two of them, so routing takes match/merge rather than direct modification.
+CREATE UNIQUE INDEX ON "mv9"";INSERT INTO victim VALUES('pwned-merge');--" (id);
+CREATE UNIQUE INDEX ON "mv9"";INSERT INTO victim VALUES('pwned-merge');--" (alt);
+
+UPDATE inj9_base SET v = 999 WHERE id <= 2;
+REFRESH MATERIALIZED VIEW "mv9"";INSERT INTO victim VALUES('pwned-merge');--"
+  WHERE id <= 2;
+
+SELECT string_agg(id || '=' || v, ' ' ORDER BY id)
+  FROM "mv9"";INSERT INTO victim VALUES('pwned-merge');--";
+
+DROP MATERIALIZED VIEW "mv9"";INSERT INTO victim VALUES('pwned-merge');--";
+DROP TABLE inj9_base;
+
+--
 -- The canary, once, at the end.
 --
 SELECT note, count(*) FROM victim GROUP BY note ORDER BY note;

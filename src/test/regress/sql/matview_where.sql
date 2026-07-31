@@ -689,3 +689,62 @@ SELECT array_agg(id ORDER BY ctid) AS insert_order
 
 DROP MATERIALIZED VIEW mv_iord;
 DROP TABLE mv_iord_base;
+
+--
+-- Test 17: the row comparison and NULL
+--
+-- With matview_partial_refresh_optimized on, the upsert's DO UPDATE carries
+-- WHERE (mv cols) IS DISTINCT FROM (EXCLUDED cols), so a row whose values did
+-- not change is not rewritten.  IS DISTINCT FROM rather than <> is the whole
+-- point: `<>` yields NULL when either side is NULL, the WHERE is then not true,
+-- and a row moving to or from NULL is silently left at its old value.
+--
+-- Nothing tested that.  matview_where_cache Test 5 does turn the optimization
+-- on, so the code ran -- but its data has no NULLs, and the two operators agree
+-- on every non-NULL row, so mutation B7 (`IS DISTINCT FROM` -> `<>`) passed the
+-- entire suite.  Found by calibrate-all.sh; ISSUES.md B27.
+--
+-- Both directions are needed and they fail differently: NULL -> value leaves the
+-- old NULL, value -> NULL leaves the old value.  A test doing only one of them
+-- catches only one of them.
+--
+-- The GUCs are set explicitly because they boot false, and use_optimized also
+-- requires querytree -- so without both, this test exercises the unoptimized
+-- statement, which has no row comparison in it at all and cannot fail.
+--
+-- Disposition: keep, and revisit when the optimization stops being optional.
+-- If the row comparison becomes unconditional the SETs go away and the case
+-- stays; if it is dropped, so is this.
+--
+CREATE TABLE mv_null_base (id int PRIMARY KEY, v int);
+INSERT INTO mv_null_base VALUES (1, NULL), (2, 20), (3, NULL), (4, 40);
+CREATE MATERIALIZED VIEW mv_null AS SELECT id, v FROM mv_null_base;
+CREATE UNIQUE INDEX ON mv_null(id);
+
+SET matview_partial_refresh_querytree = on;
+SET matview_partial_refresh_optimized = on;
+
+-- NULL -> value.  Under `<>` the comparison is NULL, the row is not updated,
+-- and id 1 stays NULL.
+UPDATE mv_null_base SET v = 11 WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_null WHERE id = 1;
+SELECT id, v FROM mv_null ORDER BY id;
+
+-- value -> NULL.  Same comparison, other direction: id 2 stays 20.
+UPDATE mv_null_base SET v = NULL WHERE id = 2;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_null WHERE id = 2;
+SELECT id, v FROM mv_null ORDER BY id;
+
+-- NULL -> NULL really is a no-op, so the row comparison is doing its job rather
+-- than being bypassed: this must change nothing, and would also pass if the
+-- comparison were absent.  It is here so the two cases above cannot be read as
+-- "the optimization is simply off".
+UPDATE mv_null_base SET v = NULL WHERE id = 3;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_null WHERE id = 3;
+SELECT id, v FROM mv_null ORDER BY id;
+
+RESET matview_partial_refresh_querytree;
+RESET matview_partial_refresh_optimized;
+
+DROP MATERIALIZED VIEW mv_null;
+DROP TABLE mv_null_base;
