@@ -35,6 +35,8 @@
 #           pristine baseline.  Same rule calibrate.sh uses, and for the same
 #           reason: six shapes diverge on pristine by design.
 # fuzz      any mode failing.  fuzz.sh exits nonzero and names the mode.
+# specs     any isolation or injection-point spec failing.  Needs a tree built
+#           --enable-injection-points; reported NOSPEC when it is not.
 #
 # A mutation is CAUGHT if any instrument fires, and the matrix says which -- a
 # bug caught only by the suite and not by the oracle is a different risk from
@@ -95,6 +97,27 @@ run_oracle() {
     su pgtest -c "PSQL_BIN=$PSQL_BIN $DIR/safety/run.sh $PORT $DB" > "$1" 2>&1
 }
 
+# ---- instrument 4: the isolation and injection-point specs ------------------
+# S1's declared detector is matview-where-prune-gap.spec, and the first version
+# of this harness did not run it -- so S1 came back UNCAUGHT from an instrument
+# that was never pointed at it.  Verified afterwards by hand: with S1 applied
+# the spec fails, on pristine it passes.  That is the row this instrument
+# exists to stop being wrong.
+#
+# The injection-point specs need a tree configured --enable-injection-points,
+# and the benchmark build deliberately is NOT, because R26-R29 were measured
+# without them and adding INJECTION_POINT() calls to the refresh path would
+# make future measurements incomparable.  So this checks the capability and
+# reports NOSPEC rather than passing quietly -- an absent instrument must never
+# read as a clean result.
+specs_capable() { grep -q '^#define USE_INJECTION_POINTS' "$SRC/src/include/pg_config.h"; }
+run_specs() {
+    su pgtest -c "PATH=$PREFIX/bin:\$PATH make -C $SRC/src/test/modules/injection_points check" \
+        > "$1" 2>&1
+}
+specs_ran()    { grep -cE '^(not )?ok ' "$1" 2>/dev/null || true; }
+specs_failed() { grep -c '^not ok' "$1" 2>/dev/null || true; }
+
 # ---- instrument 3: the concurrent fuzzer ------------------------------------
 run_fuzz() {
     su pgtest -c "PSQL_BIN=$PSQL_BIN ITER=$ITER REFRESHERS=$REFRESHERS \
@@ -103,8 +126,8 @@ run_fuzz() {
 
 MUTS=${*:-$(cd "$SRC" && ./src/test/matview_where_stress/mutations.py --list | awk '{print $1}')}
 
-printf '%-6s %-5s %-7s  %-10s %-10s %-10s  %s\n' \
-       MUT ISSUE NEEDS REGRESS ORACLE FUZZ VERDICT
+printf '%-6s %-5s %-7s  %-10s %-10s %-10s %-9s  %s\n' \
+       MUT ISSUE NEEDS REGRESS ORACLE FUZZ SPECS VERDICT
 printf '%s\n' '-------------------------------------------------------------------------------'
 
 for m in $MUTS pristine; do
@@ -119,8 +142,8 @@ for m in $MUTS pristine; do
 
     (cd "$SRC" && ./src/test/matview_where_stress/mutations.py "$m") >/dev/null
     if ! "$DIR/rebuild.sh" --source > "$OUT/build-$m.log" 2>&1; then
-        printf '%-6s %-5s %-7s  %-10s %-10s %-10s  %s\n' \
-               "$m" "$issue" "$needs" - - - BUILDFAIL
+        printf '%-6s %-5s %-7s  %-10s %-10s %-10s %-9s  %s\n' \
+               "$m" "$issue" "$needs" - - - - BUILDFAIL
         continue
     fi
 
@@ -158,11 +181,28 @@ for m in $MUTS pristine; do
     *) fz="FIRED($(grep -c '^  FAIL' "$OUT/fz-$m.log" 2>/dev/null || echo 1))" ;;
     esac
 
+    # --- specs ---
+    if ! specs_capable; then
+        sp="NOSPEC"
+    else
+        run_specs "$OUT/sp-$m.log" || true
+        nsran=$(specs_ran "$OUT/sp-$m.log")
+        nsp=$(specs_failed "$OUT/sp-$m.log")
+        if   [ "${nsran:-0}" -lt 12 ]; then sp="NORUN($nsran)"
+        elif [ "${nsp:-0}" -gt 0 ];    then sp="FIRED($nsp)"
+        else                                sp="quiet"
+        fi
+    fi
+
     # --- verdict ---
     fired=0; broke=0
     case "$reg" in FIRED*) fired=1 ;; NORUN*) broke=1 ;; esac
     case "$orc" in FIRED*) fired=1 ;; ABORTED*) broke=1 ;; esac
     case "$fz"  in FIRED*) fired=1 ;; SETUPFAIL*) broke=1 ;; esac
+    # NOSPEC is a deliberate configuration choice, not a broken instrument, so
+    # it does not void the row -- but it is printed, so a reader can see that
+    # one detector was not consulted.
+    case "$sp"  in FIRED*) fired=1 ;; NORUN*) broke=1 ;; esac
 
     if [ "$broke" -eq 1 ] && [ "$fired" -eq 0 ]; then
         # An instrument that did not run cannot vote either way, and a row that
@@ -179,8 +219,8 @@ for m in $MUTS pristine; do
         verdict=$([ "$fired" -eq 1 ] && echo CAUGHT || echo '*** UNCAUGHT ***')
     fi
 
-    printf '%-6s %-5s %-7s  %-10s %-10s %-10s  %s\n' \
-           "$m" "$issue" "$needs" "$reg" "$orc" "$fz" "$verdict"
+    printf '%-6s %-5s %-7s  %-10s %-10s %-10s %-9s  %s\n' \
+           "$m" "$issue" "$needs" "$reg" "$orc" "$fz" "$sp" "$verdict"
 done
 
 echo

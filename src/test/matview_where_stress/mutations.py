@@ -125,9 +125,26 @@ MUTATIONS = {
                 'appendStringInfo(&buf, "WHERE (%s) <> (%s) ",', 1),
            ]),
 
-    'B6': ('B6', 'data',
+    # RECLASSIFIED from `data` to `benign` -- and the reason is a finding about the
+    # code, not about the corpus.  This mutation drops the primary-key preference
+    # in refresh_by_direct_modification()'s arbiter search, which can only matter
+    # when that loop has more than one usable index to choose between.  It never
+    # does.  Routing enters that function only when nUniqueIndexes <= 1, counting
+    # indisunique && indisvalid && indimmediate; the loop then filters with
+    # is_usable_unique_index(), which is STRICTER -- it additionally rejects
+    # partial and expression indexes.  So usable is a subset of counted, counted
+    # is at most one, and the preference can never pick between anything.
+    #
+    # The preference is vestigial: it predates the routing rule moving to
+    # nUniqueIndexes <= 1 (B21's commit), and nothing updated it.  Deleting it is
+    # a candidate simplification -- see ISSUES.md B26.
+    #
+    # If the routing rule ever changes, this goes straight back to `data`, and
+    # the calibration will say so by reporting a FALSE POSITIVE the moment an
+    # instrument catches it.
+    'B6': ('B6', 'benign',
            'arbitrate on the wrong unique index (drop the primary-key '
-           'preference)', [
+           'preference -- benign: the loop never has a choice)', [
                ('\t\t\tif (is_pk)\n'
                 '\t\t\t{\n'
                 '\t\t\t\tuniqueIndexOid = indexoid;\n'
