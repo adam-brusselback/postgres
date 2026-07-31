@@ -676,10 +676,18 @@ This alone removes, by construction rather than by fix:
 |---|---|
 | B1, B2 | a Query holds OIDs; a rename cannot re-resolve it to a different relation |
 | B3 | parameter types live in the tree, not in a rendered `$1` |
-| B7, B14 | the bespoke plan cache and its use-after-free exist to avoid re-deparsing; with no deparse, most of its reason to exist goes |
+| B7, B14 | the bespoke plan cache and its use-after-free exist to avoid re-deparsing; with no deparse, most of its reason to exist goes. **B14 is reopened and live in the tree today** — see ISSUES.md; this row is what Phase 2.3 would retire, not a description of the present |
 | B9 | `RestrictSearchPath()` guards name resolution in generated text; the view side no longer resolves names at all |
 
 Five tracked items and one CVE-shaped hazard, deleted rather than patched.
+
+That is the plan, not the state. B14 has since reopened — the nested-refresh
+case, reproduced on an assertions build — and Phase 2.3 has not been written, so
+it needs a guard now rather than waiting to be deleted later. Note too that
+Phase 2.3 removes the *deparse*, not the cache: something still has to hold
+prepared plans across refreshes, so the hazard class B14 belongs to — freeing a
+structure that a re-entrant caller is still using — survives the rewrite and has
+to be designed against rather than dissolved by it.
 
 ### 2.1b Measure here, and again after 2.2
 
@@ -996,6 +1004,12 @@ the miss branch without a cheaper validity check.
 `hash_seq_search()` over every entry to find the invalid ones, per call. Cheap
 at one entry and O(sessions' matviews) at scale. A counter of pending
 invalidations turns it into a branch.
+
+It is no longer only a cost item: sweeping *every* entry rather than this
+refresh's own is what lets a nested refresh free an enclosing one's in-flight
+plans (B14, reopened). Narrowing the sweep to the caller's own key — the shape
+`ri_FetchPreparedPlan()` uses — would address both the cost and half the
+correctness problem in one change.
 
 **3.11 The ENR claims the whole matview's row count.**
 `enr->md.enrtuples = matviewRel->rd_rel->reltuples` tells the planner that

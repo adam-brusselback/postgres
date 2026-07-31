@@ -8,12 +8,22 @@ support to REFRESH MATERIALIZED VIEW**, and items found separately that have not
 been mentioned there. Each row names the test that covers it, so a fix shows up
 as that test turning green.
 
-**All of these are now fixed unless marked otherwise, and the whole suite is
-green** — regress 249/249, isolation 135/135, injection_points 12/12,
-pg_stat_statements 16/16, most recently on a `-O2 --enable-cassert` build with
-the two `Assert()`s in `refresh_by_direct_modification()` live, run both with
+**B14 is REOPENED and is a memory-safety defect — see below before reading the
+rest of this file as reassuring.** Everything else is fixed unless marked
+otherwise, and the declared suite is green — regress 249/249, isolation 135/135,
+injection_points 12/12, pg_stat_statements 16/16, most recently on a
+`-O2 --enable-cassert` build with the two `Assert()`s in
+`refresh_by_direct_modification()` live, run both with
 `matview_partial_refresh_querytree` off and with it forced on. The State column
 records what happened.
+
+That green suite is also the point: it was green throughout, on an assertions
+build, while a nested partial refresh could execute another matview's plan. No
+test in it nests a refresh, so nothing could have caught it. **The suite has
+never been run under `debug_discard_caches = 1`**, which is the configuration
+that turns this class of defect from intermittent into deterministic, and which
+caught the equivalent defect in the PG19 foreign-key fast path one day after it
+committed.
 
 The **Disposition** column says whether a test is worth leaving in the tree once
 its issue is fixed, or is scaffolding to remove then. The reasoning for each is
@@ -97,6 +107,84 @@ the current one preserves B7 — plans belonging to dropped matviews are still
 reclaimed. Behaviour is unchanged: all 36 harness shape-runs return identical
 verdicts before and after, and regress 248/248, isolation 133/133 and
 pg_stat_statements 16/16 are green.
+
+### On B14 being reopened, and why the first fix was only half right
+
+Half of it was right and is not in question: **an invalidation callback must not
+free.** `plancache.c`'s own callbacks only ever set `is_valid = false`, and
+`ri_triggers.c` states the rule outright — *"at the time a cache invalidation
+message is processed there may be active references to the cache. Because of
+this we never remove entries from the cache, but only mark them invalid."*
+
+The other half — deferring the free to "the start of the next partial refresh,
+before any plan is taken" — rests on an invariant that is false, and the code
+says so in its own words at the sweep's call site:
+
+> Afterwards nothing removes entries **until the next refresh**, so `cacheEntry`
+> stays valid for the whole maintenance window.
+
+A **nested** refresh is the next refresh. The predicate and the view definition
+are both evaluated inside the maintenance window — B5 is the same observation
+from the privileges angle, and the code comment there already says a predicate
+function "could modify any matview in the database". Such a function can issue
+`REFRESH MATERIALIZED VIEW ... WHERE`, which re-enters at the sweep before
+anything can reject it.
+
+There are **two** free sites, and the second needs no invalidation at all:
+
+- `matview_cache_sweep()` frees entries the callback marked. Reaching it needs a
+  relcache invalidation to have arrived — any one, from anywhere, because
+  `InvalidateMatViewCache()` ignores its `relid` argument and marks every entry.
+- the mismatch branch, which frees `lockPlan`/`refreshPlan` whenever an entry's
+  predicate text differs from the caller's. That fires on **a nested refresh of
+  the same matview with a different predicate** — no invalidation involved. It
+  is the ordinary two-callers-one-matview case (a row trigger keyed `= $1`
+  beside a statement trigger keyed `= ANY($1)`) which was already known to
+  thrash this single-entry cache; the thrash turns out to be a memory-safety
+  defect, not just a wasted cache.
+
+What breaks is not protected by refcounting. `DropCachedPlan()` deletes
+`plansource->context` and `SPI_freeplan()` deletes `plan->plancxt`, neither with
+a refcount test — only the derived `CachedPlan` is refcounted. So
+`_SPI_execute_plan`'s `foreach(lc1, plan->plancache_list)` iterates freed list
+cells, and `spicallbackarg.query = plansource->query_string` stays on
+`error_context_stack` pointing at freed memory.
+
+Unlike the original B14, this reproduces deterministically on an
+`--enable-cassert` build. Three symptoms, worst first:
+
+1. **A refresh of `mv1` executes `mv2`'s cached plan.** dynahash hands the
+   `HASH_REMOVE`d element straight back to the nested refresh while the outer
+   still holds its pointer. In the reproducer it errored only because
+   `matview_maintenance_relid` still named `mv1` — an incidental guard, not a
+   defence. This is B1's failure mode ("writes to a different matview") arriving
+   by a different route.
+2. **A freed `query_string` printed by the error context**, one read landing
+   mid-word in a reused buffer.
+3. **SIGSEGV** in `_SPI_execute_plan`, with `l->elements` reading
+   `0x7f7f7f7f7f7f7f7f` — the `CLOBBER_FREED_MEMORY` wipe pattern.
+
+The reproducer needs three ingredients, each verified load-bearing: a relcache
+invalidation generator (`ALTER TABLE`; `ANALYZE` is not enough, since an
+in-place `pg_class` update queues its invalidation for commit), an `EXCEPTION`
+block so the nested failure does not unwind the outer refresh, and two matviews
+(nesting the same one is stopped earlier by `CheckTableNotInUse`).
+
+The fix is the shape `funccache.c` documents — *"we can release the subsidiary
+storage, but **only if there are no active evaluations in progress**. Otherwise
+we'll just leak that storage… a leak seems acceptable"* — and which
+`evtcache.c` uses for the same situation: decline to free while an operation is
+in progress. `matview_maintenance_depth` already exists and, at both free sites,
+reflects any *enclosing* refresh. Gating both on it is the minimal correct
+change; a per-entry use count is the more precise version. Separately,
+`cacheEntry` should not be held across execution at all.
+
+Two things worth recording beyond the fix. The declared suite was green
+throughout, on an assertions build — no test in it nests a refresh, so nothing
+could have caught this. And the suite has never run under
+`debug_discard_caches = 1`, the setting that makes this class deterministic;
+the PG19 foreign-key fast path shipped a structurally identical cache and was
+caught by that configuration on the buildfarm **one day after commit**.
 
 ### On B9, and why the thread settles it
 
@@ -314,7 +402,7 @@ the A5 reproducer applies to tests you just wrote, not only to old ones.
 | # | Item | Test | Notes | Disposition |
 |---|------|------|-------|-------------|
 | B1 | Cached plans re-resolve relations by name. After a rename, or once another relation takes the old name, a refresh reports success, leaves its own target untouched, and **writes to a different matview** — with no lock and no `MAINTAIN` check taken there | `matview_where_cache` Tests 1–2 | **FIXED** — a relcache callback drops cached plans | delete if the plan cache goes away; keep as invalidation guards if it stays |
-| B2 | Same hazard through the view definition: after a base-table rename the matview fills from an unrelated table and diverges from its own `pg_get_viewdef()` | `matview_where_cache` Test 3 | **FIXED** — same callback | n/a |
+| B2 | Same hazard through the view definition: after a base-table rename the matview fills from an unrelated table and diverges from its own `pg_get_viewdef()` | `matview_where_cache` Test 3 | **PARTIALLY FIXED.** The relcache callback covers renames of *relations*. The view definition also names functions, operators, types and schemas, and we register **one** callback where `plancache.c` registers **seven** — `PROCOID`, `TYPEOID`, `NAMESPACEOID`, `OPEROID`, `AMOPOPID` and two FDW ones besides the relcache one. So `ALTER FUNCTION f RENAME TO g` invalidates plancache's plan but not our entry; we keep serving cached SQL that still names `f`, and re-analysis binds it to whatever holds that name now. Test 3 does not cover a function rename | keep, and extend to a function rename |
 | B3 | Parameter types are not in the cache key and `pg_get_expr()` does not render them, so predicates differing only in parameter type share an entry and the **wrong rows are refreshed**, silently | `matview_where_cache` Test 4 | **FIXED** — argument types are part of the cache key | keep — asserts the refresh acts on the rows its predicate identifies, cache or no cache |
 | B4 | A nullable unique key makes every refresh duplicate the NULL-keyed rows: `ON CONFLICT` never arbitrates on NULL, the anti-join's `IS NOT DISTINCT FROM` always matches it | `matview_where` Test 11 | **FIXED** — the anti-join operator now follows the arbiter index's NULL handling, which also removes an O(n^2) nested loop | keep |
 | B5 | The predicate is evaluated inside the maintenance window, so a predicate function can modify **any** matview in the database | `matview_where_privs` Test 2 | **FIXED** — the exemption is scoped to the matview being refreshed | keep |
@@ -327,9 +415,9 @@ the A5 reproducer applies to tests you just wrote, not only to old ones.
 | B12 | `opt_refresh_where_clause` duplicates the existing `where_clause` production; its `ereport` has no `parser_errposition()` | none | Cosmetic | n/a |
 | B13 | `SetMatViewPopulatedState()`'s new early return also changes the full-rebuild path: it now skips the `pg_class` update *and* the `CommandCounterIncrement()` | none | Only two callers, both benign, but it should be called out rather than slipped in | n/a |
 | B17 | **The test suite does not protect a performance phase.** Four mutations of the kind an optimizer would plausibly write were injected; three passed every gate. Detail below | mutation matrix in `safety/` notes; now `fuzz.sh` + `calibrate-fuzz.sh` | **CLOSED for the development phase** — `fuzz.sh` catches all four (M1 76/160 deadlocks, M2 40/80, M3 45 lost updates, M6 55) and is quiet on pristine. M2, recorded here as the one mutation no gate caught, is now the most strongly detected of the four. Not closed for the *shipped* suite: the fuzzer is probabilistic and is deleted at Phase 4, so the deterministic tests it is meant to write still have to be written | n/a |
-| B16 | **A refresh may cost ~12x more when each one commits.** 300 scope-1 refreshes in a single transaction measured 82.8 us each; the same 300 via pgbench, one transaction each with `synchronous_commit=off`, measured 970 us. Not yet isolated. The candidate worth checking first: a partial refresh writes to the matview, that write sends a relcache invalidation, the invalidation marks every plan-cache entry stale, and the *next* refresh's `matview_cache_sweep()` then discards them -- so a drain process committing per refresh would re-plan every single time while a trigger inside one transaction never does | `bench/` reproduces it | **OPEN, unconfirmed** — if it holds it affects every D2 drain pattern in USE-CASES.md, and it predates B14 (the old callback did HASH_REMOVE, which has the same effect) | n/a |
+| B16 | **A refresh may cost ~12x more when each one commits.** 300 scope-1 refreshes in a single transaction measured 82.8 us each; the same 300 via pgbench, one transaction each with `synchronous_commit=off`, measured 970 us | `bench/run.sh --perxact` | **MEASURED, and the named candidate is disproven.** The re-planning mechanism guessed at here requires a partial refresh to emit a relcache invalidation; it does not, because `SetMatViewPopulatedState()` early-returns when the state already matches, and an in-place `pg_class` update queues its invalidation for commit anyway rather than delivering it mid-transaction. Confirmed incidentally while building the B14 reproducer: `ANALYZE` was *not* sufficient to mark an entry stale mid-transaction; forcing it needed an `ALTER TABLE`. What `--perxact` then measured is the axis itself, and the size is smaller and the shape more interesting than the 12x suggested — amortising over 20 refreshes is worth **3.5–3.7x at scope 1** and **1.25–1.9x at scope 100**, then *inverts* to **2.1x slower at scope 1000 and 3.3x slower at scope 10000**, because 20 rewrites of one scope inside one transaction build update chains nothing can prune until it commits. So D1 is not "D2 minus the commit", and a statement trigger firing repeatedly against a large scope is this feature's worst case | n/a |
 | B15 | **The documentation does not mention blast radius.** A reader following `refresh_materialized_view.sgml` today will refresh a `rank() OVER (PARTITION BY ...)` matview by row key and silently corrupt it. Nor does it mention that a row leaving the predicate's scope is deleted, or that a non-deterministic view definition can diverge between partial and full refresh | `safety/` covers all three | **OPEN** — needs a decision, not just prose: warn, error, or document. `SAFETY.md` has the material and the measured cost of a static check | keep |
-| B14 | **Use-after-free in the plan cache.** `InvalidateMatViewCache()` freed plans and `HASH_REMOVE`d entries from inside a relcache callback, while `refresh_by_direct_modification()` held a pointer to one of those entries across the whole maintenance window | found by `safety/run.sh`; no deterministic test | **FIXED** — the callback now only marks; `matview_cache_sweep()` frees at the next refresh. See below | keep the sweep |
+| B14 | **Use-after-free in the plan cache.** `InvalidateMatViewCache()` freed plans and `HASH_REMOVE`d entries from inside a relcache callback, while `refresh_by_direct_modification()` held a pointer to one of those entries across the whole maintenance window | reproducer below; not yet in the tree | **REOPENED — the fix was incomplete, and the remaining hole is reachable by any matview owner.** The callback marking rather than freeing was necessary and correct; deferring the free to "the next refresh" was not, because **a nested refresh is the next refresh**. Confirmed by execution on an assertions build, three symptoms, worst first: a refresh of `mv1` executing `mv2`'s cached plan; `_SPI_error_callback` printing a freed `query_string`; SIGSEGV in `_SPI_execute_plan`. See below | the sweep needs a guard, and the reproducer needs to become a test |
 | B24 | **Eleven `XXX` markers described the behaviour of code that no longer existed.** Every one named a defect as present -- "currently errors", "currently allowed", "currently both succeed", "CONCURRENTLY still selects match/merge" -- while the expected output beside it recorded the fixed behaviour. A reader of the `.sql` files, which is where a -hackers reviewer starts, would conclude the feature was broken in eleven ways it is not. Found by building `c8beb05` to answer a different question and noticing the markers were describing *that* build | `matview_where`, `matview_where_cache`, `matview_where_privs` | **FIXED** -- markers removed or rewritten to say what the pre-fix behaviour was and why the case exists. The file headers no longer claim unfixed defects they do not have. Comment-only, plus one `\set VERBOSITY` guard that existed to shorten an error that no longer happens | keep |
 | B23 | **The mutation corpus rotted against the code it mutates, and said nothing.** Phase 2.1 restructured the generated SQL and gave `matview_execute_spi_plan()` a snapshot argument; A4 and M6 stopped matching and would have failed the next time either was applied. Worse, two entries matched *twice* and were applied with `replace(..., 1)`: B4's anti-join edit and Q3's column quoting each have two call sites, so each was breaking one and leaving the other correct. A half-applied mutation still builds, still misbehaves, and still yields a plausible detection number, with nothing recording which half was measured | `mutations.py --list`, and the apply path itself | **FIXED** -- patterns repaired, and an edit now declares how many occurrences it expects; a count that does not match is a hard error instead of a silent single substitution. All 11 apply and restore | keep the check |
 | B22 | **A test that asserted nothing looked exactly like a test that passed.** The bound-parameter case in `matview_where_inject` bound a tag value matching no row, so all three refreshes were correctly no-ops -- and read back a matview an earlier case had already made correct. It reported the right answer three times without executing any of the code it named. The same shape was latent in every other case in the file: run three implementations in sequence over one matview and only the first has work to do | `matview_where_inject` | **FIXED** in `608b3ad` -- the base is mutated afresh before each form with a value carrying the iteration number, and the matview read back after each, so a form that refreshed nothing shows the previous form's number. This is the fourth time in this directory that a clean run meant an absent test rather than an absent bug | keep the pattern |

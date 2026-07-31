@@ -473,3 +473,122 @@ optimization — and all of them plausible-looking at the time:
 The one quantity that reproduced everywhere — three scripts, two boots, four
 protocols, ±4% — is the *optimized* arm's absolute cost. That is the signal to
 trust. Anything divided by the un-optimized arm needs its protocol stated.
+
+
+---
+
+## 7. The plan cache — lifespan, and what it is allowed to assume
+
+Everything above assumes cached plans. The cache exists (`MatViewRefreshCache`,
+a session HTAB in `CacheMemoryContext` holding two `SPIPlanPtr` per matview),
+and its lifespan decides how much of §3 is reachable at all.
+
+**Where it lives, and when it pays.** Backend-local, so it lives exactly as long
+as the backend. Reuse needs all six of: same backend · same matview ·
+byte-identical predicate text · same argtypes · same GUCs · no invalidation
+since. That is D1 through a pooled connection and D2 through a drain loop. It is
+**nothing at all for D3** — a nightly job in a fresh backend gets a cold cache
+on every run, and no design fixes that, because a plan cache cannot outlive a
+backend. That bounds the whole caching effort before any of it is written.
+
+**Maintenance is cheap, so the answer is never "cache less".** `SPI_keepplan()`
+reparents rather than copies — `MemoryContextSetParent(plan->plancxt,
+CacheMemoryContext)` — so a wasted entry costs a pointer swap and a hash insert
+while a hit saves a full parse, rewrite and plan. The asymmetry favours caching
+even at a poor hit rate.
+
+**Three defects follow from that, and all three are subtractions.**
+
+- *The invalidation is a shotgun.* `InvalidateMatViewCache()` accepts `relid`
+  and never uses it, so any relcache event anywhere marks every entry for every
+  matview. Autoanalyze on an unrelated table does it. `plancache.c` does the
+  same job precisely, against `plansource->relationOids`.
+- *It is also too narrow.* One relcache callback where plancache registers
+  **seven**, so a function, operator, type or schema rename invalidates
+  plancache's plan and not our entry — B2, still open.
+- *It is keyed too coarsely.* One entry per `matviewOid`, so two callers with
+  different predicates on one matview evict each other every time. That is worse
+  than no cache: maintenance paid for a guaranteed miss. It is also the second
+  free site in B14.
+
+The fix for all three is `ri_triggers.c`'s pattern: **let plancache be the
+detector and own the text yourself.** `ri_FetchPreparedPlan()` gates reuse on
+`SPI_plan_is_valid()` and, when stale, rebuilds the query text from the catalog
+rather than letting plancache re-analyse a raw parse tree that still names the
+old object. That inherits all seven callbacks and deletes our callback entirely.
+
+### 7a. One argument not to make
+
+The PG19 foreign-key fast path documents its cache as *"not subject to cache
+invalidation. The cached relations are held open with locks for the transaction
+duration, preventing relcache invalidation."* **Do not reuse that reasoning.**
+It conflates two things: a lock stops concurrent DDL from changing the object,
+but it does not stop *your own backend* from processing queued invalidations —
+`LockRelationOid()` calls `AcceptInvalidationMessages()` (`lmgr.c:136`). So the
+window is between deciding to use a cached entry and finishing the opens, and
+`table_open()` can invalidate what you cached. That argument went into review
+unchallenged and broke on the CLOBBER_CACHE_ALWAYS buildfarm animal **one day
+after commit**.
+
+The standard to build to is Tom Lane's, stated about RI caching specifically:
+
+> if such caching behavior is at all competently implemented, **it will be
+> transparent because the cache will notice and respond to events that should
+> change its outputs**.
+
+Caching is welcome; caching that cannot notice is not. `SPI_plan_is_valid()`
+meets that bar and a relcache-only callback does not.
+
+### 7b. What review will ask, from the same reviewers
+
+The RI work is the closest precedent — a session cache keyed on a catalog
+object, bypassing SPI — and its history is worth reading before posting:
+
+- **Discharge Tom's 2021 checklist explicitly**, in the commit message: SELECT
+  and schema permission checks; `SetUserIdAndSecContext()` to the owner; RLS
+  (state that predicate privilege does not become an RLS bypass); non-btree and
+  non-heap AMs; and **which snapshot, and whether a *pair* is needed** — that
+  last item is why the RI fast path covers only `RI_FKey_check`.
+- **Hybrid fast path with a mandatory fallback**, gated by an explicit
+  applicability predicate, is what broke a five-year deadlock on the RI work.
+  Robert Haas's objection — *"the only way to be 100% certain we're doing all
+  the things that would happen if you executed a plan is to execute a plan,
+  which kind of defeats the point"* — is unanswerable in general, so narrow to
+  where equivalence is checkable and fall back everywhere else. No reviewer ever
+  asked for such a predicate to be *wider*.
+- **Enumerate what re-entrant user code can do**, and show the guard. All three
+  post-commit defects in the RI fast path were re-entrancy defects, and none was
+  caught in review.
+- **Track resources by subtransaction.** Noah Misch rejected a fix that disabled
+  batching below the top level as "a bad user experience not seen elsewhere"
+  that "departs from the PostgreSQL norm of tracking resources by
+  subtransaction". A session cache that cannot unwind on subxact abort will meet
+  the same objection.
+- **Run under `debug_discard_caches = 1` before posting.** Neither our suite nor
+  the RI feature's did; the buildfarm did it for them on day one.
+- **Do not read silence as approval.** That feature shipped with two named
+  reviewers, no committer review beside the author's, and a `Tested-by:` that
+  was benchmarks only — then took six follow-up commits in eleven weeks.
+
+### 7c. On holding two plans rather than choosing one
+
+§2's Tier 3 wants a churn signal; §1's heap-state and churn axes say scope is
+what actually separates the cases. The obvious mechanism — keep a pinned-generic
+and a pinned-custom plansource and select per call on the row count the pre-lock
+returns for free — is **novel**: `CURSOR_OPT_GENERIC_PLAN` and
+`CURSOR_OPT_CUSTOM_PLAN` have **zero in-tree users**, appearing only in the
+enum, in `choose_custom_plan()`, and in the SPI docs.
+
+It also sidesteps rather than collides with the recorded objections to changing
+plancache's policy: we never compare `generic_cost` against `avg_custom_cost`
+(Lane: those estimates are "apples-to-oranges", and the planning-cost estimate
+is "pretty laughable"), and we never probe (Johnston: *"any algorithm that
+requires computing the custom plan unconditionally amounts to simply setting the
+GUC to infinity"*). Lane has himself floated gating on how much rowcounts "move
+around" — on *estimated* ones; ours would be measured.
+
+One trap: `plan_cache_mode` is checked **before** `cursor_options`, so a session
+setting `force_custom_plan` silently defeats both pinned plansources. And one
+thing to measure first: whether the pre-lock's row count predicts the
+*predicate's selectivity* rather than merely its scope. `opt_result` has 94
+auto-versus-forced-generic comparisons and can answer it.
