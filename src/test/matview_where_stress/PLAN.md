@@ -1,5 +1,45 @@
 # Plan: tests, then implementation, then performance
 
+## Where we are
+
+**Phase 1 — complete.** Oracle, fuzzer, calibration, contract file, both gap
+closures.
+
+**Phase 2 — one step in, and blocked.** 2.1 (read side) is done and measured.
+**2.2 is a decision, not unstarted work**: option (b) is what 2.1 shipped, so
+what 2.2 decides is whether to go on to (a), hand-built DML `Query` trees. 2.3
+is gated on that choice — under (b) the predicate is still text. **B14 is
+reopened and blocks both**; see ISSUES.md.
+
+**Phase 3 — worked out of order, and ahead of Phase 2.** Gaps 1–5, the churn
+curve, heap state, the `ORDER BY` split. That is legitimate ("Phase 3 is a
+loop"), but it means the numbering below no longer describes the order things
+happened in.
+
+**Phases 4–7 — untouched.**
+
+### Which document owns what
+
+Two facts have now been re-derived because they were recorded in one file and
+looked for in another. B16 sat "OPEN, unconfirmed" in ISSUES.md while 3.1 below
+had already closed it. The `+28.6%` generic-plan figure was retracted as
+unreproducible when it was reproducible, because 4.1's grouping (by *span*) was
+not the grouping used to recheck it (by *scope rows*). Both cost a re-derivation
+and one produced a wrong correction. So:
+
+| fact | owner |
+|---|---|
+| phase profiles, per-µs measurements, the raw matrices | **PLAN.md** Phase 3/4 — this is the source, cite it |
+| which specialisation to build, in what order, and why | **SPECIALIZE.md** |
+| axes, and what changes an answer | **SPECIALIZE.md** §1 |
+| defects, their state, and which test covers each | **ISSUES.md** |
+| blast radius and the static-check question | **SAFETY.md** |
+| what the feature is for, and its driver patterns | **USE-CASES.md** |
+| commits worth returning to | **RESTORE.md** |
+
+SPECIALIZE.md **cites** the numbers below rather than replacing them. Before
+re-measuring anything, check whether Phase 3/4 already did — twice now, it had.
+
 Branch-local. Not part of the patch.
 
 Seven phases. The first three are the substance -- the tests are what let the

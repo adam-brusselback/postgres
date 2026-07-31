@@ -41,7 +41,7 @@ Two traps worth naming, because both have caught this document before:
 | axis | values | selects | evidence |
 |---|---|---|---|
 | **scope** | 1 · small · large · near-total | prune elision; whether fixed costs matter at all | measured, **share of refresh time** (locates work, does not judge it): source planning 16.2% → 0.9% → 0.0% at scope 1/100/10k, while the fused DML goes 52% → 58% → **87%**. So fixed costs only matter at scope 1, and at scale there is nowhere to look but the DML |
-| **predicate shape** | equality on all arbiter key columns · array · range · non-key | at-most-one-row proofs; whether the index supplies the lock order | measured, 94 comparisons: forcing a generic plan is **21.7% slower** overall, but the spread is the point — **36–64% faster** on range/scope-1, **55% slower** on array/scope-10000. `ORDER BY` on the pre-lock costs **4–26% of the pre-lock when aligned** and **20–69% when not**, growing with scope on `nonkey` (20 → 35 → 56% at scope 100 → 1000 → 10000). It is not free even when aligned — it is *invisible*, because the pre-lock is only 12–15% of a refresh |
+| **predicate shape** | equality on all arbiter key columns · array · range · non-key | at-most-one-row proofs; whether the index supplies the lock order | measured, `bench/optmatrix.sql`, 94 comparisons — **positive = the generic plan is faster**: **21.7% slower** overall, but the spread is the point, **+28.6% on range/span 1** (best +72.8%) against **−33.5% on array/span 100**. Grouped by *span*, not by scope rows; regrouping it changes the numbers and was how these figures once got wrongly retracted. Full matrix in PLAN.md 4.1. `ORDER BY` on the pre-lock costs **4–26% of the pre-lock when aligned** and **20–69% when not**, growing with scope on `nonkey` (20 → 35 → 56% at scope 100 → 1000 → 10000). It is not free even when aligned — it is *invisible*, because the pre-lock is only 12–15% of a refresh |
 | **index shape** | do the updated columns sit under any index? | whether an avoided write saves index maintenance or just a HOT update | measured: the row comparison is **27–53% faster** with a covering index and **makes no difference at all** without one. Treat the magnitude as an upper bound — it was measured fresh-heap (see below) — but not the presence/absence result, which compares two arms that both write |
 | **churn fraction** | share of the scope whose values actually changed | whether the row comparison pays | measured, `bench/churn.sql`, on `nonkey`/scope 10000 — **faster is better, and it runs out**: **54–56% faster** at churn 0, then 41–51 → 27–36 → 18–27 → **≈0%** at churn 5/25/50/100 (ranges are two protocols disagreeing). At full churn every comparison fails and the row-wise `IS DISTINCT FROM` is bought for nothing. Break-even ≈ 60–70% churn |
 | **heap state** | never-updated · settled · bloated | nothing about the code — it decides the *measured* value of everything above | measured, `bench/heapstate.sh`: one comparison reads **"54% faster" or "82% faster"** on identical code, data and boot. Neither number is better than the other; **54% is the honest one.** At zero churn only the un-optimized arm writes, so free space, full-page images, extension and bloat all land on one side of the ratio, and a matview `bench_setup` has just built is that arm's worst case |
@@ -406,10 +406,10 @@ deliberately (§4). `FOR NO KEY UPDATE` on the pre-lock.
 **Sized, unimplemented** — source plan caching, deparse elision, `Const`
 parameterisation, derived `no_delete`, `append_only`.
 
-**Measured and rejected** — forcing a generic plan (**21.7% slower** overall,
-time-weighted over 94 comparisons; faster only on range/scope-1), the arbiter
-index scan (0.08 µs), the cache sweep (below timer resolution), bypassing SPI
-(~2 µs per statement, not the ~20 a noisy run suggested).
+**Measured and rejected** — forcing a generic plan (**21.7% slower** net over 94
+comparisons; faster only on range/span 1, where it is +28.6%), the arbiter index
+scan (0.08 µs), the cache sweep (below timer resolution), bypassing SPI (~2 µs
+per statement, not the ~20 a noisy run suggested).
 
 **Benchmark `p3opt`** — 4 of 7 workloads: `nonkey` **26–35% faster**, others
 **4–16% faster** at scope ≥100, and **18.5% slower** at scope 1. **Do not quote
