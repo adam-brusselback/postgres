@@ -224,6 +224,44 @@ MUTATIONS = {
     #
     # The spec's header claims it was verified against a build with the bug
     # present.  This is that claim made re-runnable rather than remembered.
+    # 3.7's siblings for C1.  The source plansource is a third saved object on
+    # the entry and needs its own mutations, or the mechanism ships with nothing
+    # ever seen to break it -- CACHE.md step D, with B23 as the precedent.
+    #
+    # C3 is the dangerous one.  The entry is keyed on the arbiter index, the
+    # deparsed predicate and the argument types, and a mismatch rebuilds the two
+    # SPI plans.  Leave the source plansource behind and the next refresh
+    # evaluates the *previous* predicate's source query while the DML around it
+    # is built for the new one: wrong rows, silently, from a cache that looks
+    # like it is working.
+    'C3': ('-', 'data',
+           'the source plansource survives a cache-key mismatch '
+           '(a changed predicate reuses the old source query)', [
+               ('\t\t\tif (cacheEntry->sourcePlan)\n'
+                '\t\t\t\tDropCachedPlan(cacheEntry->sourcePlan);\n', ''),
+               ('\t\tcacheEntry->refreshPlan = NULL;\n'
+                '\t\tcacheEntry->sourcePlan = NULL;\n',
+                '\t\tcacheEntry->refreshPlan = NULL;\n'),
+           ]),
+
+    # C4 is perf-only and calibrates the reuse probe rather than being a
+    # correctness bug: rebuilding the source plan every refresh is what the code
+    # did before 3.7 and is still correct.  Same shape as O1 -- an optimisation
+    # that silently stops applying, invisible to anything reading the matview's
+    # contents.  It drops before rebuilding rather than simply not storing, so
+    # it is a lifetime change and not a leak; a mutation that also leaked would
+    # be caught for the wrong reason.
+    'C4': ('-', 'perf',
+           'the source plan is rebuilt on every refresh (3.7 silently off)', [
+               ('\t\tif (cacheEntry->sourcePlan == NULL)\n\t\t{',
+                '\t\tif (cacheEntry->sourcePlan != NULL)\n'
+                '\t\t{\n'
+                '\t\t\tDropCachedPlan(cacheEntry->sourcePlan);\n'
+                '\t\t\tcacheEntry->sourcePlan = NULL;\n'
+                '\t\t}\n'
+                '\t\tif (cacheEntry->sourcePlan == NULL)\n\t\t{'),
+           ]),
+
     'S1': ('-', 'concur',
            'run the fused DML under a fresh snapshot, not the one the source '
            'was evaluated under (reopens the prune gap)', [

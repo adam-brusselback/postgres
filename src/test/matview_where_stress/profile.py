@@ -78,13 +78,16 @@ EDITS = [
 		qual_str = deparseRefreshWhereClause(matviewOid, qual);
 		MVP_STOP(MVP_DEPARSE);"""),
 
-    ("""	/* Find a usable unique index, preferring the primary key. */
-	indexoidlist = RelationGetIndexList(matviewRel);""",
+    # The anchor used to be the one-line comment "preferring the primary key",
+    # which went with the preference itself (ISSUES.md B26).  Anchored on the
+    # call now, which is the thing being timed rather than the prose above it.
+    ("""	indexoidlist = RelationGetIndexList(matviewRel);
+	foreach(lc, indexoidlist)""",
      """	MVP_START(MVP_TOTAL);
 	mvp_calls++;
 	MVP_START(MVP_ARBITER);
-	/* Find a usable unique index, preferring the primary key. */
-	indexoidlist = RelationGetIndexList(matviewRel);"""),
+	indexoidlist = RelationGetIndexList(matviewRel);
+	foreach(lc, indexoidlist)"""),
 
     # The sweep moved inside "if (use_cache)" in 49a3528 (B14's fix), so ARBITER
     # has to stop BEFORE that branch -- a nested refresh takes the else arm and
@@ -131,40 +134,44 @@ EDITS = [
 		elog(ERROR, "SPI_execute_plan failed during lock acquisition");
 	MVP_STOP(MVP_LOCKEXEC);"""),
 
-    ("""		sourceQuery = matview_build_source_query(matviewRel, dataQuery, qual,
-												 nkeyatts, keyattnums);
-		matview_materialize_source(sourceQuery, params, snapshot, sourceStore);""",
-     """		MVP_START(MVP_SRCBUILD);
-		sourceQuery = matview_build_source_query(matviewRel, dataQuery, qual,
-												 nkeyatts, keyattnums);
-		MVP_STOP(MVP_SRCBUILD);
-		matview_materialize_source(sourceQuery, params, snapshot, sourceStore);"""),
+    # SRCBUILD and SRCREWRITE are now inside the cache-miss branch, so on a warm
+    # repeat they read 0 -- which is the point of 3.7 and is what the profile
+    # has to be able to show.  Timing them outside the branch would charge every
+    # refresh the cost of a miss and hide the saving entirely.
+    ("""		if (cacheEntry->sourcePlan == NULL)
+		{
+			sourceQuery = matview_build_source_query(matviewRel, dataQuery,
+													qual, nkeyatts,
+													keyattnums);
+			cacheEntry->sourcePlan =
+				matview_build_source_plansource(sourceQuery);""",
+     """		if (cacheEntry->sourcePlan == NULL)
+		{
+			MVP_START(MVP_SRCBUILD);
+			sourceQuery = matview_build_source_query(matviewRel, dataQuery,
+													qual, nkeyatts,
+													keyattnums);
+			MVP_STOP(MVP_SRCBUILD);
+			MVP_START(MVP_SRCREWRITE);
+			cacheEntry->sourcePlan =
+				matview_build_source_plansource(sourceQuery);
+			MVP_STOP(MVP_SRCREWRITE);"""),
 
-    # R27: the 12.20 us was ONE line covering rewrite AND plan, and the saving
-    # 3.7 can recover is bounded by the plan half alone.  Timed separately.
-    ("""	AcquireRewriteLocks(sourceQuery, true, false);
-	rewritten = QueryRewrite(sourceQuery);""",
-     """	MVP_START(MVP_SRCREWRITE);
-	AcquireRewriteLocks(sourceQuery, true, false);
-	rewritten = QueryRewrite(sourceQuery);"""),
-
-    ("""	CHECK_FOR_INTERRUPTS();
-
-	plan = pg_plan_query(sourceQuery, NULL, CURSOR_OPT_PARALLEL_OK, params,
-						 NULL);""",
-     """	MVP_STOP(MVP_SRCREWRITE);
-	CHECK_FOR_INTERRUPTS();
-
-	MVP_START(MVP_SRCPLAN);
-	plan = pg_plan_query(sourceQuery, NULL, CURSOR_OPT_PARALLEL_OK, params,
-						 NULL);
+    # R27 split the 12.20 us line into rewrite and plan, and 3.7 moved both
+    # behind the cache.  SRCREWRITE is now the whole plansource construction and
+    # is charged above, in the miss branch.  SRCPLAN is GetCachedPlan: the
+    # planner on a miss, a validity check on a hit.  Reading the two together is
+    # what says whether the cache is working.
+    ("""	cplan = GetCachedPlan(plansource, params, owner, NULL);""",
+     """	MVP_START(MVP_SRCPLAN);
+	cplan = GetCachedPlan(plansource, params, owner, NULL);
 	MVP_STOP(MVP_SRCPLAN);
 	MVP_START(MVP_SRCEXEC);"""),
 
-    ("""	dest->rDestroy(dest);
+    ("""	ReleaseCachedPlan(cplan, owner);
 
 	return processed;""",
-     """	dest->rDestroy(dest);
+     """	ReleaseCachedPlan(cplan, owner);
 
 	MVP_STOP(MVP_SRCEXEC);
 	return processed;"""),
