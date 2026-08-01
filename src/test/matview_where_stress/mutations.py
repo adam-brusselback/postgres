@@ -125,35 +125,20 @@ MUTATIONS = {
                 'appendStringInfo(&buf, "WHERE (%s) <> (%s) ",', 1),
            ]),
 
-    # RECLASSIFIED from `data` to `benign` -- and the reason is a finding about the
-    # code, not about the corpus.  This mutation drops the primary-key preference
-    # in refresh_by_direct_modification()'s arbiter search, which can only matter
-    # when that loop has more than one usable index to choose between.  It never
-    # does.  Routing enters that function only when nUniqueIndexes <= 1, counting
-    # indisunique && indisvalid && indimmediate; the loop then filters with
-    # is_usable_unique_index(), which is STRICTER -- it additionally rejects
-    # partial and expression indexes.  So usable is a subset of counted, counted
-    # is at most one, and the preference can never pick between anything.
+    # B6 was DELETED, not repointed, and the reason is worth keeping.
     #
-    # The preference is vestigial: it predates the routing rule moving to
-    # nUniqueIndexes <= 1 (B21's commit), and nothing updated it.  Deleting it is
-    # a candidate simplification -- see ISSUES.md B26.
+    # It dropped the primary-key preference in the arbiter search, and
+    # calibrate-all.sh found nothing could catch it.  That turned out to be
+    # correct rather than a gap: a materialized view cannot have a primary key
+    # at all -- ALTER ... ADD CONSTRAINT rejects matviews -- so indisprimary is
+    # never true on an index one owns, and the preference could not change any
+    # outcome.  Both copies of it are gone from matview.c, so there is nothing
+    # left for this mutation to edit.
     #
-    # If the routing rule ever changes, this goes straight back to `data`, and
-    # the calibration will say so by reporting a FALSE POSITIVE the moment an
-    # instrument catches it.
-    'B6': ('B6', 'benign',
-           'arbitrate on the wrong unique index (drop the primary-key '
-           'preference -- benign: the loop never has a choice)', [
-               ('\t\t\tif (is_pk)\n'
-                '\t\t\t{\n'
-                '\t\t\t\tuniqueIndexOid = indexoid;\n'
-                '\t\t\t\tbreak;\n'
-                '\t\t\t}\n'
-                '\t\t\tif (!OidIsValid(uniqueIndexOid))\n'
-                '\t\t\t\tuniqueIndexOid = indexoid;',
-                '\t\t\tuniqueIndexOid = indexoid;\t/* no PK preference */'),
-           ]),
+    # What that search still does is reject unusable indexes via
+    # is_usable_unique_index(), and THAT is live and has no test -- see
+    # ISSUES.md B29.  A mutation for it belongs here once a test exists; adding
+    # one now would only put a known-UNCAUGHT row in the matrix.
 
     # A5 and M1 are the same edit.  A5 is the issue; M1 was the name it went by
     # in the B17 mutation matrix.  Keeping both names avoids a rename in the

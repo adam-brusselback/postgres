@@ -1476,29 +1476,30 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 
 	matviewRel = table_open(matviewOid, NoLock);
 
-	/* Find a usable unique index, preferring the primary key. */
+	/*
+	 * Find the usable unique index.  There is at most one, so there is nothing
+	 * to choose between: this function is reached only when the caller has
+	 * established that the matview has no more than one index satisfying
+	 * indisunique && indisvalid && indimmediate, and is_usable_unique_index()
+	 * demands all three of those plus non-partial, indnatts > 0 and no
+	 * expression or system columns.  Anything usable is therefore also
+	 * counted, and at most one thing was counted.
+	 */
 	indexoidlist = RelationGetIndexList(matviewRel);
 	foreach(lc, indexoidlist)
 	{
 		Oid			indexoid = lfirst_oid(lc);
 		Relation	indexRel;
 		bool		usable;
-		bool		is_pk;
 
 		indexRel = index_open(indexoid, AccessShareLock);
 		usable = is_usable_unique_index(indexRel);
-		is_pk = indexRel->rd_index->indisprimary;
 		index_close(indexRel, AccessShareLock);
 
 		if (usable)
 		{
-			if (is_pk)
-			{
-				uniqueIndexOid = indexoid;
-				break;
-			}
-			if (!OidIsValid(uniqueIndexOid))
-				uniqueIndexOid = indexoid;
+			uniqueIndexOid = indexoid;
+			break;
 		}
 	}
 	list_free(indexoidlist);
@@ -2055,8 +2056,13 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 }
 
 /*
- * Choose the unique index to use as the ON CONFLICT arbiter, preferring the
- * primary key.  Returns InvalidOid if the matview has none that is usable.
+ * Choose the unique index to use as the ON CONFLICT arbiter.  Returns
+ * InvalidOid if the matview has none that is usable.
+ *
+ * This used to prefer indisprimary, which can never be set here: a
+ * materialized view cannot have a primary key at all, because ALTER ... ADD
+ * CONSTRAINT rejects matviews outright.  Any index it has arrived via CREATE
+ * INDEX, so the first usable one is the answer.
  */
 static Oid
 matview_pick_arbiter_index(Relation matviewRel)
@@ -2070,22 +2076,15 @@ matview_pick_arbiter_index(Relation matviewRel)
 		Oid			indexoid = lfirst_oid(lc);
 		Relation	indexRel;
 		bool		usable;
-		bool		is_pk;
 
 		indexRel = index_open(indexoid, AccessShareLock);
 		usable = is_usable_unique_index(indexRel);
-		is_pk = indexRel->rd_index->indisprimary;
 		index_close(indexRel, AccessShareLock);
 
 		if (usable)
 		{
-			if (is_pk)
-			{
-				result = indexoid;
-				break;
-			}
-			if (!OidIsValid(result))
-				result = indexoid;
+			result = indexoid;
+			break;
 		}
 	}
 	list_free(indexoidlist);
