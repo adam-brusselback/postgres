@@ -858,3 +858,70 @@ RESET matview_partial_refresh_querytree;
 RESET matview_partial_refresh_optimized;
 DROP MATERIALIZED VIEW mv_null;
 DROP TABLE mv_null_base;
+--
+-- Test 18: an unchanged row is not rewritten
+--
+-- Found here, not on the -hackers thread.
+--
+-- Test 17 turns the row comparison on and reads values back, which is what a
+-- NULL bug corrupts.  It cannot see the comparison being absent: without it
+-- every matched row is rewritten, which is what the code did before 03cb4f0
+-- and is still correct, so the values are right either way.  Measured rather
+-- than supposed -- calibrate-all.sh reported O1, the comparison never emitted,
+-- UNCAUGHT by all four instruments.
+--
+-- What the optimisation is for is not visible in the contents at all, so this
+-- reads the heap instead.  An UPDATE writes a new tuple at a new location, so
+-- a row that kept its ctid across the refresh is a row the refresh did not
+-- write.  That is a statement about what the command did rather than about how
+-- the SQL was spelled, so an implementation that skips the write some other way
+-- passes it.  Taking a row lock does not move a tuple, so rows the refresh
+-- locked and then left alone still read as unchanged.
+--
+-- Verified as a detector rather than assumed: under O1 every row comes back f.
+--
+-- Disposition: keep, and drop the two SET lines when the optimisation stops
+-- being optional.  Not rewriting a row nothing changed about is the feature's
+-- promise about write amplification -- it is what makes re-refreshing an
+-- already-current scope cheap, and it is the reason a drain can be run often.
+-- The promise outlives the flag.
+--
+SET matview_partial_refresh_querytree = on;
+SET matview_partial_refresh_optimized = on;
+CREATE TABLE mv_rowver_base (id int primary key, v int, note text);
+INSERT INTO mv_rowver_base SELECT g, g * 10, 'n' || g FROM generate_series(1, 5) g;
+CREATE MATERIALIZED VIEW mv_rowver AS SELECT id, v, note FROM mv_rowver_base;
+CREATE UNIQUE INDEX ON mv_rowver(id);
+CREATE TEMP TABLE mv_rowver_was AS SELECT id, ctid AS was FROM mv_rowver;
+-- Row 3 is the only one that now differs from what the matview holds.
+UPDATE mv_rowver_base SET v = 999 WHERE id = 3;
+REFRESH MATERIALIZED VIEW mv_rowver WHERE id BETWEEN 1 AND 5;
+-- Only row 3 may have been written.
+SELECT w.id, (w.was = m.ctid) AS same_row_version
+  FROM mv_rowver_was w JOIN mv_rowver m USING (id) ORDER BY w.id;
+ id | same_row_version 
+----+------------------
+  1 | t
+  2 | t
+  3 | f
+  4 | t
+  5 | t
+(5 rows)
+
+-- ...and it must actually have been.  Skipping too much is the other way to
+-- fail this and looks identical in the column above.
+SELECT id, v, note FROM mv_rowver ORDER BY id;
+ id |  v  | note 
+----+-----+------
+  1 |  10 | n1
+  2 |  20 | n2
+  3 | 999 | n3
+  4 |  40 | n4
+  5 |  50 | n5
+(5 rows)
+
+DROP TABLE mv_rowver_was;
+DROP MATERIALIZED VIEW mv_rowver;
+DROP TABLE mv_rowver_base;
+RESET matview_partial_refresh_optimized;
+RESET matview_partial_refresh_querytree;
