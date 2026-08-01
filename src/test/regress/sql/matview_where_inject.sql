@@ -9,17 +9,28 @@
 -- quote_identifier(), the predicate through a deparse of its parse tree, the
 -- view body through pg_get_viewdef().
 --
--- There are three generators, not one, and the tests below run every case
--- through all three:
+-- Which generator a case reaches is decided by the matview, not by how the
+-- REFRESH is spelled -- and the three forms every case runs under are not the
+-- same thing as the generator:
 --
---   bare       a partial refresh without CONCURRENTLY.  Two generators back to
---              back: the transient-heap fill in ExecRefreshMatView(), which
---              splices the view body and the predicate into
+--   direct     refresh_by_direct_modification(), taken by a predicate on a
+--              matview with at most one unique index, either spelling.  It
+--              builds its own SQL text: from the view's SQL under the `spi`
+--              form, and from its Query tree under `querytree`.
+--   diff/merge the transient-heap fill in ExecRefreshMatView(), which splices
+--              the view body and the predicate into
 --              "INSERT INTO <t> SELECT * FROM (<view>) _mv_q WHERE <qual>",
 --              and then refresh_by_match_merge(), which splices the predicate
---              a second time and every column name besides.
---   spi        refresh_by_direct_modification() building its own SQL text.
---   querytree  the same function evaluating the view from its Query tree.
+--              a second time and every column name besides.  Taken by a
+--              predicate on a matview with more than one unique index.
+--
+-- The `bare` form used to select diff/merge, and this header used to say so.
+-- Routing then moved onto the unique-index count, and since Tests 1 to 8 all
+-- use a matview with one unique index, all three of their forms go to direct
+-- modification and none of them reaches refresh_by_match_merge() at all.  No
+-- test changed and nothing went red; it was found by measuring, with Q2.  That
+-- is what Test 9 exists to reach, and it does it with a second unique index
+-- rather than a different spelling.
 --
 -- Nothing here should be able to fail.  That is the point: these are the tests
 -- that stay green while the generated SQL is removed, and each one names the
