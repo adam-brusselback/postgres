@@ -197,8 +197,9 @@ for m in $MUTS pristine; do
     run_regress "$OUT/reg-$m.log" && rfail=0 || rfail=1
     nreg=$(regress_failed "$OUT/reg-$m.log")
     nran=$(regress_ran "$OUT/reg-$m.log")
-    if   [ "${nran:-0}" -lt "$REGRESS_N" ]; then reg="NORUN($nran/$REGRESS_N)"
-    elif [ "${nreg:-0}" -gt 0 ];            then reg="FIRED($nreg)"
+    # Same ordering, same reason -- pg_regress stops early too.
+    if   [ "${nreg:-0}" -gt 0 ];            then reg="FIRED($nreg)"
+    elif [ "${nran:-0}" -lt "$REGRESS_N" ]; then reg="NORUN($nran/$REGRESS_N)"
     else                                         reg="quiet"
     fi
 
@@ -256,8 +257,15 @@ for m in $MUTS pristine; do
         run_specs "$OUT/sp-$m.log" || true
         nsran=$(specs_ran "$OUT/sp-$m.log")
         nsp=$(specs_failed "$OUT/sp-$m.log")
-        if   [ "${nsran:-0}" -lt 20 ]; then sp="NORUN($nsran)"
-        elif [ "${nsp:-0}" -gt 0 ];    then sp="FIRED($nsp)"
+        # Failures first, liveness second, and the order is the whole point.
+        # `make check` abandons the rest of a module once one of its tests
+        # fails, so a genuine catch drops the count below the threshold -- and
+        # checking liveness first reported C4, caught by the reuse probe, as
+        # "instrument did not run".  A run that failed is a run that happened.
+        # The liveness check is for the other case: nothing ran AND nothing
+        # failed, which is the shape that otherwise reads as quiet.
+        if   [ "${nsp:-0}" -gt 0 ];    then sp="FIRED($nsp)"
+        elif [ "${nsran:-0}" -lt 20 ]; then sp="NORUN($nsran)"
         else                                sp="quiet"
         fi
     fi
