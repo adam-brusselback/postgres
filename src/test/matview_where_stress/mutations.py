@@ -125,6 +125,39 @@ MUTATIONS = {
                 'appendStringInfo(&buf, "WHERE (%s) <> (%s) ",', 1),
            ]),
 
+    # B7's neighbour, and the one that says whether B7's gate is measuring
+    # anything.  O1 stops the comparison being emitted at all: every matched row
+    # is rewritten, which is what the code did before 03cb4f0 and is still
+    # correct, so nothing about the matview's *contents* changes.
+    #
+    # That is exactly why it belongs here.  A test that turns the optimisation
+    # on and then only reads values back cannot tell the optimisation from its
+    # absence, and would pass unchanged on a tree where it had silently stopped
+    # applying.  The realistic accident is small: use_optimized is an && of two
+    # GUCs, and a rewrite that drops one of them leaves all the code in place
+    # and none of it reachable.
+    'O1': ('-', 'perf',
+           'the row comparison is never emitted (optimisation silently off)', [
+               ('\tbool\t\tuse_optimized = matview_partial_refresh_querytree &&\n'
+                '\t\tmatview_partial_refresh_optimized;',
+                '\tbool\t\tuse_optimized = false;\t/* O1 */'),
+           ]),
+
+    # The optimisation flag drops out of the plan-cache key.
+    #
+    # use_optimized changes the generated SQL, so a plan built with it off is
+    # the wrong plan to run with it on and the other way round.  The entry is
+    # keyed on the matview OID, so the stale plan is then reused for the rest of
+    # the session -- silently, because both plans are valid SQL that refreshes
+    # the same rows.  Only the row versions differ, so nothing reading the
+    # matview's contents can see it, which is the same blind spot O1 exposes
+    # reached by a different route.
+    'O2': ('-', 'cache',
+           'drop the optimisation flag from the plan-cache key '
+           '(a plan built one way is reused for the other)', [
+               ('\t\tcacheEntry->optimized == use_optimized &&\n', ''),
+           ]),
+
     # B6 was DELETED, not repointed, and the reason is worth keeping.
     #
     # It dropped the primary-key preference in the arbiter search, and
@@ -224,6 +257,42 @@ MUTATIONS = {
                 '\t\t\t\t\t\t "FOR NO KEY UPDATE"',
                 '"SELECT 1 FROM %s mv WHERE (%s) /*%s*/ "\n'
                 '\t\t\t\t\t\t "FOR NO KEY UPDATE"', 1),
+           ]),
+
+    # The pre-lock weakened to a mode that does not conflict with itself.
+    #
+    # M3 removes the statement; this leaves it in place and takes the wrong
+    # mode.  FOR KEY SHARE conflicts only with the key-exclusive modes, so two
+    # refreshes over overlapping scopes stop ordering against each other and the
+    # second can evaluate its source from a snapshot taken before the first
+    # commits -- M3's lost update, reached by an edit that still reads like a
+    # locking statement.
+    #
+    # Plausible as an accident precisely because 63f516f argued for taking the
+    # weakest sufficient mode.  One step further is wrong, and the argument does
+    # not say where to stop unless something measures it.
+    'L1': ('A3', 'concur',
+           'weaken the pre-lock to FOR KEY SHARE (no longer conflicts with '
+           'itself, so overlapping refreshes stop serializing)', [
+               ('"FOR NO KEY UPDATE"', '"FOR KEY SHARE"', 1),
+           ]),
+
+    # The control for L1: 63f516f undone, the pre-lock back at FOR UPDATE.
+    #
+    # Expected to be caught by NOTHING, and here to keep that answer measured
+    # rather than assumed.  FOR UPDATE is strictly stronger, so every guarantee
+    # still holds; the change was made to stop escalating the tuple lock
+    # recorded in xmax, and on a relation no other session can lock there is
+    # nothing a session can observe through SQL that distinguishes the two.
+    #
+    # So an instrument that fires here is asserting the mechanism rather than
+    # the guarantee, which is the defect that got the pg_stat_statements block
+    # deleted.  Same role as the `benign` rows, arrived at deliberately: this
+    # one exists to check the gates that DO catch L1 are not over-fitted.
+    'L2': ('-', 'benign',
+           'pre-lock takes FOR UPDATE again (strictly stronger; expected to be '
+           'invisible -- the control for L1)', [
+               ('"FOR NO KEY UPDATE"', '"FOR UPDATE"', 1),
            ]),
 
     'M2': ('P3', 'concur',
