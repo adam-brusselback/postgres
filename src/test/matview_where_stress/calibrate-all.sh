@@ -64,6 +64,9 @@ CELLS=$(wc -l < "$BASELINE" 2>/dev/null || echo 0)
 [ "$CELLS" -gt 0 ] || { echo "no baseline at $BASELINE; run calibrate.sh --baseline" >&2; exit 1; }
 
 REGRESS_TESTS="matview_where matview_where_cache matview_where_privs matview_where_contract matview_where_inject"
+ISOLATION_SPECS="matview-where-serialize matview-where-deadlock matview-where-lockorder matview-where-insertorder"
+PGHOST=${PGHOST:-/tmp}
+export PGHOST
 
 # ---- instrument 1: the regression suite -------------------------------------
 # Its own database per run, because a mutation that corrupts data would
@@ -111,9 +114,24 @@ run_oracle() {
 # reports NOSPEC rather than passing quietly -- an absent instrument must never
 # read as a clean result.
 specs_capable() { grep -q '^#define USE_INJECTION_POINTS' "$SRC/src/include/pg_config.h"; }
+# Two runners, because the specs live in two places and only one of them was
+# being called.  The injection-point specs sit in a module that sets
+# NO_INSTALLCHECK and starts its own instance; the other four are in the
+# isolation schedule and run against the server on $PORT.  Calling only the
+# first left matview-where-{lockorder,insertorder,serialize,deadlock} outside
+# every matrix this script has printed -- four of the eleven gates that survive
+# Phase 4, and the deterministic detectors for M1 and M2.  The matrix said M1
+# was caught by the probabilistic fuzzer alone, which was never true.
+#
+# That is the same hole this script was written to close, one directory over:
+# an instrument nothing called, reported as coverage because the row was quiet.
 run_specs() {
     su pgtest -c "PATH=$PREFIX/bin:\$PATH make -C $SRC/src/test/modules/injection_points check" \
         > "$1" 2>&1
+    mkdir -p "$OUT/iso"; chmod 777 "$OUT/iso" 2>/dev/null || true
+    su pgtest -c "cd $SRC/src/test/isolation && PGPORT=$PORT PGHOST=$PGHOST \
+        ./pg_isolation_regress --bindir=$PREFIX/bin --inputdir=. \
+        --outputdir=$OUT/iso $ISOLATION_SPECS" >> "$1" 2>&1 || true
 }
 specs_ran()    { grep -cE '^(not )?ok ' "$1" 2>/dev/null || true; }
 specs_failed() { grep -c '^not ok' "$1" 2>/dev/null || true; }
@@ -188,7 +206,7 @@ for m in $MUTS pristine; do
         run_specs "$OUT/sp-$m.log" || true
         nsran=$(specs_ran "$OUT/sp-$m.log")
         nsp=$(specs_failed "$OUT/sp-$m.log")
-        if   [ "${nsran:-0}" -lt 12 ]; then sp="NORUN($nsran)"
+        if   [ "${nsran:-0}" -lt 20 ]; then sp="NORUN($nsran)"
         elif [ "${nsp:-0}" -gt 0 ];    then sp="FIRED($nsp)"
         else                                sp="quiet"
         fi
