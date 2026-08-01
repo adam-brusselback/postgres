@@ -54,8 +54,35 @@ ITER=${ITER:-15}
 REFRESHERS=${REFRESHERS:-4}
 OUT=${OUT:-/tmp/pgt/calall}
 PSQL_BIN="$PREFIX/bin/psql"
+RUNAS=${RUNAS:-pgtest}
 
 mkdir -p "$OUT"
+
+# A mutation that crashes the server kills this script mid-table, and until C3
+# did exactly that the tree was left mutated behind it -- which is the worst
+# possible residue, because everything run afterwards is measuring the wrong
+# code and looks fine.  Restore on any exit, not just the happy one.
+cleanup() {
+    (cd "$SRC" && ./src/test/matview_where_stress/mutations.py pristine) >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+# The server does not survive every mutation, and a crashed one poisons every
+# instrument after it with "the database system is in recovery mode" -- which
+# reads as a quiet instrument, not as a catch.  Wait for it to come back, and
+# say plainly if it does not.
+server_live() {
+    su "$RUNAS" -c "$PSQL_BIN -p $PORT -d $DB -Atc 'SELECT 1'" >/dev/null 2>&1
+}
+wait_for_server() {
+    i=0
+    while [ $i -lt 30 ]; do
+        server_live && return 0
+        i=$((i + 1))
+        sleep 2
+    done
+    return 1
+}
 # pg_regress runs as pgtest and writes its outputdir itself.  Root-owned and it
 # bails out before running a single test -- see the liveness check below, which
 # exists because exactly that happened and was reported as "quiet".
@@ -175,6 +202,23 @@ for m in $MUTS pristine; do
     else                                         reg="quiet"
     fi
 
+    # A mutation can take the server down with it, and from here on every
+    # instrument would report "the database system is in recovery mode" -- which
+    # counts as quiet, i.e. as a miss, for a mutation that was caught in the
+    # loudest way available.  C3 did this.  Wait for recovery, and record the
+    # crash as its own verdict rather than letting it read as silence.
+    crashed=0
+    if ! wait_for_server; then
+        printf '%-6s %-5s %-7s  %-10s %-10s %-10s %-9s  %s\n' \
+               "$m" "$issue" "$needs" "$reg" - - - \
+               'CAUGHT (server did not recover)'
+        continue
+    fi
+    if grep -qE 'terminated by signal|was terminated|in recovery mode' \
+            "$OUT/reg-$m.log" 2>/dev/null; then
+        crashed=1
+    fi
+
     # --- oracle ---
     run_oracle "$OUT/orc-$m.log" || true
     got=$(vector); ngot=$(printf '%s' "$got" | grep -c '|' || true)
@@ -215,6 +259,7 @@ for m in $MUTS pristine; do
     # --- verdict ---
     fired=0; broke=0
     case "$reg" in FIRED*) fired=1 ;; NORUN*) broke=1 ;; esac
+    [ "$crashed" -eq 1 ] && fired=1
     case "$orc" in FIRED*) fired=1 ;; ABORTED*) broke=1 ;; esac
     case "$fz"  in FIRED*) fired=1 ;; SETUPFAIL*) broke=1 ;; esac
     # NOSPEC is a deliberate configuration choice, not a broken instrument, so
