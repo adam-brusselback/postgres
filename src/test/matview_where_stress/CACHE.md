@@ -318,7 +318,7 @@ Both are calibrated instruments, both break silently, and B23 is the precedent.
   (`mutations.py:156-157`). 3.7 does not delete that line — B2's restructure
   would — but C1 needs a sibling that breaks the *source* plansource's validity,
   or the new mechanism ships with no mutation ever seen to break it.
-  `mutations.py --check` goes from 16/16 (R20) to 17/17.
+  `mutations.py --check` goes from 20/20 (R20) to 21/21.
 - **`profile.py`** patches by literal match inside
   `refresh_by_direct_modification()`, including the block step A rewrites. Update
   it in the same commit and re-run `--check`.
@@ -416,7 +416,7 @@ something by reasoning.
 - **R31** recorded: Query-tree arm measurably closer to the text arm, warm, constant
   literal, scope 1, arms `querytree` off/on, **no VACUUM between timed
   refreshes**;
-- `mutations.py --check` 17/17 and `profile.py --check` green, both repaired in
+- `mutations.py --check` 21/21 and `profile.py --check` green, both repaired in
   the commits that break them;
 - `installcheck` 250/250, isolation, injection_points green;
   `debug_discard_caches = 1` green with step C's reuse case explicitly guarded;
