@@ -221,7 +221,13 @@ for m in $MUTS pristine; do
 
     # --- oracle ---
     run_oracle "$OUT/orc-$m.log" || true
-    got=$(vector); ngot=$(printf '%s' "$got" | grep -c '|' || true)
+    # `vector` reads the oracle's result table, and a mutation that took the
+    # server down never created it -- so psql exits non-zero, and under `set -e`
+    # a plain `got=$(vector)` takes the whole run out with it.  That is why C3
+    # could never be scored: it crashes, and the script died three rows before
+    # printing anything.  The ABORTED branch below already knows what to do with
+    # an empty vector; it just never got to run.
+    got=$(vector || true); ngot=$(printf '%s' "$got" | grep -c '|' || true)
     if [ "${ngot:-0}" -lt "$CELLS" ]; then
         orc="ABORTED"
     else
