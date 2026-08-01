@@ -370,10 +370,23 @@ parity and is readable two ways.)
 **2.5 ms** cell from `bench/orderby-floor.sh`. This is a ~50–62 µs in-backend
 `INSTR_TIME` cell on one clone. Quoting R12 here breaks RESULTS.md's own rule and
 gives an acceptance band wide enough to hide the entire 12.20 µs. Measure the
-floor of *this* protocol, record it as **R30**, then set the bar.
+floor of *this* protocol, then set the bar.
 
-Record the result as **R31**. Not R26 — that is the "before" number this work is
-justified by, it is `settled`, and overwriting it destroys the comparison.
+**The numbers this section reserved were taken while it waited.** R30 went to
+the fuzzer's `nest` calibration and R31 to the p2/p3 question, so the floor is
+**R33** and the result is **R34**.  Recorded rather than renumbered: RESULTS.md
+is an index other files cite by number, and quietly reusing one destroys the
+finding already under it.
+
+Record the result as **R34** (see above). Not R26 — that is the "before" number
+this work is justified by, it is `settled`, and overwriting it destroys the
+comparison.
+
+**And R26 turned out not to be usable as the before at all.** Its magnitude was
+already `provisional` after failing to reproduce, so the honest before had to be
+measured on this protocol, this build and this container -- which is what
+`mutations.py C4` is for: it switches the source-plan cache off and nothing
+else, putting both arms of the comparison inside one configuration.
 
 ## 7. Recorded but not built: why one plan per matview may not be enough
 
@@ -408,14 +421,19 @@ something by reasoning.
 
 - **R27** (the split), **R28** (necessary-not-sufficient) and **R29** (the cache
   survives) recorded — **done**; this protocol's noise floor still outstanding
-  and now **R30**;
+  and now **R33** -- **done**: sd 4.11 us on a 67.40 us cell, 6.1%, SEM 0.48 us
+  over 72 bands;
 - the source plan is reused **and no planning occurs** on a warm repeat refresh
   in the constant-literal cell, proven by step C's plancache-state assertion, not
   by timing;
 - a base-table change invalidates the source plansource, with a test;
-- **R31** recorded: Query-tree arm measurably closer to the text arm, warm, constant
-  literal, scope 1, arms `querytree` off/on, **no VACUUM between timed
-  refreshes**;
+- **R34** recorded -- **done, and it beat the bar**: the deficit goes 54.25 us to
+  0.38 us, a 99.3% reduction, with the source line 44.88 us to 0.07 us.  The bar
+  was "roughly the `srcplan` share, with the residual attributed", because R28
+  said 3.7 could not reach parity alone.  It reached parity, and the reason is
+  that R28 credited 3.7 with `srcplan` only: as implemented it also removes
+  `srcbuild` and `srcrewrite`, since the source query is built on a miss and not
+  on a hit.  §1's "necessary but not sufficient" is superseded for this cell;
 - `mutations.py --check` 21/21 and `profile.py --check` green, both repaired in
   the commits that break them;
 - `installcheck` 250/250, isolation, injection_points green;
