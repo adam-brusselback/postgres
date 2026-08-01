@@ -43,6 +43,7 @@
 #include "rewrite/rewriteManip.h"
 #include "storage/lmgr.h"
 #include "tcop/tcopprot.h"
+#include "tcop/utility.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "utils/acl.h"
@@ -52,6 +53,7 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/plancache.h"
 #include "utils/queryenvironment.h"
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
@@ -63,6 +65,13 @@
 /* See matview.h.  Branch-local scaffolding for the Query-tree rewrite. */
 bool		matview_partial_refresh_querytree = false;
 bool		matview_partial_refresh_optimized = false;
+
+/*
+ * query_string for the source plansource.  CreateCachedPlan() requires one and
+ * this path has no SQL text to give it -- the source is a Query tree.  It shows
+ * up in error contexts, so it says what it is rather than being empty.
+ */
+#define MATVIEW_SOURCE_QUERY_STRING "REFRESH MATERIALIZED VIEW ... WHERE (source query)"
 
 /*
  * Name the materialised source rows are registered under for the SQL that
@@ -118,6 +127,13 @@ typedef struct MatViewPartialRefreshCache
 	/* The cached plans */
 	SPIPlanPtr	lockPlan;		/* SELECT ... FOR NO KEY UPDATE */
 	SPIPlanPtr	refreshPlan;	/* Fused CTE: Evaluate -> Upsert -> Delete */
+	CachedPlanSource *sourcePlan;	/* the view's own query, on the Query-tree
+									 * path only.  Rewriting and planning it is
+									 * 16.2% of a warm scope-1 refresh; keeping
+									 * it saved is what removes that.  NULL on
+									 * the text path, where the source is
+									 * spliced into the fused statement and
+									 * planned as part of it */
 
 	bool		invalid;		/* set by the relcache callback; the entry is
 								 * dropped at the next partial refresh, not by
@@ -168,6 +184,7 @@ static char *get_matview_view_query(Oid matviewOid);
 static void InitMatViewCache(void);
 static void InvalidateMatViewCache(Datum arg, Oid relid);
 static void matview_cache_sweep(void);
+static CachedPlanSource *matview_build_source_plansource(Query *sourceQuery);
 static bool refresh_where_clause_is_leakproof(Node *qual);
 static bool matview_argtypes_match(MatViewPartialRefreshCache *entry,
 								   ParamListInfo params);
@@ -1230,6 +1247,8 @@ matview_cache_sweep(void)
 			SPI_freeplan(entry->lockPlan);
 		if (entry->refreshPlan)
 			SPI_freeplan(entry->refreshPlan);
+		if (entry->sourcePlan)
+			DropCachedPlan(entry->sourcePlan);
 		if (entry->whereClauseStr)
 			pfree(entry->whereClauseStr);
 		if (entry->argtypes)
@@ -1367,28 +1386,118 @@ matview_build_source_query(Relation matviewRel, Query *dataQuery, Node *qual,
  * This is the same sequence the full refresh uses in
  * refresh_matview_datafill(); the difference is only where the rows go.
  */
+/*
+ * matview_build_source_plansource
+ *
+ * Wrap the source query in a CachedPlanSource, rewritten and completed but not
+ * yet planned and not yet saved.  The caller owns it.
+ *
+ * CreateCachedPlanForQuery() is the entry point for a query that has already
+ * been through parse analysis -- "used only for new-style SQL functions, where
+ * we have a Query from the function's prosqlbody, but no source text".  That is
+ * this case exactly, and functions.c is the pattern followed here.  Going
+ * through plancache rather than stashing a PlannedStmt is what makes the plan
+ * self-validating: plancache already registers eight callbacks, one relcache
+ * and seven syscache, and decides staleness itself.
+ *
+ * It copies the tree into its own context first, so what it holds is the
+ * *unrewritten* query -- which is what plancache wants, because on revalidation
+ * it re-acquires the rewrite locks and re-rewrites from that copy itself.  So
+ * the rewrite below must come after this call, and scribbles only on the
+ * caller's tree, which is rebuilt on every cache miss anyway.
+ */
+static CachedPlanSource *
+matview_build_source_plansource(Query *sourceQuery)
+{
+	CachedPlanSource *plansource;
+	List	   *querytree_list;
+
+	plansource = CreateCachedPlanForQuery(sourceQuery,
+										  MATVIEW_SOURCE_QUERY_STRING,
+										  CreateCommandTag((Node *) sourceQuery));
+
+	AcquireRewriteLocks(sourceQuery, true, false);
+
+	/*
+	 * pg_rewrite_query() rather than QueryRewrite(): the same rewrite with the
+	 * standard debug/stats wrapper around it, which is what plancache's own
+	 * revalidation path calls.  Named because it is not quite a no-op -- it
+	 * adds log_parser_stats reporting and the DEBUG dump of the result.
+	 */
+	querytree_list = pg_rewrite_query(sourceQuery);
+
+	/* A SELECT should never rewrite to more or less than one SELECT. */
+	if (list_length(querytree_list) != 1)
+		elog(ERROR, "unexpected rewrite result for REFRESH MATERIALIZED VIEW");
+
+	/*
+	 * CURSOR_OPT_PARALLEL_OK has to reach the planner through here now, since
+	 * this is what CompleteCachedPlan hands to pg_plan_queries.  Dropping it
+	 * would silently disable parallel source evaluation: invisible at scope 1,
+	 * material where the source scan is large.
+	 */
+	CompleteCachedPlan(plansource,
+					   querytree_list,
+					   NULL,	/* copy into the plansource's own context */
+					   NULL,
+					   0,
+					   NULL,
+					   NULL,
+					   CURSOR_OPT_PARALLEL_OK,
+					   false);
+
+	return plansource;
+}
+
 static double
-matview_materialize_source(Query *sourceQuery, ParamListInfo params,
+matview_materialize_source(CachedPlanSource *plansource, ParamListInfo params,
 						   Snapshot snapshot, Tuplestorestate *tupstore)
 {
-	List	   *rewritten;
+	CachedPlan *cplan;
 	PlannedStmt *plan;
 	QueryDesc  *queryDesc;
 	DestReceiver *dest;
+	ResourceOwner owner;
 	double		processed;
-
-	AcquireRewriteLocks(sourceQuery, true, false);
-	rewritten = QueryRewrite(sourceQuery);
-
-	/* A SELECT should never rewrite to more or less than one SELECT. */
-	if (list_length(rewritten) != 1)
-		elog(ERROR, "unexpected rewrite result for REFRESH MATERIALIZED VIEW");
-	sourceQuery = linitial_node(Query, rewritten);
+	const CachedPlan *generic_before;
+	int64		custom_before;
 
 	CHECK_FOR_INTERRUPTS();
 
-	plan = pg_plan_query(sourceQuery, NULL, CURSOR_OPT_PARALLEL_OK, params,
-						 NULL);
+	/*
+	 * A saved plansource can and should be handed a ResourceOwner: it is what
+	 * releases the plan's refcount if the executor throws between here and the
+	 * ReleaseCachedPlan below.  An unsaved one cannot -- GetCachedPlan()
+	 * rejects it outright -- so a nested refresh, whose plansource is private
+	 * and dropped when it returns, passes NULL and accepts that its refcount
+	 * dies with the plansource.
+	 */
+	owner = plansource->is_saved ? CurrentResourceOwner : NULL;
+
+	generic_before = plansource->gplan;
+	custom_before = plansource->num_custom_plans;
+
+	cplan = GetCachedPlan(plansource, params, owner, NULL);
+
+	/*
+	 * Did plancache have to *build* a plan, or hand back one it already had?
+	 *
+	 * Not num_generic_plans, which is the obvious choice and is wrong: it is
+	 * incremented in the `else` arm of GetCachedPlan's custom-or-not branch, so
+	 * it counts every call that *returns* a generic plan, reused or freshly
+	 * built.  A probe reading it can never see a hit -- the mirror image of a
+	 * test that cannot fail.
+	 *
+	 * A new generic plan replaces plansource->gplan, so the pointer moving is
+	 * the build.  num_custom_plans is a genuine build counter -- a custom plan
+	 * is built every time by definition -- and covers the bound-parameter cell,
+	 * where the first five plans are custom.
+	 */
+	if (plansource->gplan != generic_before ||
+		plansource->num_custom_plans > custom_before)
+		INJECTION_POINT("matview-where-source-planned", NULL);
+
+	plan = linitial_node(PlannedStmt, cplan->stmt_list);
 
 	dest = CreateDestReceiver(DestTuplestore);
 	SetTuplestoreDestReceiverParams(dest, tupstore, CurrentMemoryContext,
@@ -1406,6 +1515,8 @@ matview_materialize_source(Query *sourceQuery, ParamListInfo params,
 	FreeQueryDesc(queryDesc);
 
 	dest->rDestroy(dest);
+
+	ReleaseCachedPlan(cplan, owner);
 
 	return processed;
 }
@@ -1599,6 +1710,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 				SPI_freeplan(cacheEntry->lockPlan);
 			if (cacheEntry->refreshPlan)
 				SPI_freeplan(cacheEntry->refreshPlan);
+			if (cacheEntry->sourcePlan)
+				DropCachedPlan(cacheEntry->sourcePlan);
 			if (cacheEntry->whereClauseStr)
 				pfree(cacheEntry->whereClauseStr);
 			if (cacheEntry->argtypes)
@@ -1607,6 +1720,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 
 		cacheEntry->lockPlan = NULL;
 		cacheEntry->refreshPlan = NULL;
+		cacheEntry->sourcePlan = NULL;
 		cacheEntry->whereClauseStr = NULL;
 		cacheEntry->nargs = 0;
 		cacheEntry->argtypes = NULL;
@@ -1993,9 +2107,43 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		PushCopiedSnapshot(GetTransactionSnapshot());
 		snapshot = GetActiveSnapshot();
 
-		sourceQuery = matview_build_source_query(matviewRel, dataQuery, qual,
-												 nkeyatts, keyattnums);
-		matview_materialize_source(sourceQuery, params, snapshot, sourceStore);
+		/*
+		 * Build the source plansource on the first refresh through this entry
+		 * and keep it.  On the ones after, plancache hands back the plan it
+		 * already has -- that is 3.7.
+		 *
+		 * The query itself is only built on a miss, which is a second saving
+		 * on top of the plan: the entry is keyed on the arbiter index, the
+		 * deparsed predicate and the argument types, and those are exactly the
+		 * inputs matview_build_source_query() reads besides the matview OID.
+		 * A hit therefore means it would build the same tree again.  Values
+		 * that vary between refreshes arrive through `params`, not through the
+		 * tree, which is what plancache exists to handle.
+		 *
+		 * SaveCachedPlan() only under use_cache, matching what SPI_keepplan()
+		 * does for the other two plans.  This is B14's guard: a nested refresh
+		 * at maintenance depth > 0 holds a stack entry that is gone when it
+		 * returns, so saving its plansource would leak it into
+		 * CacheMemoryContext with nothing left to read it.  It is dropped
+		 * below instead.
+		 *
+		 * It must be saved *before* the first GetCachedPlan(): SaveCachedPlan()
+		 * asserts the plansource is not already saved and discards any plan it
+		 * is holding.
+		 */
+		if (cacheEntry->sourcePlan == NULL)
+		{
+			sourceQuery = matview_build_source_query(matviewRel, dataQuery,
+													qual, nkeyatts,
+													keyattnums);
+			cacheEntry->sourcePlan =
+				matview_build_source_plansource(sourceQuery);
+			if (use_cache)
+				SaveCachedPlan(cacheEntry->sourcePlan);
+		}
+
+		matview_materialize_source(cacheEntry->sourcePlan, params, snapshot,
+								   sourceStore);
 
 		/*
 		 * The rows are computed; the statement that compares the matview
@@ -2034,6 +2182,20 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	if (sourceStore != NULL)
 		tuplestore_end(sourceStore);
 
+	/*
+	 * A nested refresh's plansource was never saved, so nothing else will ever
+	 * free it -- SPI_finish() reclaims its two SPI plans but knows nothing
+	 * about this one, and the stack entry holding the pointer is about to go
+	 * out of scope.  Drop it here.  The saved one is left alone: it belongs to
+	 * the hash entry and is freed by matview_cache_sweep() or by the mismatch
+	 * branch that rebuilds the entry.
+	 */
+	if (!use_cache && cacheEntry->sourcePlan != NULL)
+	{
+		DropCachedPlan(cacheEntry->sourcePlan);
+		cacheEntry->sourcePlan = NULL;
+	}
+
 	SPI_finish();
 	}
 	PG_CATCH();
@@ -2044,6 +2206,13 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		 */
 		matview_maintenance_depth = old_depth;
 		matview_maintenance_relid = old_relid;
+
+		/* Same reasoning as the success path; see above. */
+		if (!use_cache && cacheEntry->sourcePlan != NULL)
+		{
+			DropCachedPlan(cacheEntry->sourcePlan);
+			cacheEntry->sourcePlan = NULL;
+		}
 		PG_RE_THROW();
 	}
 	PG_END_TRY();

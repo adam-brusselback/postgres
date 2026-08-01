@@ -36,6 +36,7 @@ tests += {
       'hashagg',
       'reindex_conc',
       'vacuum',
+      'matview_where_source_plan',
     ],
     'regress_args': ['--dlpath', meson.project_build_root() / 'src/test/regress'],
     # The injection points are cluster-wide, so disable installcheck

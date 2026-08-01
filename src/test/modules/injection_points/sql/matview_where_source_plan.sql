@@ -1,0 +1,97 @@
+--
+-- REFRESH MATERIALIZED VIEW ... WHERE ... : is the source plan reused?
+--
+-- The Query-tree path rewrites and plans the source query on every refresh,
+-- and that line is 16.2% of a warm scope-1 refresh (RESULTS.md R13), of which
+-- planning is 97.3% (R27).  Caching it is PLAN.md 3.7.  This is the gate on
+-- whether the cache does what it claims.
+--
+-- It cannot be a timing test.  The effect is a few microseconds on a ~60 us
+-- cell and this protocol's noise floor is not established, so a benchmark
+-- would answer "probably" -- and a cache that silently re-plans every call is
+-- indistinguishable from one that works, at that resolution, in exactly the
+-- direction that would let a broken implementation ship.
+--
+-- Nor can it hook "we reused the cache entry", which is what the obvious
+-- injection point would observe.  That is true even when GetCachedPlan()
+-- re-plans underneath it, so it would be green against the bug it exists to
+-- catch.
+--
+-- What it watches instead is plansource->gplan changing, which is a new
+-- generic plan, plus num_custom_plans, which is a genuine build counter.  Not
+-- num_generic_plans: that one is incremented in the `else` arm of
+-- GetCachedPlan's custom-or-not branch, so it counts every call that *returns*
+-- a generic plan, reused or built.  A probe reading it can never go green --
+-- the mirror image of a test that cannot fail -- and the first version of this
+-- file did exactly that.
+--
+-- Verified as a detector rather than assumed: against a build where the
+-- plansource is created and dropped on every refresh, every refresh below
+-- reports "notice triggered for injection point matview-where-source-planned"
+-- and this file is red.
+--
+-- Disposition: keep.  "The source plan is reused, and a base-table change
+-- invalidates it" is the contract of the cache, not of its current shape, and
+-- it holds however the plan comes to be stored.  The SET of
+-- matview_partial_refresh_querytree goes when that GUC does; the case does not.
+--
+
+CREATE EXTENSION injection_points;
+
+-- Both are load-bearing.  matview_materialize_source() is on the Query-tree
+-- path only, so with the GUC defaulted off this file would exercise nothing at
+-- all and pass -- the shape that has caught this project out four times.
+SET matview_partial_refresh_querytree = on;
+
+-- debug_discard_caches calls InvalidateSystemCachesExtended() at every
+-- invalidation-acceptance point, which invalidates every saved plansource with
+-- a non-empty relationOids.  A reuse assertion must go red under it.  Disabled
+-- explicitly, the way syscache-update-pruned.spec does.
+SET debug_discard_caches = 0;
+
+CREATE TABLE mvsp_base (id int PRIMARY KEY, v int);
+INSERT INTO mvsp_base SELECT g, g * 10 FROM generate_series(1, 5) g;
+
+CREATE MATERIALIZED VIEW mvsp AS SELECT id, v FROM mvsp_base;
+CREATE UNIQUE INDEX ON mvsp (id);
+
+SELECT injection_points_attach('matview-where-source-planned', 'notice');
+
+-- A constant literal, deliberately.  It deparses identically every call, so the
+-- entry is hit; and params is NULL, so choose_custom_plan() returns false
+-- immediately and the plan is generic unconditionally.  That is the cell
+-- PLAN.md 3.7 is scoped to and the one R26 measured.  A *varying* literal
+-- misses the entry by design and would prove nothing.
+
+-- First refresh: nothing is cached, so a plan must be built.
+UPDATE mvsp_base SET v = 101 WHERE id = 1;
+REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
+
+-- Second and third: the plan must be reused.  No notice may appear here.  This
+-- is the assertion; everything above is setup for it.
+UPDATE mvsp_base SET v = 102 WHERE id = 1;
+REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
+UPDATE mvsp_base SET v = 103 WHERE id = 1;
+REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
+
+SELECT id, v FROM mvsp ORDER BY id;
+
+-- A base-table change must invalidate it.  This is the correctness half, and
+-- the reason plancache was chosen over stashing a PlannedStmt: a plan that
+-- outlives the shape of what it reads is a wrong answer, not a slow one.  The
+-- notice must come back.
+ALTER TABLE mvsp_base ADD COLUMN filler int;
+UPDATE mvsp_base SET v = 104 WHERE id = 1;
+REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
+
+-- ...and then settle again.
+UPDATE mvsp_base SET v = 105 WHERE id = 1;
+REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
+
+SELECT id, v FROM mvsp ORDER BY id;
+
+SELECT injection_points_detach('matview-where-source-planned');
+
+DROP MATERIALIZED VIEW mvsp;
+DROP TABLE mvsp_base;
+DROP EXTENSION injection_points;
