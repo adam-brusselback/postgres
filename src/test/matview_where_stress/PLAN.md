@@ -739,13 +739,30 @@ designed against rather than dissolved by it.
 A deliberate pause between the two halves of the rewrite, so the second half
 can be compared against something rather than asserted about.
 
-**Performance.** `bench/run.sh --forms spi,querytree` measures both
-implementations *on one binary*, which removes build variance from the
-comparison — the thing that made the earlier debug-vs-`-O2` numbers
+**Performance.** `bench/run.sh --shapes key,array,range --forms spi,querytree`
+measures both implementations *on one binary*, which removes build variance from
+the comparison — the thing that made the earlier debug-vs-`-O2` numbers
 untransferable. Start it from `bench/detach.sh`: a sweep outlives the shell that
 starts it only if it is put in its own session, and three sweeps were lost here
 before that was diagnosed rather than guessed at. The pre-2.2 sweep is labelled
 `p21-O2`; label the post-2.2 one to match.
+
+**`--shapes` is not optional, and this instruction used to omit it.** The
+default is `--shapes key`, and `run.sh:157` reads
+
+    [ "$shape" = key ] && [ "$span" != 1 ] && continue
+
+because the `key` predicate is `id = :k` and a span above 1 does not mean
+anything for it. So the invocation as previously written here could only ever
+produce **span-1 cells** — one third of the intended sweep, and the third that
+says least, since a fixed cost divided by one row is where every fixed cost
+looks largest. All span 10 and span 100 coverage comes from `array` and
+`range`. The `p21-O2` run of 2026-07-30 did pass all three shapes and is
+therefore *better specified than the instruction that was supposed to have
+produced it* — 8 `key` cells against 24 each for `array` and `range`, which is
+exactly the 1:3:3 the skip predicts. Anyone reading a sweep should check the
+shape count before the numbers: `SELECT predshape, count(*) FROM bench_result
+WHERE run_label = ... GROUP BY 1`.
 
 **Injection.** `matview_where_inject` (`608b3ad`) states the case for this whole
 phase as something checkable instead of something argued. There are three SQL
