@@ -169,10 +169,21 @@ query is **40-47% of the entire refresh**, not the ~17 us R13+R14 imply.  Both
 arms re-plan every single refresh -- planning 19.2% text against 19.8%
 Query-tree, `SPI_prepare` 14.6 against 12.8 -- because pgbench substitutes `:k`
 textually and the cache key is the deparsed predicate string, so every distinct
-key is a fresh miss.  R33/R34 used a **constant literal**, where it hits.  Direct
-confirmation on one arm: varying k **0.728 ms / 1373 tps**, constant k
-**0.403 ms / 2481 tps**, a **1.81x** difference (some of it data locality, since
-a constant k also re-refreshes one hot row).
+key is a fresh miss.  R33/R34 used a **constant literal**, where it hits.
+
+**This was already written down and was rediscovered, not discovered.**
+PLAN.md 3.2 says it outright -- *"bench/run.sh interpolates :k client-side, so
+every measurement in every run recorded so far is on the miss path"* -- and
+sizes it properly, in-backend over 300 refreshes: **546 us varying, 72 us
+constant, 67 us bound parameter, 8x**.  Quote those.  The quick check run here
+gave 0.728 ms against 0.403 ms, only **1.81x**, from a single 12-second pgbench
+pair with no alternation and no settle -- the protocol `profile.sh` was written
+to replace, used out of habit minutes after writing it.  It does not reconcile
+with 8x and 3.2 is the better measurement.
+
+What the profile does add is *where inside the refresh* the miss lands:
+planning 19%, `SPI_prepare` 13-15%, deparse 6.6%.  3.2 has the magnitude; this
+has the breakdown.
 
 **(2) The jump at scope 10000 has no mechanism and should not be pursued.**  At
 scope 10000 the source query is **0.04% of the refresh in both arms** -- four
@@ -187,8 +198,10 @@ The Query-tree rewrite is worth its **6.6%** at scope 1 (the deparse, exactly as
 R14 says) and **nothing** at scale.  That is the whole of it, and it is now
 measured rather than argued.  Two larger things sit next to it:
 
-- **Parameterise the predicate so the cache can hit.**  This is PLAN.md 3.2 and
-  R15 already sizes it at 8x on plan-cache hit rate.  The profile says why it is
+- **Parameterise the predicate so the cache can hit.**  PLAN.md 3.2, already
+  written, already sized at 8x, and already flagged there as the thing the
+  benchmark has been measuring without saying so.  Nothing here changes its
+  priority; this only supplies the phase breakdown behind it.  The profile says why it is
   the big one: ~45% of a scope-1 refresh is source-query work that a hit removes
   outright, against 6.6% for the deparse.  Every driver pattern in USE-CASES.md
   that refreshes per row or drains a queue varies the key, so **the realistic
