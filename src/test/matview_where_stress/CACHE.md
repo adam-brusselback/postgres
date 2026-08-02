@@ -436,11 +436,26 @@ something by reasoning.
   on a hit.  §1's "necessary but not sufficient" is superseded for this cell;
 - `mutations.py --check` 21/21 and `profile.py --check` green, both repaired in
   the commits that break them;
-- `installcheck` 250/250, isolation, injection_points green;
-  `debug_discard_caches = 1` green with step C's reuse case explicitly guarded;
-  `contrib/pg_stat_statements` is **15/16** and stays that way — B25 is
-  pre-existing and deliberately red;
-- `rundiff.sh` quiet across the corpus, both GUC arms.
+- `installcheck` 250/250, isolation 135/135, injection_points 5 regress + 12
+  specs -- **all green**;
+- **`debug_discard_caches = 1` green** on all five `matview_where*` files, with
+  the probe's reuse case explicitly guarded to 0 as this criterion requires.
+  The runtimes are the evidence it was actually in effect: 10-79 s per file
+  against ~0.15 s normally.  A fast pass would have meant the setting was being
+  ignored, which is this directory's recurring failure shape;
+- `contrib/pg_stat_statements` **15/16, confirmed as B25's exact diff** -- the
+  bare form reporting 3 rows rather than 6 since routing moved off spelling.
+  Note that `installcheck` there is a silent no-op (`NO_INSTALLCHECK = 1`, the
+  tests need `shared_preload_libraries`); it must be `make check`, and reading
+  the no-op's silence as a pass is the same mistake one level up;
+- **`rundiff.sh` quiet: 23 shapes, 0 divergences, 0 errors in either arm**;
+- **no leaks**: `leakcheck.sh` reports +0 plansources on all four modes over 300
+  refreshes each, with `churn` calibrated against `L3` (+400/400) and `dropmv`
+  against `L4` (+200/200).  `steady` is a control and `nested` is not live --
+  the per-mode table in that script says which is which and why.
+
+**Step E is done and §8 is met.**  PLAN.md step 2 -- flip the `querytree`
+default and re-run 2.1b -- was blocked on this and is now unblocked by R34.
 
 It is **not** done because the code compiles and the tests are green. B14's first
 fix was green throughout.
