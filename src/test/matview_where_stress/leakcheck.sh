@@ -36,10 +36,25 @@
 # a count that climbs with the refresh count is unambiguous, and it says how
 # many were leaked rather than how much.
 #
-# This is a detector and is calibrated like one: `./leakcheck.sh --selftest`
-# reports what it sees with the drop removed, and it must see growth there or it
-# is not measuring anything.  Four instruments in this directory have now been
-# caught reporting success while measuring nothing.
+# What each mode is, and what proved it
+# -------------------------------------
+# There are three drop sites and they are reached by different events, so a
+# mutation hitting one says nothing about the others.  Every mode below is
+# either calibrated against the site it covers or labelled as not being a
+# detector -- "it printed ok" is not evidence, which is the mistake that put
+# `nested` in this file reporting a clean bill while observing nothing.
+#
+#   churn    DETECTOR, calibrated.  Under L3 (key-mismatch drop removed):
+#            +400 plansources over 400 refreshes, one per refresh.
+#   dropmv   DETECTOR, calibrated.  Under L4 (sweep drop removed): +200 over
+#            200, one per dropped matview.  L3 leaves it at +0, so the modes
+#            are specific rather than all firing at once.
+#   steady   CONTROL, not a detector, and it cannot be made into one by
+#            removing a drop: the reuse path allocates one plansource and never
+#            frees it, so there is no drop site on it.  It must read +0 under
+#            every mutation; anything else is a false positive here.
+#   nested   NOT LIVE -- see above.  Reports +0 under L3 and L4 both, because
+#            the nested refresh never reaches the source-plan build.
 set -eu
 
 DIR=$(cd "$(dirname "$0")" && pwd)

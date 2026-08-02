@@ -294,6 +294,24 @@ MUTATIONS = {
                 '\t\t\tcacheEntry->sourcePlan = NULL;\n', 1),
            ]),
 
+    # L3's sibling, and the reason there are two: there are three drop sites and
+    # they are reached by different events.  L3 covers the key-mismatch rebuild
+    # and the nested teardown; this one covers matview_cache_sweep(), which is
+    # the only thing that reclaims the plans of a matview that has since been
+    # DROPped.  A mutation hitting one says nothing about the others, and
+    # leakcheck.sh's `dropmv` mode exists for exactly this site.
+    #
+    # Same shape as L3 and the same reason it is invisible to everything else:
+    # the entry is gone, so nothing stale is dereferenced and every result stays
+    # correct.  The plansource just stays in CacheMemoryContext, one per dropped
+    # matview, for the life of the backend.
+    'L4': ('-', 'leak',
+           'the sweep forgets the source plansource instead of dropping it '
+           '(leaks one per dropped matview)', [
+               ('\t\tif (entry->sourcePlan)\n'
+                '\t\t\tDropCachedPlan(entry->sourcePlan);\n', ''),
+           ]),
+
     'S1': ('-', 'concur',
            'run the fused DML under a fresh snapshot, not the one the source '
            'was evaluated under (reopens the prune gap)', [
