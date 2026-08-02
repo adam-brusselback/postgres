@@ -558,6 +558,20 @@ rejection does not have to rest on the memory limit alone:
   *different* advisory locks and fail to serialize at all. That is a
   correctness failure, not a performance one, and it is silent.
 
+Not to be confused with the `ROW()` that *does* survive in the tree, at
+`matview.c:2414` — a `grep` from this section lands on it. That one is a shape
+fix and carries none of the above. On the partial path the diff query's `mv` is
+no longer a relation but the subquery `(SELECT ctid, * FROM mv WHERE ...)`
+(`:2267`), one column wider than the matview's rowtype, so upstream's
+`newdata.* OPERATOR(pg_catalog.*=) mv.*` would be an arity mismatch; the branch
+rebuilds the rowtype explicitly instead, over live attributes in attnum order
+skipping `attisdropped`, and for the same reason the outer-join null test
+becomes `mv.ctid IS NULL` rather than `mv.* IS NULL`. It is handed to
+`record_eq`, which compares column by column under each type's own equality and
+treats two NULLs as equal — which is why upstream chose `*=` there — and it is
+never rendered to text or hashed. The canonicalization hazard is specific to
+hashing a rendered key, which nothing in the tree now does.
+
 ### MERGE
 
 **Not mentioned anywhere on the thread** — all thirteen messages checked, from
