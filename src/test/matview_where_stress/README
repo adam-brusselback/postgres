@@ -14,8 +14,11 @@ things that do not belong in the patch itself:
                 that remain and which of them gate the others.
 
   ISSUES.md     Review items, split into those raised on the -hackers thread
-                (A1-A9) and those found separately (B1-B25), each mapped to the
-                test that covers it.  Start here.
+                (A1-A9) and those found separately (B1-B31), each mapped to the
+                test that covers it, plus a third section recording the two
+                designs that were rejected -- per-key advisory locks, which were
+                built and abandoned on the thread, and MERGE, which was not.
+                Start here.
 
   CACHE.md      The subplan behind PLAN.md 3.7: cache the source plan, on an
                 invalidation corrected first.  What is being cached and the one

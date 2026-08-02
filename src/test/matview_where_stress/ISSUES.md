@@ -3,10 +3,13 @@
 Branch-local tracking file. Not part of the patch; delete this directory before
 posting to -hackers.
 
-Two sections: items raised on the -hackers thread **[Patch] Add WHERE clause
-support to REFRESH MATERIALIZED VIEW**, and items found separately that have not
-been mentioned there. Each row names the test that covers it, so a fix shows up
-as that test turning green.
+Three sections: items raised on the -hackers thread **[Patch] Add WHERE clause
+support to REFRESH MATERIALIZED VIEW**, items found separately that have not
+been mentioned there, and designs that were considered and rejected. Each row in
+the first two names the test that covers it, so a fix shows up as that test
+turning green. Section C carries no tests of its own — it records why the shape
+of the write path is what it is, because both of the obvious alternatives to it
+will be proposed by a reviewer who has not read the whole thread.
 
 **B14 is FIXED, for the second time, and this time with a test that has been
 seen to fail.** Everything is fixed unless marked otherwise, and the declared
@@ -460,3 +463,177 @@ the A5 reproducer applies to tests you just wrote, not only to old ones.
 | B20 | **`matview-where-deadlock.spec` is flaky.** Its expected output records *which* of the two sessions receives `ERROR: deadlock detected`, and that is the deadlock detector's choice of victim, not a property of the refresh. Observed failing once in six runs of an unchanged tree, which is exactly often enough to be blamed on whatever was committed most recently | `src/test/isolation/expected/matview-where-deadlock_1.out` | **FIXED** — alternative expected file, the standard mechanism for legitimately variable output. Both orderings are correct deadlock resolutions | keep both files |
 | B19 | **The transformed `WHERE` clause never had collations assigned.** `transformRefreshWhereClause()` did not call `assign_expr_collations()`. Invisible for as long as the only thing done with the tree was to deparse it — the text goes back through the parser, which assigns them the second time round — so the omission was covered by the very round trip this rewrite exists to remove. Executing the tree directly fails on a predicate as ordinary as `tag = 'hot'` with "could not determine which collation to use". The corpus could not see it: all 21 shapes compared numbers | `safety/exh3.sql` case 22 `text_key`, which errors on all 48 of its mutations with the fix reverted | **FIXED** in `9a5195b` | keep the shape |
 | B18 | **The oracle's own gate excluded the one shape that failed it.** `safety/exh.sql` case 7 `distincton` was labelled `SAFE` but diverges on 1 of its 96 mutations; the shape list in `checkall.sh` names `distincton_total` and omits `distincton`, so nothing ever looked at it. The divergence is not a defect — the view's `ORDER BY k, ts DESC` is a partial order, and case 13 is the same view with a total order and diverges zero times — but the label said one thing and the data said another for as long as both existed | `safety/exh.sql`; baseline recorded in `calibrate.baseline` | **FIXED** — relabelled `NONDET`, and `calibrate.sh` now compares against a recorded pristine vector instead of a hand-written shape list | keep the baseline file |
+
+---
+
+## C. Designs considered and rejected
+
+Not issues, and nothing here is open. Two alternatives to the fused
+`INSERT ... ON CONFLICT` write path get proposed on sight, and one of them was
+already built and thrown away. The record exists so neither has to be argued
+from scratch a second time.
+
+| Alternative | Verdict | Why |
+|---|---|---|
+| Transaction-level advisory locks on the logical key | **Built, then abandoned** | Shared lock table entries scale with the predicate's scope, which is the caller's number and not ours |
+| `MERGE` instead of, or fused with, the upsert | **Rejected without building** | `MERGE`'s insert cannot take the speculative path, so it cannot serialize two refreshes inserting the same new key |
+
+### Advisory locks on the logical key
+
+Proposed on the thread 2026-01-04, in the message that first described the
+`DELETE`→`INSERT` consistency gap that is now A3:
+
+> My plan is to replace that row-locking strategy with transaction-level
+> advisory locks inside the refresh logic: Before the DELETE, run a
+> `SELECT pg_advisory_xact_lock(mv_oid, hashtext(ROW(unique_keys)::text))` for
+> the rows matching the WHERE clause. […] This effectively locks the "logical"
+> ID of the row, preventing concurrent refreshes on the same ID even while the
+> physical tuple is temporarily gone.
+
+— <https://www.postgresql.org/message-id/CAMjNa7egcgUMf2tdQ1qeTYj1J1bBvyth3thoZPioujusFsBd4Q@mail.gmail.com>
+
+Withdrawn on the thread 2026-04-09, after prototyping:
+
+> In my last email, I mentioned planning to use transaction-level advisory locks
+> to fix the consistency gap. After prototyping it, I had to abandon that
+> approach. Testing revealed that it falls over at scale, quickly hitting
+> `max_locks_per_transaction` limits and causing issues with bulk operations. I
+> worked on this for a while before deciding it wasn't workable.
+
+— <https://www.postgresql.org/message-id/CAMjNa7d8f3sj-1ZsmsqiUPLzjXFtjOgeM7GFKvU_1EugyzJ5jw@mail.gmail.com>
+
+That is the measured result and it is the one to cite. What the thread does not
+say is *why* the limit is structural rather than a tuning problem, and that is
+worth recording because it is also the reason `ON CONFLICT` is not just a
+convenient substitute: **the two designs differ in where the lock lives.**
+
+`pg_advisory_xact_lock` puts one entry in the shared lock table per key and
+holds it until commit. N keys in scope means N entries held simultaneously, and
+the lock table is sized once at startup —
+`max_locks_per_transaction × (MaxBackends + max_prepared_xacts)`, allocated in
+shared memory and unable to grow. So the ceiling scales with the predicate's
+scope, which is exactly the number the feature exists to let the caller choose
+and therefore the one number we do not control. Raising
+`max_locks_per_transaction` moves the wall; it cannot remove it, and it costs
+every backend in the cluster whether or not it refreshes anything.
+
+Speculative insertion holds **at most one** lock table entry per backend at any
+instant, regardless of how many rows it inserts. The token generator is
+backend-local (`src/backend/storage/lmgr/lmgr.c:45`), and in
+`src/backend/executor/nodeModifyTable.c` the acquire (`:1232`) and the release
+(`:1258`) bracket a single tuple's insertion — take token, insert speculative,
+insert index entries, complete, release. The per-key rendezvous is not in shared
+memory at all: it is the token stored in the heap tuple, which a would-be
+conflicter reaches through the index. Unbounded distinct keys, O(1) shared
+memory.
+
+The core paid for that with an imprecision it documented rather than fixed
+(`lmgr.c:33-43`): the counter can wrap, so a waiter can end up
+
+> waiting for the latest unrelated insertion instead. Even then, nothing
+> particularly bad happens: in the worst case they deadlock, causing one of the
+> transactions to abort.
+
+Occasional false waits, bought in exchange for constant memory. The advisory
+lock design structurally cannot make that trade, because its keys must stay
+distinct to be *correct*, not merely to be fast.
+
+Two further problems follow from the same line, neither raised on the thread and
+neither measured here — they are arithmetic and reading, recorded so the
+rejection does not have to rest on the memory limit alone:
+
+- **The hash is 32 bits.** `hashtext` returns `int4` (`pg_proc.dat:1267`) and
+  the two-argument `pg_advisory_xact_lock` takes `int4 int4`
+  (`pg_proc.dat:9228`), so with the OID consuming one slot the key space per
+  matview is 2^32. Collisions do not corrupt anything — they falsely serialize
+  two unrelated logical keys — but they degrade the property the feature is
+  sold on, and they get worse precisely as scope grows. Birthday arithmetic: at
+  10,000 distinct keys the chance of at least one collision is about 1%; at
+  100,000 it is about 69%.
+- **`ROW(...)::text` is not a canonical form of the key.** Equality on the
+  unique index and equality of the rendered text are different relations for
+  any type whose output function is not injective over its equality class —
+  `citext` is the clean example, where `'A'` and `'a'` are the same key and
+  render differently. Two refreshes touching the same logical row would take
+  *different* advisory locks and fail to serialize at all. That is a
+  correctness failure, not a performance one, and it is silent.
+
+### MERGE
+
+**Not mentioned anywhere on the thread** — all thirteen messages checked, from
+2025-12-08 to 2026-05-29. This is a pre-emptive record, because "why not
+`MERGE`?" is a cheap question to ask of any upsert-shaped patch and the answer
+takes a paragraph of executor reading that a reviewer should not have to do.
+
+`MERGE`'s `WHEN NOT MATCHED ... THEN INSERT` cannot reach speculative insertion.
+The entire speculative path is gated on one condition
+(`nodeModifyTable.c:1131`):
+
+```c
+if (onconflict != ONCONFLICT_NONE && resultRelInfo->ri_NumIndices > 0)
+{
+    /* Perform a speculative insertion. */
+```
+
+where `onconflict` is read from the plan node at `:889`
+(`OnConflictAction onconflict = node->onConflictAction;`). `ExecMergeNotMatched`
+reaches the insert through `ExecInsert(context, mtstate->rootResultRelInfo,
+newslot, canSetTag, NULL, NULL)` (`:4139`) on a ModifyTable whose
+`onConflictAction` the `MERGE` grammar has no way to set. So it is a plain heap
+insert that takes no token: two overlapping refreshes producing the same new key
+both see NOT MATCHED, both insert, and the second gets a unique violation at
+index-insert time instead of waiting for the first to decide.
+
+That is exactly the case the thread already assigned to `ON CONFLICT`, 2026-05-26:
+
+> `SELECT FOR UPDATE` only serializes overlapping refreshes covering rows that
+> already exist in the MV. Two refreshes that both insert the same new logical
+> key are serialized by `ON CONFLICT` and the unique index, not by
+> `FOR UPDATE`. The outcome is still correct. The last writer wins on that key.
+
+— <https://www.postgresql.org/message-id/CAMjNa7cnyWqWQT5FwXX8myfej4ZLhEKLsBUdtW1vmvYK-KxbPA@mail.gmail.com>
+
+The pre-lock structurally cannot cover it, because a row that does not exist yet
+cannot be locked. `merge.sgml:715` says the same thing from the other direction:
+
+> You may also wish to consider using `INSERT ... ON CONFLICT` as an
+> alternative statement which offers the ability to run an `UPDATE` or return
+> the existing row (with `DO SELECT`) if a concurrent `INSERT` occurs. There are
+> a variety of differences and restrictions between the two statement types and
+> they are not interchangeable.
+
+Two corrections to objections that are *not* the reason, so they do not get
+raised as though they were:
+
+- **Row ordering is expressible under `MERGE`.** `merge.sgml:704-707`: the
+  source order is indeterminate by default, but "A `source_query` can be used
+  to specify a consistent ordering, if required, which might be needed to avoid
+  deadlocks between concurrent transactions." So M1/M2's ordering requirement
+  could be met. Ordering solves deadlock; it does not solve the unique
+  violation.
+- **`MERGE` is allowed as a data-modifying CTE in this tree**, so a hybrid is
+  syntactically available. Verified directly:
+
+  ```sql
+  WITH m AS (
+    MERGE INTO mg_t t USING mg_s s ON t.id = s.id
+    WHEN MATCHED THEN UPDATE SET v = s.v
+    WHEN NOT MATCHED BY SOURCE THEN DELETE
+    RETURNING t.id
+  ) SELECT count(*) FROM m;   -- 1
+  ```
+
+The hybrid is therefore the only version worth weighing: `MERGE` for the prune
+via `WHEN NOT MATCHED BY SOURCE`, `ON CONFLICT` for the upsert, fused in one
+statement so A3's consistency gap stays closed. It buys one thing — the
+anti-join is replaced by a clause that reads better — and that thing does **not**
+fix B4, because `ON t.k = s.k` is exactly as NULL-unsafe as the anti-join was and
+would need the same `IS NOT DISTINCT FROM` treatment B4's fix already applied.
+Net gain approximately cosmetic; net cost a second write path that the whole
+mutation corpus and both fuzzer modes have to be recalibrated against.
+
+The dependency on `ON CONFLICT` is load-bearing rather than incidental, and the
+branch already says so in executable form: `matview-where-insertorder.spec` is
+the deterministic gate for insert-side lock ordering, and `mutations.py` M2 —
+drop the `ORDER BY` feeding `new_data` — is the calibration proving that gate is
+a real detector (`fuzz.sh` p3, 40/80, quiet on pristine).
