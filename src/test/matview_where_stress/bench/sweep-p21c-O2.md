@@ -119,15 +119,39 @@ fixed cost, exactly as R13/R14 describe -- and then goes to **2963 us** at scope
 window array 5113, window range 6025), so it is not one view's plan.  A fixed
 cost cannot produce it.
 
-**3. `timerange` gets nothing, and `recursive` gets nothing.**  `timerange`
-averages +0.0% over 5 cells and holds the run's two worst: range/span 1 at
-**-7.0%** and array/span 1 at **-1.9%**, both at scope 200, with range/span 10
-flat at -0.1%.  `recursive` averages +0.5% with 6 of 7 cells mildly negative.
-The `recursive` case is explained -- a fixed ~120 us saving against a ~1400 ms
-refresh is 0.009%, so ~0 is the right answer and the sign is noise.
-`timerange` is not explained: its refreshes are 2.8-17.9 ms, where the other
-workloads show 5-9%.
+**3. ~~`timerange` gets nothing~~ -- RETRACTED.  It was noise, and the retraction
+is the useful part.**  The sweep had `timerange` at +0.0% over 5 cells holding
+the run's two worst results, range/span 1 at -7.0% and array/span 1 at -1.9%.
+Re-run as `tr-probe` with `--repeat 5` instead of 3, same build, same server,
+same boot, **every cell moved positive**:
 
-The cheap next step for (3) is to rebuild only the `timerange` fixture and run
-`EXPLAIN` on both arms; it could not be done during the sweep because `run.sh`
-drops and recreates `bench.mv` per workload.
+| shape | span | sweep | probe |
+|---|---|---|---|
+| array | 1 | -1.9% | **+3.3%** |
+| array | 10 | +8.2% | +2.8% |
+| key | 1 | +0.5% | **+22.1%** |
+| range | 1 | **-7.0%** | **+4.7%** |
+| range | 10 | -0.1% | **+6.3%** |
+
+`timerange` averages **+7.8%** on the probe, which is the same 5-9% the other
+seven workloads give.  There is no `timerange` anomaly.
+
+What this costs the rest of the run: **the per-workload column is noise-limited
+at `--repeat 3` and must not be quoted or ranked.**  Five cells were enough to
+produce a 0.0% average for a workload that actually sits at +7.8%, and the
+absolute latencies moved up to 20% between runs on *both* arms -- 3.344 against
+2.705 ms for the same spi cell, which no change in the code can explain.  The
++22.1% cell is the same instability pointing the other way; it is not a result
+either.
+
+The shape-level headline survives, for a reason worth stating rather than
+assuming: it rests on 23 / 8 / 23 cells rather than 5, and the Jul-30 `p21-O2`
+run reached the same ~6% independently on a different build.  Two independent
+routes to one number is what makes it quotable; the per-workload figures have
+neither.
+
+**4. `recursive` gets nothing, and this one IS explained.**  +0.5% with 6 of 7
+cells mildly negative (-0.4 to -2.2).  A fixed ~120 us saving against a ~1400 ms
+refresh is 0.009%, so ~0 is the arithmetically correct answer and the sign is
+noise.  This is the fixed-cost reading confirmed from the far end of the scale,
+and it is the one workload result here that does not depend on `--repeat`.
