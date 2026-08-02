@@ -53,11 +53,18 @@ PERF=${PERF:-/usr/lib/linux-tools-6.8.0-136/perf}
 FG=${FG:-/opt/FlameGraph}
 FREQ=${FREQ:-299}
 
-PSQL="su pgtest -c \"$BINDIR/psql -p $PORT -d $DB -X -q -Atc\""
-psql_c() { su pgtest -c "$BINDIR/psql -p $PORT -d $DB -X -q -Atc \"$1\"" 2>/dev/null; }
-psql_f() { su pgtest -c "$BINDIR/psql -p $PORT -d $DB -X -q -f $1" >/dev/null 2>&1; }
-
 mkdir -p "$OUT"
+
+# SQL goes to a file and psql reads it with -f.  It must NOT be interpolated
+# into `su -c "..."`, because that hands it to a second shell: dollar-quoting
+# ($$...$$) then expands to the shell's PID and psql receives
+# bench_scope_rows(12345region BETWEEN ...).  That cost a debugging cycle;
+# a file has no quoting layer to get wrong.
+psql_c() {
+    printf '%s\n' "$1" > "$OUT/.q.sql"; chmod 644 "$OUT/.q.sql"
+    su pgtest -c "$BINDIR/psql -p $PORT -d $DB -X -q -At -f $OUT/.q.sql" 2>/dev/null
+}
+psql_f() { su pgtest -c "$BINDIR/psql -p $PORT -d $DB -X -q -f $1" >/dev/null 2>&1; }
 DIR=$(cd "$(dirname "$0")" && pwd)
 
 # ---- preflight.  Nothing below is worth doing if any of this is wrong. ----
@@ -91,9 +98,12 @@ PREDT=$(psql_c "SELECT $PREDCOL FROM bench_workload WHERE id='$W'")
 ARRLIT="ARRAY["$(i=0; while [ $i -lt "$SPAN" ]; do
                    [ $i -gt 0 ] && printf ,; printf ':k+%s' "$i"; i=$((i+1)); done)"]"
 PREDT=$(echo "$PREDT" | sed "s/:arraylit/$ARRLIT/g; s/:span/$SPAN/g")
-SCOPE=$(psql_c "SET search_path=bench,public; SELECT bench_scope_rows(\$\$$(echo "$PREDT" | sed 's/:k/1/g')\$\$)")
+SCOPE=$(psql_c "SET search_path=bench,public;
+SELECT bench_scope_rows(\$q\$$(echo "$PREDT" | sed 's/:k/1/g')\$q\$);")
 echo "  predicate: $PREDT"
 echo "  scope_rows=$SCOPE"
+[ -n "$SCOPE" ] || { echo "  scope probe returned nothing -- refusing to profile a" >&2
+                     echo "  combination that cannot be described" >&2; exit 1; }
 
 settle() {
     su pgtest -c "$BINDIR/psql -p $PORT -d $DB -X -q -Atc \"SELECT 'VACUUM (ANALYZE) '||schemaname||'.'||quote_ident(relname)||';' FROM pg_stat_user_tables WHERE schemaname='bench'\"" 2>/dev/null \
