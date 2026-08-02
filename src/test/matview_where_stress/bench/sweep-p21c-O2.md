@@ -155,3 +155,55 @@ cells mildly negative (-0.4 to -2.2).  A fixed ~120 us saving against a ~1400 ms
 refresh is 0.009%, so ~0 is the arithmetically correct answer and the sign is
 noise.  This is the fixed-cost reading confirmed from the far end of the scale,
 and it is the one workload result here that does not depend on `--repeat`.
+
+---
+
+## Both open questions, answered by profile (R36)
+
+`bench/profile.sh` settled (1) and (2) above.  Neither needed a new benchmark;
+both needed to know where the time goes.
+
+**(1) The 7x gap against the fixed-cost accounting: the accounting was measured
+where the cache hits, and the benchmark never hits it.**  At scope 1 the source
+query is **40-47% of the entire refresh**, not the ~17 us R13+R14 imply.  Both
+arms re-plan every single refresh -- planning 19.2% text against 19.8%
+Query-tree, `SPI_prepare` 14.6 against 12.8 -- because pgbench substitutes `:k`
+textually and the cache key is the deparsed predicate string, so every distinct
+key is a fresh miss.  R33/R34 used a **constant literal**, where it hits.  Direct
+confirmation on one arm: varying k **0.728 ms / 1373 tps**, constant k
+**0.403 ms / 2481 tps**, a **1.81x** difference (some of it data locality, since
+a constant k also re-refreshes one hot row).
+
+**(2) The jump at scope 10000 has no mechanism and should not be pursued.**  At
+scope 10000 the source query is **0.04% of the refresh in both arms** -- four
+parts in ten thousand, identical.  Nothing the Query-tree rewrite touches can
+move a large-scope refresh by 3 ms, or by anything.  Read with the timerange
+retraction above, the jump is very likely the same `--repeat 3` noise, and it is
+withdrawn as a finding.
+
+### What the profile says to work on instead
+
+The Query-tree rewrite is worth its **6.6%** at scope 1 (the deparse, exactly as
+R14 says) and **nothing** at scale.  That is the whole of it, and it is now
+measured rather than argued.  Two larger things sit next to it:
+
+- **Parameterise the predicate so the cache can hit.**  This is PLAN.md 3.2 and
+  R15 already sizes it at 8x on plan-cache hit rate.  The profile says why it is
+  the big one: ~45% of a scope-1 refresh is source-query work that a hit removes
+  outright, against 6.6% for the deparse.  Every driver pattern in USE-CASES.md
+  that refreshes per row or drains a queue varies the key, so **the realistic
+  pattern is the one that never caches**.
+- **At scale, look at `ON CONFLICT` (23-27%) and the locking SELECT (19-20%).**
+  Together they are ~45% of a scope-10000 refresh.  R17 already says the
+  locking SELECT's cost is the locking rather than the scan, and section C of
+  ISSUES.md says the `ON CONFLICT` is load-bearing for P3 -- so neither is free
+  to change, which is what makes them the interesting targets rather than the
+  obvious ones.
+
+One thing the profile raised that is **not** yet explained: at scope 10000 the
+two arms spend their time differently despite identical source-query cost --
+base table scan 26.0% text against 18.2% Query-tree, index maintenance 4.8
+against 2.0, `ON CONFLICT` 23.3 against 27.3.  Parse and plan overhead is nil,
+so this would have to be a **plan-shape difference** between deparse-and-reparse
+and handing the planner a Query tree directly.  Capturing both plans is cheap
+now that profile.sh holds a fixture still, and it has not been done.
