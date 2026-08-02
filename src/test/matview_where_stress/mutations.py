@@ -262,6 +262,38 @@ MUTATIONS = {
                 '\t\tif (cacheEntry->sourcePlan == NULL)\n\t\t{'),
            ]),
 
+    # The leak, as distinct from C3's crash.  C3 keeps the old plansource *and*
+    # keeps using it, which segfaults; this forgets it instead -- the pointer is
+    # cleared, so nothing stale is ever dereferenced and the plansource simply
+    # stays in CacheMemoryContext until the backend exits.
+    #
+    # That is the failure a test suite cannot see.  Every result is correct,
+    # every gate is green, and the only symptom is a backend that grows for as
+    # long as it keeps refreshing -- which for a drain process is forever.  It is
+    # the calibration for leakcheck.sh, and leakcheck.sh is the only instrument
+    # here that can catch it.
+    #
+    # Both drop sites, because they leak on different paths: the key-mismatch
+    # rebuild leaks one per predicate switch, and the nested-refresh teardown
+    # leaks one per nested refresh, on the success and error paths alike.
+    'L3': ('-', 'leak',
+           'the source plansource is forgotten instead of dropped '
+           '(leaks one per rebuild; every result still correct)', [
+               ('\t\t\tif (cacheEntry->sourcePlan)\n'
+                '\t\t\t\tDropCachedPlan(cacheEntry->sourcePlan);\n', ''),
+               # The two nested-teardown sites sit at different indentation --
+               # success path inside PG_TRY, error path inside PG_CATCH -- so
+               # they are two edits, not one with a count of two.  The count
+               # check caught that; a single pattern would have silently
+               # mutated one path and left the other correct, which is B23.
+               ('\t\tDropCachedPlan(cacheEntry->sourcePlan);\n'
+                '\t\tcacheEntry->sourcePlan = NULL;\n',
+                '\t\tcacheEntry->sourcePlan = NULL;\n', 1),
+               ('\t\t\tDropCachedPlan(cacheEntry->sourcePlan);\n'
+                '\t\t\tcacheEntry->sourcePlan = NULL;\n',
+                '\t\t\tcacheEntry->sourcePlan = NULL;\n', 1),
+           ]),
+
     'S1': ('-', 'concur',
            'run the fused DML under a fresh snapshot, not the one the source '
            'was evaluated under (reopens the prune gap)', [
