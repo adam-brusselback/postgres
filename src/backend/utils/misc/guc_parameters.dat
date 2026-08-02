@@ -1988,7 +1988,7 @@
   long_desc => 'Both settings must produce the same materialized view contents; this exists so the two can be compared while the query-tree implementation is being developed.',
   flags => 'GUC_NOT_IN_SAMPLE',
   variable => 'matview_partial_refresh_querytree',
-  boot_val => 'false',
+  boot_val => 'true',
 },
 
 { name => 'max_active_replication_origins', type => 'int', context => 'PGC_POSTMASTER', group => 'REPLICATION_SUBSCRIBERS',
