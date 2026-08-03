@@ -10,13 +10,13 @@
 -- view body through pg_get_viewdef().
 --
 -- Which generator a case reaches is decided by the matview, not by how the
--- REFRESH is spelled -- and the three forms every case runs under are not the
+-- REFRESH is spelled -- and the two forms every case runs under are not the
 -- same thing as the generator:
 --
 --   direct     refresh_by_direct_modification(), taken by a predicate on a
 --              matview with at most one unique index, either spelling.  It
---              builds its own SQL text: from the view's SQL under the `spi`
---              form, and from its Query tree under `querytree`.
+--              builds its own SQL text around a source tuplestore; the view
+--              body no longer appears in it.
 --   diff/merge the transient-heap fill in ExecRefreshMatView(), which splices
 --              the view body and the predicate into
 --              "INSERT INTO <t> SELECT * FROM (<view>) _mv_q WHERE <qual>",
@@ -26,7 +26,7 @@
 --
 -- The `bare` form used to select diff/merge, and this header used to say so.
 -- Routing then moved onto the unique-index count, and since Tests 1 to 8 all
--- use a matview with one unique index, all three of their forms go to direct
+-- use a matview with one unique index, both of their forms go to direct
 -- modification and none of them reaches refresh_by_match_merge() at all.  No
 -- test changed and nothing went red; it was found by measuring, with Q2.  That
 -- is what Test 9 exists to reach, and it does it with a second unique index
@@ -39,22 +39,16 @@
 -- fail them, which is the argument for the rewrite stated as a test rather
 -- than as a claim.
 --
--- Disposition: keep.  When the GUC goes, drop 'querytree' from the form arrays
--- and the SET/SHOW pair that pins and checks it; the cases themselves outlive
--- all three implementations -- an identifier-quoting regression is exactly what
--- a later refactor reintroduces -- and the bare path keeps generating SQL after
--- the concurrent one stops.
+-- Disposition: keep.  The cases outlive the implementations they were written
+-- against -- an identifier-quoting regression is exactly what a later refactor
+-- reintroduces -- and the bare path keeps generating SQL after the concurrent
+-- one stops.  'querytree' and 'spi' have already been dropped from the form
+-- arrays, with the GUC that selected them.
 --
 -- Found here, not on the -hackers thread.
 
 CREATE SCHEMA mvinj;
 SET search_path = mvinj, public;
-
--- Pin the session default.  Every case below selects its implementation
--- explicitly, so nothing here depends on this value -- but the leak check after
--- Test 1 prints it, and that has to read the same whether the suite was started
--- with the GUC defaulted on or off.
-SET matview_partial_refresh_querytree = off;
 
 -- The canary.  Nothing any test does may change this table; every case that
 -- could escape the generated SQL is written so that a successful escape would
@@ -73,13 +67,13 @@ INSERT INTO victim VALUES ('untouched');
 -- The mutation carries the iteration number into the data, so each form has to
 -- produce a value only it could have produced.
 --
---   %1$s   a fresh value, 901 then 902 then 903
---   %2$s   the iteration, 1 then 2 then 3
+--   %1$s   a fresh value, 901 then 902
+--   %2$s   the iteration, 1 then 2
 --
 CREATE FUNCTION refresh_forms(mv text, pred text, mutate text, readback text)
 RETURNS TABLE(form text, contents text) LANGUAGE plpgsql AS $$
 DECLARE
-  forms text[] := ARRAY['bare', 'spi', 'querytree'];
+  forms text[] := ARRAY['bare', 'conc'];
   i     int;
 BEGIN
   FOR i IN 1 .. array_length(forms, 1) LOOP
@@ -87,8 +81,6 @@ BEGIN
     IF forms[i] = 'bare' THEN
       EXECUTE format('REFRESH MATERIALIZED VIEW %s WHERE %s', mv, pred);
     ELSE
-      EXECUTE format('SET LOCAL matview_partial_refresh_querytree = %s',
-                     CASE forms[i] WHEN 'querytree' THEN 'on' ELSE 'off' END);
       EXECUTE format('REFRESH MATERIALIZED VIEW CONCURRENTLY %s WHERE %s',
                      mv, pred);
     END IF;
@@ -118,9 +110,6 @@ SELECT * FROM refresh_forms(
   $m$UPDATE inj1_base SET v = %s WHERE id <= 2$m$,
   $r$SELECT string_agg(id || '=' || v, ' ' ORDER BY id)
        FROM "mv1"";INSERT INTO victim VALUES('pwned-name');--"$r$);
-
--- SET LOCAL inside the function must not have escaped it.
-SHOW matview_partial_refresh_querytree;
 
 --
 -- Test 2: a column name that does the same
@@ -190,7 +179,7 @@ CREATE FUNCTION refresh_forms_param(mv text, val text, mutate text,
                                     readback text)
 RETURNS TABLE(form text, contents text) LANGUAGE plpgsql AS $$
 DECLARE
-  forms text[] := ARRAY['bare', 'spi', 'querytree'];
+  forms text[] := ARRAY['bare', 'conc'];
   i     int;
 BEGIN
   FOR i IN 1 .. array_length(forms, 1) LOOP
@@ -199,8 +188,6 @@ BEGIN
       EXECUTE format('REFRESH MATERIALIZED VIEW %s WHERE tag = $1', mv)
         USING val;
     ELSE
-      EXECUTE format('SET LOCAL matview_partial_refresh_querytree = %s',
-                     CASE forms[i] WHEN 'querytree' THEN 'on' ELSE 'off' END);
       EXECUTE format('REFRESH MATERIALIZED VIEW CONCURRENTLY %s WHERE tag = $1',
                      mv) USING val;
     END IF;

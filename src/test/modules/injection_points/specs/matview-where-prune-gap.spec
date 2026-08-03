@@ -56,7 +56,6 @@ teardown
 
 session s1
 setup {
-    SET matview_partial_refresh_querytree = on;
     SELECT injection_points_set_local();
     SELECT injection_points_attach('matview-where-source-materialized', 'wait');
 }
@@ -68,7 +67,6 @@ step s1_wide { REFRESH MATERIALIZED VIEW CONCURRENTLY mvgap WHERE tag = 'hot'; }
 step s1_noop { }
 
 session s2
-setup { SET matview_partial_refresh_querytree = on; }
 # A key the matview has never held.  s2_narrow's locking SELECT therefore locks
 # nothing and does not queue behind s1.
 step s2_add    { INSERT INTO mvgap_base VALUES (9, 'hot', 90); }

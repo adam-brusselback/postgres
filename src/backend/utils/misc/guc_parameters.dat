@@ -1977,18 +1977,10 @@
 
 { name => 'matview_partial_refresh_optimized', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Applies the Phase 3 optimisations to a partial refresh.',
-  long_desc => 'Only has effect together with matview_partial_refresh_querytree.  Exists so that the optimised and unoptimised Query-tree implementations can be measured against each other on one binary.',
+  long_desc => 'Exists so that the optimised and unoptimised implementations can be measured against each other on one binary.',
   flags => 'GUC_NOT_IN_SAMPLE',
   variable => 'matview_partial_refresh_optimized',
   boot_val => 'false',
-},
-
-{ name => 'matview_partial_refresh_querytree', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
-  short_desc => 'Builds a partial refresh from the view query tree rather than from its SQL text.',
-  long_desc => 'Both settings must produce the same materialized view contents; this exists so the two can be compared while the query-tree implementation is being developed.',
-  flags => 'GUC_NOT_IN_SAMPLE',
-  variable => 'matview_partial_refresh_querytree',
-  boot_val => 'true',
 },
 
 { name => 'max_active_replication_origins', type => 'int', context => 'PGC_POSTMASTER', group => 'REPLICATION_SUBSCRIBERS',

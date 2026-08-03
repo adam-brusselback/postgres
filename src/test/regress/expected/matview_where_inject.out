@@ -10,13 +10,13 @@
 -- view body through pg_get_viewdef().
 --
 -- Which generator a case reaches is decided by the matview, not by how the
--- REFRESH is spelled -- and the three forms every case runs under are not the
+-- REFRESH is spelled -- and the two forms every case runs under are not the
 -- same thing as the generator:
 --
 --   direct     refresh_by_direct_modification(), taken by a predicate on a
 --              matview with at most one unique index, either spelling.  It
---              builds its own SQL text: from the view's SQL under the `spi`
---              form, and from its Query tree under `querytree`.
+--              builds its own SQL text around a source tuplestore; the view
+--              body no longer appears in it.
 --   diff/merge the transient-heap fill in ExecRefreshMatView(), which splices
 --              the view body and the predicate into
 --              "INSERT INTO <t> SELECT * FROM (<view>) _mv_q WHERE <qual>",
@@ -26,7 +26,7 @@
 --
 -- The `bare` form used to select diff/merge, and this header used to say so.
 -- Routing then moved onto the unique-index count, and since Tests 1 to 8 all
--- use a matview with one unique index, all three of their forms go to direct
+-- use a matview with one unique index, both of their forms go to direct
 -- modification and none of them reaches refresh_by_match_merge() at all.  No
 -- test changed and nothing went red; it was found by measuring, with Q2.  That
 -- is what Test 9 exists to reach, and it does it with a second unique index
@@ -39,20 +39,15 @@
 -- fail them, which is the argument for the rewrite stated as a test rather
 -- than as a claim.
 --
--- Disposition: keep.  When the GUC goes, drop 'querytree' from the form arrays
--- and the SET/SHOW pair that pins and checks it; the cases themselves outlive
--- all three implementations -- an identifier-quoting regression is exactly what
--- a later refactor reintroduces -- and the bare path keeps generating SQL after
--- the concurrent one stops.
+-- Disposition: keep.  The cases outlive the implementations they were written
+-- against -- an identifier-quoting regression is exactly what a later refactor
+-- reintroduces -- and the bare path keeps generating SQL after the concurrent
+-- one stops.  'querytree' and 'spi' have already been dropped from the form
+-- arrays, with the GUC that selected them.
 --
 -- Found here, not on the -hackers thread.
 CREATE SCHEMA mvinj;
 SET search_path = mvinj, public;
--- Pin the session default.  Every case below selects its implementation
--- explicitly, so nothing here depends on this value -- but the leak check after
--- Test 1 prints it, and that has to read the same whether the suite was started
--- with the GUC defaulted on or off.
-SET matview_partial_refresh_querytree = off;
 -- The canary.  Nothing any test does may change this table; every case that
 -- could escape the generated SQL is written so that a successful escape would
 -- write to it.  Checked once at the end, so a failure cannot be missed by a
@@ -69,13 +64,13 @@ INSERT INTO victim VALUES ('untouched');
 -- The mutation carries the iteration number into the data, so each form has to
 -- produce a value only it could have produced.
 --
---   %1$s   a fresh value, 901 then 902 then 903
---   %2$s   the iteration, 1 then 2 then 3
+--   %1$s   a fresh value, 901 then 902
+--   %2$s   the iteration, 1 then 2
 --
 CREATE FUNCTION refresh_forms(mv text, pred text, mutate text, readback text)
 RETURNS TABLE(form text, contents text) LANGUAGE plpgsql AS $$
 DECLARE
-  forms text[] := ARRAY['bare', 'spi', 'querytree'];
+  forms text[] := ARRAY['bare', 'conc'];
   i     int;
 BEGIN
   FOR i IN 1 .. array_length(forms, 1) LOOP
@@ -83,8 +78,6 @@ BEGIN
     IF forms[i] = 'bare' THEN
       EXECUTE format('REFRESH MATERIALIZED VIEW %s WHERE %s', mv, pred);
     ELSE
-      EXECUTE format('SET LOCAL matview_partial_refresh_querytree = %s',
-                     CASE forms[i] WHEN 'querytree' THEN 'on' ELSE 'off' END);
       EXECUTE format('REFRESH MATERIALIZED VIEW CONCURRENTLY %s WHERE %s',
                      mv, pred);
     END IF;
@@ -112,19 +105,11 @@ SELECT * FROM refresh_forms(
   $m$UPDATE inj1_base SET v = %s WHERE id <= 2$m$,
   $r$SELECT string_agg(id || '=' || v, ' ' ORDER BY id)
        FROM "mv1"";INSERT INTO victim VALUES('pwned-name');--"$r$);
-   form    |          contents          
------------+----------------------------
- bare      | 1=901 2=901 3=30 4=40 5=50
- spi       | 1=902 2=902 3=30 4=40 5=50
- querytree | 1=903 2=903 3=30 4=40 5=50
-(3 rows)
-
--- SET LOCAL inside the function must not have escaped it.
-SHOW matview_partial_refresh_querytree;
- matview_partial_refresh_querytree 
------------------------------------
- off
-(1 row)
+ form |          contents          
+------+----------------------------
+ bare | 1=901 2=901 3=30 4=40 5=50
+ conc | 1=902 2=902 3=30 4=40 5=50
+(2 rows)
 
 --
 -- Test 2: a column name that does the same
@@ -148,12 +133,11 @@ SELECT * FROM refresh_forms(
   $r$SELECT string_agg(k || '=' || v, ' ' ORDER BY k)
        FROM (SELECT "k"";INSERT INTO victim VALUES('pwned-col');--" AS k,
                     "v ""odd"" name" AS v FROM inj2_mv) s$r$);
-   form    |          contents          
------------+----------------------------
- bare      | 1=901 2=901 3=30 4=40 5=50
- spi       | 1=902 2=902 3=30 4=40 5=50
- querytree | 1=903 2=903 3=30 4=40 5=50
-(3 rows)
+ form |          contents          
+------+----------------------------
+ bare | 1=901 2=901 3=30 4=40 5=50
+ conc | 1=902 2=902 3=30 4=40 5=50
+(2 rows)
 
 --
 -- Test 3: a hostile string literal in the predicate
@@ -177,12 +161,11 @@ SELECT * FROM refresh_forms(
   $p$tag = ''';INSERT INTO victim VALUES(''pwned-lit'');--'$p$,
   $m$UPDATE inj3_base SET v = %s$m$,
   $r$SELECT string_agg(tag || '=' || v, ' | ' ORDER BY tag) FROM inj3_mv$r$);
-   form    |                        contents                        
------------+--------------------------------------------------------
- bare      | ';INSERT INTO victim VALUES('pwned-lit');--=901 | ok=1
- spi       | ';INSERT INTO victim VALUES('pwned-lit');--=902 | ok=1
- querytree | ';INSERT INTO victim VALUES('pwned-lit');--=903 | ok=1
-(3 rows)
+ form |                        contents                        
+------+--------------------------------------------------------
+ bare | ';INSERT INTO victim VALUES('pwned-lit');--=901 | ok=1
+ conc | ';INSERT INTO victim VALUES('pwned-lit');--=902 | ok=1
+(2 rows)
 
 --
 -- Test 4: the same string arriving as a bound parameter
@@ -203,7 +186,7 @@ CREATE FUNCTION refresh_forms_param(mv text, val text, mutate text,
                                     readback text)
 RETURNS TABLE(form text, contents text) LANGUAGE plpgsql AS $$
 DECLARE
-  forms text[] := ARRAY['bare', 'spi', 'querytree'];
+  forms text[] := ARRAY['bare', 'conc'];
   i     int;
 BEGIN
   FOR i IN 1 .. array_length(forms, 1) LOOP
@@ -212,8 +195,6 @@ BEGIN
       EXECUTE format('REFRESH MATERIALIZED VIEW %s WHERE tag = $1', mv)
         USING val;
     ELSE
-      EXECUTE format('SET LOCAL matview_partial_refresh_querytree = %s',
-                     CASE forms[i] WHEN 'querytree' THEN 'on' ELSE 'off' END);
       EXECUTE format('REFRESH MATERIALIZED VIEW CONCURRENTLY %s WHERE tag = $1',
                      mv) USING val;
     END IF;
@@ -227,12 +208,11 @@ SELECT * FROM refresh_forms_param(
   ''';INSERT INTO victim VALUES(''pwned-param'');--',
   $m$UPDATE inj3_base SET v = %s$m$,
   $r$SELECT string_agg(tag || '=' || v, ' | ' ORDER BY tag) FROM inj3_mv$r$);
-   form    |                                                  contents                                                  
------------+------------------------------------------------------------------------------------------------------------
- bare      | ';INSERT INTO victim VALUES('pwned-lit');--=903 | ';INSERT INTO victim VALUES('pwned-param');--=901 | ok=1
- spi       | ';INSERT INTO victim VALUES('pwned-lit');--=903 | ';INSERT INTO victim VALUES('pwned-param');--=902 | ok=1
- querytree | ';INSERT INTO victim VALUES('pwned-lit');--=903 | ';INSERT INTO victim VALUES('pwned-param');--=903 | ok=1
-(3 rows)
+ form |                                                  contents                                                  
+------+------------------------------------------------------------------------------------------------------------
+ bare | ';INSERT INTO victim VALUES('pwned-lit');--=902 | ';INSERT INTO victim VALUES('pwned-param');--=901 | ok=1
+ conc | ';INSERT INTO victim VALUES('pwned-lit');--=902 | ';INSERT INTO victim VALUES('pwned-param');--=902 | ok=1
+(2 rows)
 
 --
 -- Test 5: a schema name that closes the qualified identifier
@@ -259,12 +239,11 @@ SELECT * FROM refresh_forms(
        SET v = %s WHERE id = 1$m$,
   $r$SELECT string_agg(id || '=' || v, ' ' ORDER BY id)
        FROM "s"";INSERT INTO mvinj.victim VALUES('pwned-schema');--".mv$r$);
-   form    |   contents    
------------+---------------
- bare      | 1=901 2=2 3=3
- spi       | 1=902 2=2 3=3
- querytree | 1=903 2=2 3=3
-(3 rows)
+ form |   contents    
+------+---------------
+ bare | 1=901 2=2 3=3
+ conc | 1=902 2=2 3=3
+(2 rows)
 
 --
 -- Test 6: view data that looks like the end of a statement
@@ -290,12 +269,11 @@ SELECT * FROM refresh_forms(
   $p$id = 3$p$,
   $m$UPDATE inj6_base SET v = %s$m$,
   $r$SELECT string_agg(id || '=' || v, ' ' ORDER BY id) FROM inj6_mv$r$);
-   form    |    contents     
------------+-----------------
- bare      | 1=10 2=20 3=901
- spi       | 1=10 2=20 3=902
- querytree | 1=10 2=20 3=903
-(3 rows)
+ form |    contents     
+------+-----------------
+ bare | 1=10 2=20 3=901
+ conc | 1=10 2=20 3=902
+(2 rows)
 
 --
 -- Test 7: real relations named after every name the generated statements use
@@ -339,12 +317,11 @@ SELECT * FROM refresh_forms(
   $m$WITH d AS (DELETE FROM inj7_base WHERE id = 2 + %2$s RETURNING 1)
      UPDATE inj7_base SET v = %1$s WHERE id = 1$m$,
   $r$SELECT string_agg(id || '=' || v, ' ' ORDER BY id) FROM inj7_mv$r$);
-   form    |       contents        
------------+-----------------------
- bare      | 1=901 2=2 4=4 5=5 6=6
- spi       | 1=902 2=2 5=5 6=6
- querytree | 1=903 2=2 6=6
-(3 rows)
+ form |       contents        
+------+-----------------------
+ bare | 1=901 2=2 4=4 5=5 6=6
+ conc | 1=902 2=2 5=5 6=6
+(2 rows)
 
 -- No negative ids anywhere; none of the shadowed tables was read or written.
 SELECT 'new_data' AS t, count(*) FROM new_data
@@ -388,12 +365,11 @@ SELECT * FROM refresh_forms(
   $r$SELECT string_agg(id || ':' || mv || ',' || nd || ',' || new_data
                        || ',' || tid || ',' || newdata, ' ' ORDER BY id)
        FROM inj8_mv$r$);
-   form    |               contents                
------------+---------------------------------------
- bare      | 1:1,1,1,1,1 2:2,901,2,2,2 3:3,3,3,3,3
- spi       | 1:1,1,1,1,1 2:2,902,2,2,2 3:3,3,3,3,3
- querytree | 1:1,1,1,1,1 2:2,903,2,2,2 3:3,3,3,3,3
-(3 rows)
+ form |               contents                
+------+---------------------------------------
+ bare | 1:1,1,1,1,1 2:2,901,2,2,2 3:3,3,3,3,3
+ conc | 1:1,1,1,1,1 2:2,902,2,2,2 3:3,3,3,3,3
+(2 rows)
 
 --
 -- Test 9: a hostile name on the MATCH/MERGE path

@@ -267,12 +267,11 @@ SELECT * FROM mv_c4 ORDER BY id;
 -- and never re-reads cacheEntry, so the freed plan keeps executing and the
 -- damage surfaces as a garbage query_string or a crash -- neither of which can
 -- be written into an expected file.  The classic arm is coverage of the nested
--- path, not a detector.  If the Query-tree path is ever removed, this test
--- stops asserting anything and needs rebuilding, not deleting.
+-- path, not a detector.  If the cache stops being reused across nested
+-- refreshes, this test stops asserting anything and needs rebuilding, not
+-- deleting.
 --
--- The classic path: predicate deparsed into SQL text, plans built by
--- SPI_prepare over that text.
-SET matview_partial_refresh_querytree = off;
+-- Without the row comparison, so the upsert rewrites every matched row.
 SET matview_partial_refresh_optimized = off;
 UPDATE mv_c4_base SET v = 102 WHERE id = 2;
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c4 WHERE id = 2;
@@ -284,11 +283,9 @@ UPDATE mv_c4_base SET v = 103 WHERE id = 3;
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c4 WHERE id = 3;
 SELECT * FROM mv_c4 ORDER BY id;
 
--- The Query-tree path.  Before the fix this reported "cannot change
--- materialized view mv_c4_inner" from a refresh of mv_c4: the enclosing
--- refresh had picked up the nested one's plan out of the reused entry.
-SET matview_partial_refresh_querytree = on;
-SET matview_partial_refresh_optimized = on;
+-- And with it.  Before the fix this reported "cannot change materialized view
+-- mv_c4_inner" from a refresh of mv_c4: the enclosing refresh had picked up the
+-- nested one's plan out of the reused entry.
 UPDATE mv_c4_base SET v = 104 WHERE id = 4;
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c4 WHERE id = 4;
 SELECT * FROM mv_c4 ORDER BY id;
@@ -297,7 +294,6 @@ UPDATE mv_c4_base SET v = 105 WHERE id = 5;
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c4 WHERE id = 5;
 SELECT * FROM mv_c4 ORDER BY id;
 
-RESET matview_partial_refresh_querytree;
 RESET matview_partial_refresh_optimized;
 
 -- The nested refresh never committed anything, and must not have: it failed at
@@ -315,10 +311,9 @@ DROP TABLE mv_c4_inner_base;
 --
 -- The entry is reused when the arbiter index, the deparsed predicate and the
 -- argument types all match.  None of those describes the statement the plans
--- were built from, and two settings change it: matview_partial_refresh_querytree
--- picks where the source rows come from, and matview_partial_refresh_optimized
--- decides whether the upsert carries the row comparison that lets it skip a row
--- nothing changed about.  Both are in the key.
+-- were built from, and matview_partial_refresh_optimized changes it: it decides
+-- whether the upsert carries the row comparison that lets it skip a row nothing
+-- changed about.  So it is in the key.
 --
 -- Without them a plan prepared under one setting is reused under the other for
 -- the rest of the session, and reused silently: the stale plan is still valid
@@ -345,13 +340,12 @@ DROP TABLE mv_c4_inner_base;
 -- Verified as a detector rather than assumed: under O2 all three rows come
 -- back t.
 --
--- Disposition: DELETE with the two developer GUCs, as part of the Phase 4
+-- Disposition: DELETE with the remaining developer GUC, as part of the Phase 4
 -- removal -- unless the cache has by then acquired another input that changes
 -- the generated SQL.  If it has, rewrite this around that instead of deleting
--- it: the rule outlives the flags that illustrate it.
+-- it: the rule outlives the flag that illustrates it.
 --
 
-SET matview_partial_refresh_querytree = on;
 SET matview_partial_refresh_optimized = on;
 
 CREATE TABLE mv_c5_base (id int primary key, v int);
@@ -384,4 +378,3 @@ DROP MATERIALIZED VIEW mv_c5;
 DROP TABLE mv_c5_base;
 
 RESET matview_partial_refresh_optimized;
-RESET matview_partial_refresh_querytree;

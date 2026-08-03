@@ -62,8 +62,7 @@
 #include "utils/tuplestore.h"
 
 
-/* See matview.h.  Branch-local scaffolding for the Query-tree rewrite. */
-bool		matview_partial_refresh_querytree = false;
+/* See matview.h.  Branch-local scaffolding for the Phase 3 optimisations. */
 bool		matview_partial_refresh_optimized = false;
 
 /*
@@ -116,13 +115,6 @@ typedef struct MatViewPartialRefreshCache
 								 * when these plans were built?  It changes the
 								 * generated SQL, so a plan built one way is
 								 * wrong for the other */
-
-	bool		querytree;		/* was matview_partial_refresh_querytree set
-								 * when these plans were built?  The two paths
-								 * generate different SQL -- one evaluates the
-								 * view inline, the other reads it from a
-								 * registered tuplestore -- so a plan built for
-								 * one is wrong for the other */
 
 	/* The cached plans */
 	SPIPlanPtr	lockPlan;		/* SELECT ... FOR NO KEY UPDATE */
@@ -1540,12 +1532,13 @@ matview_materialize_source(CachedPlanSource *plansource, ParamListInfo params,
  *    the results into the matview, and deletes rows that no longer match
  *    the predicate (via anti-join against the fresh query output).
  *
- * With matview_partial_refresh_querytree set, step 2 changes shape: the view
- * is evaluated from its Query tree into a tuplestore, which is registered as
- * an ephemeral named relation and read by the same fused statement in place of
- * the CTE.  The view's SQL text disappears from the generated statement, and
- * with it every hazard that came from re-parsing deparsed SQL in a different
- * naming environment than the one it was written in.
+ * Step 2's source rows are the view evaluated from its Query tree into a
+ * tuplestore, registered as an ephemeral named relation and read by the fused
+ * statement.  The view's SQL text does not appear in the generated statement at
+ * all, and with it goes every hazard that came from re-parsing deparsed SQL in
+ * a different naming environment than the one it was written in.  An earlier
+ * revision could instead inline the view as a MATERIALIZED CTE, selected by a
+ * GUC so the two could be compared at run time; that path is gone.
  *
  * Both halves of the fused statement then read one physically materialised
  * tuplestore rather than one materialised CTE, so they still cannot disagree
@@ -1578,9 +1571,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	uint64		result_processed = 0;
 	int			old_depth;
 	Oid			old_relid;
-	bool		use_querytree = matview_partial_refresh_querytree;
-	bool		use_optimized = matview_partial_refresh_querytree &&
-		matview_partial_refresh_optimized;
+	bool		use_optimized = matview_partial_refresh_optimized;
 	int			nkeyatts = 0;
 	int16	   *keyattnums = NULL;
 	Tuplestorestate *sourceStore = NULL;
@@ -1691,7 +1682,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	 */
 	if (found &&
 		cacheEntry->uniqueIndexOid == uniqueIndexOid &&
-		cacheEntry->querytree == use_querytree &&
 		cacheEntry->optimized == use_optimized &&
 		cacheEntry->whereClauseStr != NULL &&
 		whereClauseStr != NULL &&
@@ -1724,7 +1714,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		cacheEntry->whereClauseStr = NULL;
 		cacheEntry->nargs = 0;
 		cacheEntry->argtypes = NULL;
-		cacheEntry->querytree = use_querytree;
 		cacheEntry->optimized = use_optimized;
 		cacheEntry->invalid = false;
 	}
@@ -1744,7 +1733,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	 * tuplestore is registered empty here and filled further down.  Nothing
 	 * reads it in between.
 	 */
-	if (use_querytree)
 	{
 		Relation	indexRel = index_open(uniqueIndexOid, AccessShareLock);
 		Form_pg_index indexStruct = indexRel->rd_index;
@@ -1775,7 +1763,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	if (cacheEntry->lockPlan == NULL || cacheEntry->refreshPlan == NULL)
 	{
 		StringInfoData buf;
-		char	   *view_sql;
 		char	   *matview_name;
 		const char *matview_alias;
 		Oid		   *argtypes = NULL;
@@ -1798,14 +1785,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		matview_name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
 												  RelationGetRelationName(matviewRel));
 		matview_alias = quote_identifier(RelationGetRelationName(matviewRel));
-
-		/*
-		 * The deparse is the thing this rewrite exists to remove: it renders
-		 * the view as SQL text that then has to be re-parsed in whatever
-		 * naming environment the refresh happens to run in.  On the Query-tree
-		 * path nothing asks for it.
-		 */
-		view_sql = use_querytree ? NULL : get_matview_view_query(matviewOid);
 
 		if (params && params->numParams > 0)
 		{
@@ -1989,21 +1968,13 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		resetStringInfo(&buf);
 
 		/*
-		 * Where the source rows come from.  Both spellings give the fused
-		 * statement one "new_data" that the upsert and the prune each read,
-		 * and that both see identically: a CTE the planner is told to
-		 * materialise, or a tuplestore that was materialised before the
-		 * statement started.
+		 * The source rows are the registered tuplestore, materialised before
+		 * this statement started, which the upsert and the prune each read and
+		 * both see identically.  An earlier revision could instead inline the
+		 * view as a MATERIALIZED CTE; that path is gone, and with it the only
+		 * caller that needed the view deparsed to text.
 		 */
-		if (use_querytree)
-			appendStringInfoString(&buf, "WITH ");
-		else
-			appendStringInfo(&buf,
-							 "WITH new_data AS MATERIALIZED ( "
-							 "  SELECT * FROM (%s) %s WHERE (%s) ORDER BY %s "
-							 "), ",
-							 view_sql, matview_alias, whereClauseStr,
-							 conflict_cols.data);
+		appendStringInfoString(&buf, "WITH ");
 
 		appendStringInfo(&buf,
 						 "upsert AS ( "
@@ -2049,7 +2020,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		{
 			oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
 			cacheEntry->uniqueIndexOid = uniqueIndexOid;
-			cacheEntry->querytree = use_querytree;
 			cacheEntry->whereClauseStr = pstrdup(whereClauseStr);
 			cacheEntry->nargs = nargs;
 			if (nargs > 0)
@@ -2063,8 +2033,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		}
 
 		pfree(matview_name);
-		if (view_sql != NULL)
-			pfree(view_sql);
 		pfree(buf.data);
 		pfree(conflict_cols.data);
 		pfree(set_clause.data);
@@ -2090,7 +2058,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	 */
 	INJECTION_POINT("matview-where-locked", NULL);
 
-	if (use_querytree)
 	{
 		Query	   *sourceQuery;
 		Snapshot	snapshot;
@@ -2159,9 +2126,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 
 		PopActiveSnapshot();
 	}
-	else if (matview_execute_spi_plan(cacheEntry->refreshPlan, params,
-									  InvalidSnapshot, false) < 0)
-		elog(ERROR, "SPI_execute_plan failed during refresh");
 
 	/*
 	 * The statement returns one row holding the number of rows upserted plus

@@ -721,7 +721,6 @@ INSERT INTO mv_null_base VALUES (1, NULL), (2, 20), (3, NULL), (4, 40);
 CREATE MATERIALIZED VIEW mv_null AS SELECT id, v FROM mv_null_base;
 CREATE UNIQUE INDEX ON mv_null(id);
 
-SET matview_partial_refresh_querytree = on;
 SET matview_partial_refresh_optimized = on;
 
 -- NULL -> value.  Under `<>` the comparison is NULL, the row is not updated,
@@ -743,7 +742,6 @@ UPDATE mv_null_base SET v = NULL WHERE id = 3;
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_null WHERE id = 3;
 SELECT id, v FROM mv_null ORDER BY id;
 
-RESET matview_partial_refresh_querytree;
 RESET matview_partial_refresh_optimized;
 
 DROP MATERIALIZED VIEW mv_null;
@@ -778,7 +776,6 @@ DROP TABLE mv_null_base;
 -- The promise outlives the flag.
 --
 
-SET matview_partial_refresh_querytree = on;
 SET matview_partial_refresh_optimized = on;
 
 CREATE TABLE mv_rowver_base (id int primary key, v int, note text);
@@ -806,4 +803,3 @@ DROP MATERIALIZED VIEW mv_rowver;
 DROP TABLE mv_rowver_base;
 
 RESET matview_partial_refresh_optimized;
-RESET matview_partial_refresh_querytree;

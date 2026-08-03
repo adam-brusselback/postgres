@@ -22,16 +22,8 @@
 
 
 /*
- * Build a partial refresh's source rows from the view's Query tree instead of
- * from its deparsed SQL text.  Scaffolding: it exists so that the two
- * implementations can be compared against each other at run time while the
- * rewrite is in progress, and goes away with the text path.
- */
-extern PGDLLIMPORT bool matview_partial_refresh_querytree;
-
-/*
- * Apply the Phase 3 optimisations.  Only meaningful with the above; like it,
- * this exists so both can run in one binary and be measured against each
+ * Apply the Phase 3 optimisations.  Scaffolding: this exists so both can run
+ * in one binary and be measured against each
  * other, and goes away when the optimisations are no longer optional.
  */
 extern PGDLLIMPORT bool matview_partial_refresh_optimized;

@@ -812,7 +812,6 @@ CREATE TABLE mv_null_base (id int PRIMARY KEY, v int);
 INSERT INTO mv_null_base VALUES (1, NULL), (2, 20), (3, NULL), (4, 40);
 CREATE MATERIALIZED VIEW mv_null AS SELECT id, v FROM mv_null_base;
 CREATE UNIQUE INDEX ON mv_null(id);
-SET matview_partial_refresh_querytree = on;
 SET matview_partial_refresh_optimized = on;
 -- NULL -> value.  Under `<>` the comparison is NULL, the row is not updated,
 -- and id 1 stays NULL.
@@ -854,7 +853,6 @@ SELECT id, v FROM mv_null ORDER BY id;
   4 | 40
 (4 rows)
 
-RESET matview_partial_refresh_querytree;
 RESET matview_partial_refresh_optimized;
 DROP MATERIALIZED VIEW mv_null;
 DROP TABLE mv_null_base;
@@ -886,7 +884,6 @@ DROP TABLE mv_null_base;
 -- already-current scope cheap, and it is the reason a drain can be run often.
 -- The promise outlives the flag.
 --
-SET matview_partial_refresh_querytree = on;
 SET matview_partial_refresh_optimized = on;
 CREATE TABLE mv_rowver_base (id int primary key, v int, note text);
 INSERT INTO mv_rowver_base SELECT g, g * 10, 'n' || g FROM generate_series(1, 5) g;
@@ -924,4 +921,3 @@ DROP TABLE mv_rowver_was;
 DROP MATERIALIZED VIEW mv_rowver;
 DROP TABLE mv_rowver_base;
 RESET matview_partial_refresh_optimized;
-RESET matview_partial_refresh_querytree;
