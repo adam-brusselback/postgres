@@ -9,9 +9,9 @@
 # scope is orphaned.  The counts alone are not enough -- the qual must also read
 # only the arbiter key's columns, or a matview row can carry a source row's key
 # without satisfying the predicate and the two errors cancel.  matview_where
-# Test 19 is the single-session detector for that half.
+# Test 18 is the single-session detector for that half.
 #
-# What Test 19 structurally cannot see is that n_locked is measured under an
+# What Test 18 structurally cannot see is that n_locked is measured under an
 # EARLIER SNAPSHOT than the DELETE it stands in for.  The pre-lock takes its
 # own; the source evaluation and the DML then take another, and they have to be
 # in that order -- a refresh that queued behind another would otherwise evaluate

@@ -369,12 +369,19 @@ SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 -- Track the total number of rows affected by a partial
 -- REFRESH MATERIALIZED VIEW
 --
--- Both partial refresh forms report the number of rows they wrote to the
--- matview.  The two forms reach the same end state by different means, so the
--- counts differ for the same logical change: the diff/merge form used by the
--- bare spelling applies a changed row as a delete plus an insert, while the
--- upsert form used by CONCURRENTLY updates it in place.  Rows that simply
--- disappear cost one write either way.
+-- A partial refresh reports the number of rows it wrote to the matview.  Two
+-- algorithms can do that work and they reach the same end state by different
+-- means, so one logical change costs a different number of writes under each:
+-- match/merge applies a changed row as a delete plus an insert, while the
+-- upsert updates it in place.  Rows that simply disappear cost one write
+-- either way.
+--
+-- Which algorithm runs is decided by how many unique indexes the matview
+-- carries, and not by whether CONCURRENTLY was written.  The upsert has to
+-- arbitrate on a single index, so a matview with a second one takes match/merge
+-- whichever way the command is spelled.  Both spellings are run against both
+-- shapes below, which is what says so: the counts pair by matview, not by
+-- spelling.
 --
 -- Disposition: keep.  This belongs with the rows-tracking cases above; the
 -- count is part of the command's contract, not scaffolding.
@@ -385,15 +392,30 @@ CREATE UNIQUE INDEX ON pgss_pr_matv (a);
 UPDATE pgss_pr_base SET b = 'w' WHERE a <= 3;
 DELETE FROM pgss_pr_base WHERE a >= 9;
 
+-- The second unique index is on a column the updates below leave alone, so it
+-- changes which algorithm runs and nothing else.
+CREATE TABLE pgss_pr_base2 AS
+  SELECT a, a * 100 AS c, 'v'::text AS b FROM generate_series(1, 10) a;
+CREATE MATERIALIZED VIEW pgss_pr_matv2 AS SELECT a, c, b FROM pgss_pr_base2;
+CREATE UNIQUE INDEX ON pgss_pr_matv2 (a);
+CREATE UNIQUE INDEX ON pgss_pr_matv2 (c);
+UPDATE pgss_pr_base2 SET b = 'w' WHERE a <= 3;
+
 SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
--- diff/merge form: three changed rows are applied as 3 deletes + 3 inserts.
+-- One unique index, so both spellings take the upsert: three changed rows are
+-- updated in place, so 3 writes each.
 REFRESH MATERIALIZED VIEW pgss_pr_matv WHERE a <= 3;
--- ... and two vanished rows as 2 deletes.
+-- ... and two vanished rows cost 2 deletes.
 REFRESH MATERIALIZED VIEW pgss_pr_matv WHERE a >= 9;
--- upsert form: the same changed rows are updated in place, so 3 writes.
 UPDATE pgss_pr_base SET b = 'x' WHERE a <= 3;
 REFRESH MATERIALIZED VIEW CONCURRENTLY pgss_pr_matv WHERE a <= 3;
+
+-- Two unique indexes, so both spellings take match/merge: the same three
+-- changed rows become 3 deletes plus 3 inserts, so 6 writes each.
+REFRESH MATERIALIZED VIEW pgss_pr_matv2 WHERE a <= 3;
+UPDATE pgss_pr_base2 SET b = 'x' WHERE a <= 3;
+REFRESH MATERIALIZED VIEW CONCURRENTLY pgss_pr_matv2 WHERE a <= 3;
 
 SELECT calls, rows, query FROM pg_stat_statements
   WHERE query LIKE 'REFRESH MATERIALIZED VIEW%pgss_pr_matv%'
@@ -401,6 +423,8 @@ SELECT calls, rows, query FROM pg_stat_statements
 
 DROP MATERIALIZED VIEW pgss_pr_matv;
 DROP TABLE pgss_pr_base;
+DROP MATERIALIZED VIEW pgss_pr_matv2;
+DROP TABLE pgss_pr_base2;
 
 SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 

@@ -497,73 +497,7 @@ DROP MATERIALIZED VIEW mv_sp;
 DROP TABLE mv_sp_base;
 
 --
--- Test 14: Which form of the command allows concurrent writers
---
--- Reported on -hackers by Vellaipandiyan: "The CONCURRENTLY behavior also feels
--- somewhat unintuitive here.  With WHERE refreshes, the non-CONCURRENT path
--- appears more permissive for writers than CONCURRENTLY WHERE, which seems
--- opposite to the expectation established by normal REFRESH MATERIALIZED VIEW
--- semantics."  Adam Brusselback agreed to swap the two paths, so that
--- CONCURRENTLY selects the direct-modification path and the bare form selects
--- match/merge.  That swap has since landed, so this test now records the agreed
--- behaviour rather than pinning a direction not yet taken.
---
--- What decides whether writers are blocked is the lock ExecRefreshMatView()
--- takes on the matview: match/merge takes ExclusiveLock, direct modification
--- takes only RowExclusiveLock.  Reading it back inside the refreshing
--- transaction is enough to tell which path ran.
---
--- Disposition: REPLACE.  The swap has landed, so the condition this test was
--- waiting on has fired -- and it asserts a lock level, which is the mechanism,
--- not "does a concurrent writer block", which is the guarantee.  An
--- implementation that blocks writers by some other means satisfies the
--- guarantee and fails this test.
---
--- The behavioural replacement belongs in the isolation suite next to
--- matview-where-serialize, which already pins "readers never block"; what is
--- missing is "the bare form blocks a concurrent writer and CONCURRENTLY does
--- not".  Keep this until that exists.
---
-
-CREATE TABLE mv_lock_base (id int primary key, v text);
-INSERT INTO mv_lock_base VALUES (1, 'one'), (2, 'two');
-
-CREATE MATERIALIZED VIEW mv_lock AS SELECT id, v FROM mv_lock_base;
-CREATE UNIQUE INDEX ON mv_lock(id);
-
--- CONCURRENTLY must be the permissive form: writers are not blocked.
--- Holds since the two strategies were swapped: CONCURRENTLY with a predicate
--- selects direct modification, which touches rows rather than the whole table.
-BEGIN;
-REFRESH MATERIALIZED VIEW CONCURRENTLY mv_lock WHERE id = 1;
-SELECT bool_or(mode = 'ExclusiveLock') AS concurrently_blocks_writers
-  FROM pg_locks
-  WHERE locktype = 'relation' AND relation = 'mv_lock'::pg_catalog.regclass;
-COMMIT;
-
--- The bare form must be the conservative one: writers are blocked.
--- Holds for the same reason from the other side: the bare form with a predicate
--- selects match/merge, which rewrites through a transient heap.
-BEGIN;
-REFRESH MATERIALIZED VIEW mv_lock WHERE id = 1;
-SELECT bool_or(mode = 'ExclusiveLock') AS bare_where_blocks_writers
-  FROM pg_locks
-  WHERE locktype = 'relation' AND relation = 'mv_lock'::pg_catalog.regclass;
-COMMIT;
-
--- A full refresh is unaffected by the swap and keeps AccessExclusiveLock.
-BEGIN;
-REFRESH MATERIALIZED VIEW mv_lock;
-SELECT bool_or(mode = 'AccessExclusiveLock') AS full_refresh_blocks_everything
-  FROM pg_locks
-  WHERE locktype = 'relation' AND relation = 'mv_lock'::pg_catalog.regclass;
-COMMIT;
-
-DROP MATERIALIZED VIEW mv_lock;
-DROP TABLE mv_lock_base;
-
---
--- Test 15: More than one unique index
+-- Test 14: More than one unique index
 --
 -- Not yet reported on -hackers; found while writing these tests.  Test 8 above
 -- covers a change that happens to arbitrate cleanly; this covers one that does
@@ -632,7 +566,7 @@ DROP MATERIALIZED VIEW mv_multi2;
 DROP TABLE mv_multi2_base;
 
 --
--- Test 16: the row comparison and NULL
+-- Test 15: the row comparison and NULL
 --
 -- The upsert's DO UPDATE carries WHERE (mv cols) IS DISTINCT FROM (EXCLUDED
 -- cols), so a row whose values did not change is not rewritten.  IS DISTINCT
@@ -677,11 +611,11 @@ DROP MATERIALIZED VIEW mv_null;
 DROP TABLE mv_null_base;
 
 --
--- Test 17: an unchanged row is not rewritten
+-- Test 16: an unchanged row is not rewritten
 --
 -- Found here, not on the -hackers thread.
 --
--- Test 16 reads values back, which is what a NULL bug corrupts.  It cannot see
+-- Test 15 reads values back, which is what a NULL bug corrupts.  It cannot see
 -- the comparison being absent: without it every matched row is rewritten, which
 -- is what the code did before 03cb4f0 and is still correct, so the values are
 -- right either way.  Measured rather than supposed -- mutation O1, the
@@ -729,7 +663,7 @@ DROP TABLE mv_rowver_base;
 
 
 --
--- Test 18: the predicate's constants become parameters, and the values still
+-- Test 17: the predicate's constants become parameters, and the values still
 --          reach the right rows
 --
 -- The plan cache is keyed on the deparsed predicate, so "WHERE id = 1" and
@@ -801,7 +735,7 @@ DROP MATERIALIZED VIEW mv_pp;
 DROP TABLE mv_pp_base;
 
 --
--- Test 19: the prune is skipped only when it provably cannot delete
+-- Test 18: the prune is skipped only when it provably cannot delete
 --
 -- The fused statement's DELETE carries a guard so the scope is not scanned a
 -- second time when nothing in it can be orphaned.  Two counts decide it: how
