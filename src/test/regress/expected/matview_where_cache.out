@@ -431,3 +431,57 @@ DROP TABLE mv_c5_was;
 DROP MATERIALIZED VIEW mv_c5;
 DROP TABLE mv_c5_base;
 RESET matview_partial_refresh_optimized;
+--
+-- Test 7: The predicate itself is part of the cache key
+--
+-- Tests 1 to 4 all cover ways the key can be right and the plans still wrong --
+-- a rename underneath it, a parameter type it cannot see.  None of them covers
+-- the key simply not looking at the predicate, and that is the thing it is for:
+-- two different predicates on one matview must not share plans.
+--
+-- Found by mutation, not by reading.  `mutations.py C7` drops the predicate
+-- from the comparison and every instrument in the tree stayed quiet -- regress
+-- 5/5, the differential oracle's vector identical to the recorded baseline, and
+-- fuzz.sh PASS on all four modes.  Nothing anywhere refreshed one matview
+-- through two different predicates in one session, so nothing could have seen
+-- it.  Same shape as B22 and B30: a clean run meaning an absent test.
+--
+-- The two predicates are chosen so a confusion is not merely visible but
+-- inverted.  Both carry a single int4 constant, so the argument types match and
+-- the key's other terms cannot do this one's job; and grp = 3 names rows 1 and
+-- 2 while the warmed plan, id = $1 executed with 3, names row 3.  So the wrong
+-- answer refreshes exactly the rows the right one leaves alone, which no
+-- rounding of "it did nothing" can produce.
+--
+-- No DDL between the two refreshes, for Test 6's reason: any relcache
+-- invalidation discards the entry this case exists to reuse, and the plans are
+-- then rebuilt correctly by accident.
+--
+-- Verified as a detector: under C7 rows 1 and 2 keep their pre-update values
+-- and row 3 is the one that moves.
+--
+-- Disposition: keep.  It asserts that a refresh acts on the rows its own
+-- predicate names, which holds however the plans are or are not cached, and
+-- says nothing about how the key is built.
+--
+CREATE TABLE mv_c6_base (id int primary key, grp int, v text);
+INSERT INTO mv_c6_base VALUES (1, 3, 'a'), (2, 3, 'b'), (3, 9, 'c');
+CREATE MATERIALIZED VIEW mv_c6 AS SELECT id, grp, v FROM mv_c6_base;
+CREATE UNIQUE INDEX ON mv_c6(id);
+-- Warm the entry with a predicate on the key column.
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c6 WHERE id = 1;
+UPDATE mv_c6_base SET v = v || '-new';
+-- A different predicate, on a different column, with the same argument types.
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c6 WHERE grp = 3;
+-- Rows 1 and 2 are the ones grp = 3 names, so they are the ones that refresh;
+-- row 3 keeps its stale value.
+SELECT * FROM mv_c6 ORDER BY id;
+ id | grp |   v   
+----+-----+-------
+  1 |   3 | a-new
+  2 |   3 | b-new
+  3 |   9 | c
+(3 rows)
+
+DROP MATERIALIZED VIEW mv_c6;
+DROP TABLE mv_c6_base;

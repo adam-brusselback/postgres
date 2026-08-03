@@ -303,6 +303,25 @@ MUTATIONS = {
                 '\t\tctx->consts = lcons(con, ctx->consts);', 1),
            ]),
 
+    # The predicate stops being part of the cache key, so the second of two
+    # different predicates on one matview executes the first one's plans.  That
+    # is B1's failure mode -- "the refresh reports success and acts on rows its
+    # predicate does not name" -- reached through the key rather than through a
+    # rename, and it is the property the key exists for at all.
+    #
+    # Deliberately the whole term rather than a subtle weakening: the question
+    # this calibrates is whether ANY instrument in the tree notices the key
+    # ignoring the predicate, and a weakening that only some predicates trip
+    # would not answer it.
+    'C7': ('-', 'data',
+           'the plan cache key ignores the predicate '
+           '(a second, different predicate reuses the first one\'s plans)', [
+               ('\t\tcacheEntry->whereClauseStr != NULL &&\n'
+                '\t\twhereClauseStr != NULL &&\n'
+                '\t\tstrcmp(cacheEntry->whereClauseStr, whereClauseStr) == 0 &&\n',
+                '', 1),
+           ]),
+
     # The leak, as distinct from C3's crash.  C3 keeps the old plansource *and*
     # keeps using it, which segfaults; this forgets it instead -- the pointer is
     # cleared, so nothing stale is ever dereferenced and the plansource simply
