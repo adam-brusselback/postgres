@@ -67,14 +67,21 @@ mvp_report(void)
 EDITS = [
     ('#include "utils/tuplestore.h"', PROLOGUE),
 
+    # Two edits rather than one, because parameterizeRefreshWhereClause() landed
+    # between the transform and the deparse in d20f396 and this pattern silently
+    # stopped matching.  Anchored on each call separately now, so the next thing
+    # inserted between them cannot take the pair down with it.  The
+    # parameterisation itself is counted under neither: it is a walk of a
+    # just-parsed tree, and giving it a timer would need a phase slot.
     ("""		qual = transformRefreshWhereClause(matviewOid, whereClause, params,
-										   save_userid);
-		qual_str = deparseRefreshWhereClause(matviewOid, qual);""",
+										   save_userid);""",
      """		MVP_START(MVP_TRANSFORM);
 		qual = transformRefreshWhereClause(matviewOid, whereClause, params,
 										   save_userid);
-		MVP_STOP(MVP_TRANSFORM);
-		MVP_START(MVP_DEPARSE);
+		MVP_STOP(MVP_TRANSFORM);"""),
+
+    ("""		qual_str = deparseRefreshWhereClause(matviewOid, qual);""",
+     """		MVP_START(MVP_DEPARSE);
 		qual_str = deparseRefreshWhereClause(matviewOid, qual);
 		MVP_STOP(MVP_DEPARSE);"""),
 
@@ -115,13 +122,13 @@ EDITS = [
 	{
 		MVP_START(MVP_PREPARE);"""),
 
-    ("""		pfree(join_clause.data);
-		if (argtypes != NULL)
+    ("""		if (argtypes != NULL)
 			pfree(argtypes);
+		pfree(dml_argtypes);
 	}""",
-     """		pfree(join_clause.data);
-		if (argtypes != NULL)
+     """		if (argtypes != NULL)
 			pfree(argtypes);
+		pfree(dml_argtypes);
 		MVP_STOP(MVP_PREPARE);
 	}"""),
 
@@ -176,26 +183,25 @@ EDITS = [
 	MVP_STOP(MVP_SRCEXEC);
 	return processed;"""),
 
-    ("""		if (matview_execute_spi_plan(cacheEntry->refreshPlan, params,
-									 snapshot, false) < 0)
-			elog(ERROR, "SPI_execute_plan failed during refresh");""",
+    # The call site grew the prune guard's parameters, so this is anchored on the
+    # two lines that bracket it rather than on the argument list.  Note what the
+    # timer therefore includes: building the guard's ParamListInfo, which is a
+    # handful of assignments, and the guard's own evaluation inside the
+    # statement, which is where the saving shows up.
+    ("""		if (matview_execute_spi_plan(cacheEntry->refreshPlan,""",
      """		MVP_START(MVP_DMLEXEC);
-		if (matview_execute_spi_plan(cacheEntry->refreshPlan, params,
-									 snapshot, false) < 0)
-			elog(ERROR, "SPI_execute_plan failed during refresh");
+		if (matview_execute_spi_plan(cacheEntry->refreshPlan,"""),
+
+    ("""			elog(ERROR, "SPI_execute_plan failed during refresh");""",
+     """			elog(ERROR, "SPI_execute_plan failed during refresh");
 		MVP_STOP(MVP_DMLEXEC);"""),
 
-    ("""	else if (matview_execute_spi_plan(cacheEntry->refreshPlan, params,
-									  InvalidSnapshot, false) < 0)
-		elog(ERROR, "SPI_execute_plan failed during refresh");""",
-     """	else
-	{
-		MVP_START(MVP_DMLEXEC);
-		if (matview_execute_spi_plan(cacheEntry->refreshPlan, params,
-									 InvalidSnapshot, false) < 0)
-			elog(ERROR, "SPI_execute_plan failed during refresh");
-		MVP_STOP(MVP_DMLEXEC);
-	}"""),
+    # There used to be a second DMLEXEC edit here, for the text path's own
+    # execution of the fused statement.  That path was deleted in 82f71d8 and
+    # this edit has been unmatchable ever since -- it was one of the four --check
+    # reported, and the only reason it was noticed is that --check reports every
+    # miss rather than the first.  Removed rather than re-anchored: there is
+    # nothing left for it to time.
 
     ("""	CloseMatViewIncrementalMaintenance();
 	Assert(matview_maintenance_depth == old_depth);
