@@ -47,7 +47,7 @@ Two traps worth naming, because both have caught this document before:
 | **heap state** | never-updated · settled · bloated | nothing about the code — it decides the *measured* value of everything above | measured, `bench/heapstate.sh`: one comparison reads **"54% faster" or "82% faster"** on identical code, data and boot. Neither number is better than the other; **54% is the honest one.** At zero churn only the un-optimized arm writes, so free space, full-page images, extension and bloat all land on one side of the ratio, and a matview `bench_setup` has just built is that arm's worst case |
 | **driver pattern** | D1 statement trigger · D2 queue drain · D3 scheduled window | frequency, transaction context, and the priors for every axis above | measured, `--perxact`, as **D1's throughput over D2's — above 1× D1 wins, below 1× it loses**: **3.5–3.7×** at scope 1, **2.1–3.1×** at scope 10, **1.25–1.9×** at scope 100, then it *inverts* to **0.47× (2.1× slower)** at scope 1000 and **0.30× (3.3× slower)** at scope 10000. Twenty rewrites of one scope inside one transaction build update chains nothing can prune until it commits. D1 is not "D2 minus the commit" |
 | **overlap probability** | none · concurrent-disjoint · concurrent-overlapping | whether the lock and its ordering buy anything | measured, 54 cells. Correctness first, **lower is better and all three are zero**: no deadlocks, no failed transactions, no serialization failures. Then throughput at 4 clients over 1, **higher is better**: disjoint scopes reach **3.4–5.9×**, flattening by 16 clients. Overlapping scopes go the other way — `nonkey` range/scope 1000 hot falls **161 → 141 → 26 tps** at 1 → 4 → 16 clients, which is the lock serialising on purpose, not a defect |
-| **mutability** | append-only · no-delete · general | whether the prune exists at all | measured, `bench/mutability.sql`, **on top of the row comparison rather than instead of it** — these do not add to the figures above, they are what is left after them. Dropping the prune (`no_delete`) is **13–19% faster** at scope ≥1000, and only **1.1% faster** on `expensive`, where GIN maintenance dominates. `DO NOTHING` (`append_only`) adds **10–22 points** on top, reaching **26–39% faster** in total |
+| **mutability** | append-only · no-delete · general | whether the prune exists at all | measured, `bench/mutability.sql`, **on top of the row comparison rather than instead of it** — these do not add to the figures above, they are what is left after them. Dropping the prune (`no_delete`) is **13–19% faster** at scope ≥1000, and only **1.1% faster** on `expensive`, where GIN maintenance dominates.  **Those are model figures**; measured on the implementation it is **10.9% at scope 1000 and 13.7% at scope 10000** (R42), bare form only — see §3b-ii for why. `DO NOTHING` (`append_only`) adds **10–22 points** on top, reaching **26–39% faster** in total |
 
 What mutability turns on is whether the view's output *for a scope* can lose a
 row: **no-delete** kills the prune and keeps `DO UPDATE`, removing the anti-join
@@ -196,7 +196,7 @@ is better everywhere in it, and a *slower* entry is spelled out as such.
 | **parameterise predicate `Const`s** — *implemented*; each Const becomes a `Param` of the same type, typmod and collation before the deparse, and the values ride the `ParamListInfo` the path already carried | — | **8× in-backend** (R15), **0.3-45.3% end to end across 40 paired cells, none slower** (R37).  It turns refreshes that would miss the plan cache into hits | oracle, plus `matview_where` Test 19 for the values reaching the right rows and `matview_where_source_plan` part 3 for the plan actually being reused.  Changes what the cache key *is*, so it lands first or last, never in the middle |
 | **skip the prune** when the source is **empty** — the non-empty case is now covered by derived `no_delete` below, which needs no at-most-one-row proof | 1 + 2 | unmeasured. It is the mirror of the row above — the row-trigger delete path — and it applies at *any* scope | **none yet** — see 3c |
 | **drop the pre-lock's `ORDER BY`** — *not* the source's, and gated on the **lock level**, not on index alignment | 1 | **Measured directly on the pre-lock: 20–69% of it** when misaligned, growing with scope, and 4–26% when aligned. The pre-lock is 12–15% of a refresh, so the implied whole-refresh saving is **~3–10% — implied, not measured.** Direct whole-refresh measurement cannot resolve it at scope 1000, where the effect is smaller than the harness's own ±11% wobble; only `nonkey`/scope 10000 (+4.8 to +9.4%) is plausibly resolved. Do **not** bundle the source `ORDER BY` in — see below | oracle, plus an isolation permutation showing two refreshes deadlocking if it is dropped under `RowExclusiveLock` |
-| **drop the prune** — `no_delete`, **derived** rather than declared, but **not by the rule this row used to state**: `n_locked + n_inserted == n_source` is unsound on its own and §3b has the counterexample and the correction | **2**, not 4 | **13–19% faster** at scope ≥1000, measured *on top of* the row comparison rather than instead of it; only **1.1% faster** on `expensive`, where GIN maintenance dominates | oracle, plus the `mutations.py` entry that forces the elision when the counts do *not* agree |
+| **drop the prune** — `no_delete`, **derived** rather than declared, but **not by the rule this row used to state**: `n_locked + n_inserted == n_source` is unsound on its own, and unsound again under concurrency. §3b has the first counterexample, §3b-ii the second. *Implemented*, gated on the qual being key-only **and** on holding `ExclusiveLock` | **2 + 1**, and a lock level | **10.9% faster at scope 1000 and 13.7% at scope 10000** on the implementation (R42), against a control that reads 0.  R6's model said 13–19% and this is the bottom of that band, which is the direction to expect.  Bare form only.  Model figures: only **1.1% faster** on `expensive`, where GIN maintenance dominates | matview_where Test 20 with `mutations.py` **N1** (drop the key-only gate) and **N2** (skip unconditionally); `matview-where-prune-elide.spec` with **N4** (drop the lock-level condition) — each seen to fail, and each fails a different file |
 | **`DO NOTHING`** (`append_only`) — the half that cannot be derived, because no count taken during a refresh proves existing rows never need rewriting | 4 | a further **10–22 points** on top of `no_delete`, taking the pair to **26–39% faster** at scope ≥1000 | sampling verifier, plus a `mutations.py` entry declaring `append_only` on a view that updates |
 
 ### 3b. `n_locked + n_inserted == n_source` is UNSOUND, and here is the case
@@ -237,7 +237,9 @@ produce — and report success.
 **What is sound instead**, and the shape is verified against the executor:
 
 - **`n_locked == 0`** — no matview row is in scope, so the prune cannot delete
-  anything. Unconditional; needs no gate and no counting.
+  anything. ~~Unconditional; needs no gate and no counting.~~ **Not
+  unconditional — see 3b-ii, which applies to this rule as much as to the next
+  one.**
 - **`n_locked + n_inserted == n_source`, gated on the qual referencing only the
   arbiter index's key columns.** That gate is what makes drift impossible: two
   rows with the same key then agree on the qual, so every conflicting matview
@@ -271,6 +273,45 @@ The gate then lives in the *values*, not in the SQL: pass the real `n_source`
 when the qual is key-only and `-1` when it is not, since the left-hand side is
 never negative. One statement, one plan, one cache key — which also keeps B31's
 rule, that anything changing the generated SQL has to be in the key.
+
+### 3b-ii. Both rules need the lock level too, and here is that case
+
+The two rules above were written down as though `n_locked` were a count of what
+the matview holds in scope *at the moment the prune would run*. It is not. It is
+what the pre-lock matched, under an **earlier snapshot** — and the ordering is
+not an accident that can be tidied away: the snapshot is taken *after* the lock
+precisely so that a refresh which queued behind another does not evaluate its
+source from before that one committed and write the stale values back over it.
+That is mutation M3's lost update, at 45 events a run, and §3e is the same
+argument from the other side.
+
+The lock stops the rows it matched from changing. It does not stop new ones
+appearing. A refresh over a key the matview does not hold yet locks nothing, so
+it does not queue behind us and can commit a row into our scope inside that
+window — the same "a key with no row locks nothing" that §3c relies on to reach
+the prune gap at all. Neither count has seen that row, so **the accounting
+balances while the row is orphaned**, and the refresh reports success.
+
+Which is §3b's own failure mode arriving from concurrency instead of from
+predicate shape. Worth saying plainly, because the pattern has now repeated
+twice in one section: **every single-session gate is green under it.**
+matview_where Test 20, the contract file, the differential oracle and the
+fuzzer all pass. It was found by building the detector that §3c asks for, not
+by reading the design — RESULTS.md **R43**, and **X13**.
+
+**The condition that closes it is the lock level**, which is §4's argument
+arriving with a second customer: at `ExclusiveLock` no other session can write
+the matview at all, so the in-scope set cannot change between the pre-lock and
+the DELETE. So the elision is available to the **bare** `WHERE` form and not to
+`CONCURRENTLY`, and the saving is once again available exactly where the lock
+makes it safe to take. Ask the lock manager rather than the statement's
+spelling: what the guard needs is the fact, not the form that chose it.
+
+Two things this rules out, both of which look like the obvious fix:
+
+- **Taking the snapshot before the pre-lock** closes the window and reopens M3.
+- **Counting the in-scope rows under the DML's snapshot** is the scan being
+  elided.
 
 ### 3c. The at-most-one-row proof, and why it needs a new detector
 
@@ -316,11 +357,15 @@ concurrency gain that will never appear in a single-client sweep.
 
 ### 3f. Order, and why
 
-- **`no_delete` first**, and it is now a *smaller* change than when it was
-  written down as a reloption: three counters the fused statement already has,
-  compared, with the prune skipped when they agree. No catalog change, no
-  user-visible surface, no verifier, and a wrong answer is not possible rather
-  than merely detectable. It also subsumes the non-empty case of the T2 prune
+- **`no_delete` first** — **DONE**, and it was a smaller change than the
+  reloption it replaced but a larger one than this line predicted: three
+  counters the fused statement already has, compared, with the prune skipped
+  when they agree, **plus two conditions neither of which is about the
+  counters** — the qual must read key columns only (§3b) and the matview must be
+  held at `ExclusiveLock` (§3b-ii). No catalog change, no user-visible surface
+  and no verifier, but "a wrong answer is not possible rather than merely
+  detectable" was wrong twice: it is possible, it is silent, and both times the
+  only thing that found it was a test written to look for it. It also subsumes the non-empty case of the T2 prune
   elision, which is why that one dropped off this list entirely — what is left
   of it is the empty-source path, which is the row-trigger delete path and needs
   the detector described in §3c.
@@ -477,8 +522,10 @@ deliberately (§4). `FOR NO KEY UPDATE` on the pre-lock.
 **Implemented since that line was written** — source plan caching (R34) and
 `Const` parameterisation (R37).
 
-**Sized, unimplemented** — deparse elision, derived `no_delete`,
-`append_only`.
+**Implemented since that line was written, part 2** — derived `no_delete`
+(R42, R43), bare form only.
+
+**Sized, unimplemented** — deparse elision, `append_only`.
 
 **Measured and rejected** — forcing a generic plan (**21.7% slower** net over 94
 comparisons; faster only on range/span 1, where it is +28.6%), the arbiter index

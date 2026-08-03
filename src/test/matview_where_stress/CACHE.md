@@ -26,7 +26,7 @@ tail:
 | 3 | B2 / the invalidation restructure | **its own item, no longer inside 1** — §4 |
 | 4 | delete the text path, the two GUCs, and the oracle's A/B axis | blocked on 2 |
 | 5 | B15 — warn, error, or document the blast radius | independent, needs a decision |
-| 6 | B25, derived `no_delete` | independent |
+| 6 | B25, derived `no_delete` | `no_delete` **done** (RESULTS.md R42, R43); B25 independent and open |
 
 **Why it gates.** Phase 2.2 decided to ship (b), the Query-tree read side. Both
 GUCs still boot `false`, so the default today is the text path, and flipping it

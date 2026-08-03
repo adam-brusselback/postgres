@@ -32,7 +32,7 @@ other and the order is the reason they landed at all:
 | 3 | B2 / the invalidation restructure | **STILL OPEN, and still its own item.**  Pulling it into 1 was justified by an argument the project's own measurements refute (3.1), and it reopens B7 — CACHE.md §4.  Whether it is reachable at all now that the text path is gone has not been established |
 | 4 | delete the text path, the two GUCs, and the oracle's A/B axis | **DONE**, `82f71d8`.  One implementation, `matview_partial_refresh_optimized` the only remaining GUC |
 | 5 | B15 — warn, error, or document the blast radius | **STILL OPEN, needs a decision**, independent |
-| 6 | B25, and derived `no_delete` | **STILL OPEN**, independent |
+| 6 | B25, and derived `no_delete` | **derived `no_delete` DONE**, **R42** (10.9% at scope 1000, 13.7% at 10000, bare form only) and **R43** (the concurrency condition, found by building its detector).  **B25 still open** |
 
 And one that was not on that list: **3.2, parameterise the predicate's
 constants**, is **DONE**.  It was the largest single number in the Phase 3 list
@@ -42,8 +42,8 @@ landed first, its param arm turned out to be measuring the literal path for two
 of the three predicate shapes (**B33**), and the fix to that is what made the
 result readable.  Numbers at 3.2 below.
 
-So what is left is **3**, **5** and **6**, none of which blocks another, plus
-Phases 4–7.
+So what is left is **3**, **5** and the **B25** half of **6**, none of which
+blocks another, plus Phases 4–7.
 
 ### Which document owns what
 
@@ -1360,11 +1360,15 @@ conflict with foreign-key checks.  A concurrency optimisation, not a latency
 one -- measure it with `--clients 4,16 --overlap hot`, where the current sweep
 has nothing to say.
 
-**4.6 Skip the prune when it provably cannot delete anything.**  On the
-Query-tree path the source row count is known once the tuplestore is filled.
-If it matches the number of matview rows in scope and the upsert inserted none,
-nothing can be missing.  The derivation is the hard part and it has to be right
-every time, not usually.
+**4.6 Skip the prune when it provably cannot delete anything.**  **DONE**, and
+this entry's last sentence was the whole of it: *"the derivation is the hard
+part and it has to be right every time, not usually."*  It was wrong twice
+before it was right, and both times every single-session gate stayed green --
+once on predicate shape (SPECIALIZE.md 3b) and once on the snapshot the count is
+taken under (3b-ii).  The shipped rule is the counts, gated on the qual reading
+only the arbiter key columns and on the matview being held at `ExclusiveLock`.
+**R42** measures it at 10.9% (scope 1000) and 13.7% (scope 10000) against a
+control that reads zero; **R43** is the concurrency case and its detector.
 
 **4.7 Reuse the tuplestore and the ENR tuple descriptor across refreshes.**
 `CreateTupleDescCopy()` and a `tuplestore_begin_heap()`/`_end()` pair per
