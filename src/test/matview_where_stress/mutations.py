@@ -383,10 +383,15 @@ MUTATIONS = {
                ('"FOR NO KEY UPDATE"', '"FOR UPDATE"', 1),
            ]),
 
+    # The ordering this drops used to live in the MATERIALIZED CTE's text, as
+    # "ORDER BY %s" appended to the new_data subquery.  With the text path gone
+    # the source rows come from a Query tree, and the same ordering is the sort
+    # clause on that tree -- built from the arbiter index's key columns a few
+    # lines above.  Same property, same detectors, different line.
     'M2': ('P3', 'concur',
-           'drop ORDER BY from new_data (lock order for INSERTed rows)', [
-               ('"  SELECT * FROM (%s) %s WHERE (%s) ORDER BY %s "',
-                '"  SELECT * FROM (%s) %s WHERE (%s) /*%s*/ "'),
+           'drop the source ordering (lock order for INSERTed rows)', [
+               ('\tsourceQuery->sortClause = sortlist;',
+                '\tsourceQuery->sortClause = NIL;\t/* M2 */'),
            ]),
 
     'M3': ('A3', 'concur',
@@ -401,11 +406,13 @@ MUTATIONS = {
     # actually re-evaluate in a way that diverges, so this is NOT a P1
     # violation and a detector missing it is not a gap.  Do not put it back on
     # the "must find" list without re-establishing that it can fail.
-    'M4': ('-', 'benign',
-           'un-MATERIALIZE new_data (verified benign -- see ISSUES.md B17)', [
-               ('"WITH new_data AS MATERIALIZED ( "',
-                '"WITH new_data AS NOT MATERIALIZED ( "'),
-           ]),
+    # M4 is DELETED, not broken.  It flipped the new_data CTE from MATERIALIZED
+    # to NOT MATERIALIZED -- a planner hint that the source rows be computed
+    # once -- and calibration recorded it MISSED and verified benign.  The CTE
+    # is gone: the source rows are a tuplestore, materialised because they were
+    # physically written before the statement ran, not because the planner was
+    # asked nicely.  There is no hint left to flip and the guarantee it probed
+    # is now structural, which is strictly stronger than what M4 tested.
 
     'M6': ('A3', 'concur',
            'lock after doing the work instead of before', [
@@ -413,15 +420,14 @@ MUTATIONS = {
                 '\t\t\t\t\t\t\t\t InvalidSnapshot, false) < 0)\n'
                 '\t\telog(ERROR, "SPI_execute_plan failed during lock acquisition");\n\n',
                 ''),
-               ('\telse if (matview_execute_spi_plan(cacheEntry->refreshPlan, params,\n'
-                '\t\t\t\t\t\t\t\t\t  InvalidSnapshot, false) < 0)\n'
-                '\t\telog(ERROR, "SPI_execute_plan failed during refresh");',
-                '\telse if (matview_execute_spi_plan(cacheEntry->refreshPlan, params,\n'
-                '\t\t\t\t\t\t\t\t\t  InvalidSnapshot, false) < 0)\n'
-                '\t\telog(ERROR, "SPI_execute_plan failed during refresh");\n\n'
-                '\tif (matview_execute_spi_plan(cacheEntry->lockPlan, params,\n'
-                '\t\t\t\t\t\t\t\t InvalidSnapshot, false) < 0)\n'
-                '\t\telog(ERROR, "SPI_execute_plan failed during lock acquisition");'),
+               ('\t\tPopActiveSnapshot();\n\t}',
+                '\t\tPopActiveSnapshot();\n'
+                '\n'
+                '\t\t/* M6: the lock, moved to after the work it was meant to guard */\n'
+                '\t\tif (matview_execute_spi_plan(cacheEntry->lockPlan, params,\n'
+                '\t\t\t\t\t\t\t\t\t InvalidSnapshot, false) < 0)\n'
+                '\t\t\telog(ERROR, "SPI_execute_plan failed during lock acquisition");\n'
+                '\t}'),
            ]),
 
     # The Q mutations are a different kind, and the rule above -- every

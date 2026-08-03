@@ -32,14 +32,9 @@
 --
 -- Disposition: keep.  "The source plan is reused, and a base-table change
 -- invalidates it" is the contract of the cache, not of its current shape, and
--- it holds however the plan comes to be stored.  The SET of
--- matview_partial_refresh_querytree goes when that GUC does; the case does not.
+-- it holds however the plan comes to be stored.
 --
 CREATE EXTENSION injection_points;
--- Both are load-bearing.  matview_materialize_source() is on the Query-tree
--- path only, so with the GUC defaulted off this file would exercise nothing at
--- all and pass -- the shape that has caught this project out four times.
-SET matview_partial_refresh_querytree = on;
 -- debug_discard_caches calls InvalidateSystemCachesExtended() at every
 -- invalidation-acceptance point, which invalidates every saved plansource with
 -- a non-empty relationOids.  A reuse assertion must go red under it.  Disabled
