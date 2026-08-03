@@ -535,7 +535,8 @@ matters, what its numbers are still worth — is below.
 
 **Implemented and verified** — the row comparison
 (`matview_partial_refresh_optimized`): oracle 22 shapes / 1636 mutations / 0
-divergences, five `matview_where` suites green with it forced on. Routing of the
+divergences, five `matview_where` suites green -- **and since R45 it is the
+default rather than something to force on**. Routing of the
 bare `WHERE` form onto the general algorithm, with `ExclusiveLock` chosen
 deliberately (§4). `FOR NO KEY UPDATE` on the pre-lock.
 
@@ -561,6 +562,8 @@ setting was in effect.
 
 **Sized, unimplemented** — deparse elision, `append_only`.
 
+**Measured and rejected since** — the pre-lock `ORDER BY` elision (R44).
+
 **Measured and rejected** — forcing a generic plan (**21.7% slower** net over 94
 comparisons; faster only on range/span 1, where it is +28.6%), the arbiter index
 scan (0.08 µs), the cache sweep (below timer resolution), bypassing SPI (~2 µs
@@ -574,8 +577,9 @@ the faster figures.** The label covers two runs 2h43m apart (01:36–01:56 and
 halves were measured on different postmaster incarnations. It predates
 `bench_result.server_start`, which is why this had to be reconstructed from the
 server log rather than read off the row.
-The 18.5%-slower result at scope 1 is corroborated elsewhere; the rest needs
-re-measuring.
+~~The 18.5%-slower result at scope 1 is corroborated elsewhere~~ -- **retracted:
+re-measured over 23 bands it is +2.2% FASTER, all three statistics positive
+(R45).  Nothing corroborates it any more.**  The rest still needs re-measuring.
 
 **Provenance of the gap runs** — `gaps-concurrency`, `gaps-crossover`,
 `gaps-txn-d1` and `gaps-txn-d2` also predate `server_start`, but the log puts

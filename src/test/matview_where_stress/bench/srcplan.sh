@@ -17,10 +17,12 @@
 # plan is generic unconditionally.  A *varying* literal misses by design and is
 # the path bench/run.sh takes, which is why run.sh cannot produce this cell.
 #
-# Arms are querytree off against on, NOT qtopt.  The row comparison is
-# separately measured at 18.5% slower at scope 1 -- the exact cell and
-# direction of the bar -- so bundling it would hand the arm that has to close a
-# gap a handicap unrelated to 3.7.
+# Arms are querytree off against on, NOT qtopt.  The reason given was that the
+# row comparison measured 18.5% slower at scope 1 and would hand the arm that
+# has to close a gap a handicap unrelated to 3.7 -- and that FIGURE is retracted
+# (RESULTS.md R45: +2.2% faster there, and it is the default now).  The rule it
+# supported is not: bundling any second change into a measurement makes a
+# measurable effect unmeasurable, whichever way the second one points.
 #
 # No VACUUM between timed refreshes.  vac_update_relstats() updates pg_class in
 # place, which routes through CacheInvalidateHeapTupleInplace(); a VACUUM before

@@ -89,6 +89,39 @@ is in PLAN.md 2.1b.
 
 ---
 
+## `a5672af` — Phase 3's specialisations, decided
+
+The point at which the two optimisations that survive are in and the two that
+do not are recorded as rejections rather than as ideas.  The state to return to
+before opening anything in SPECIALIZE.md §3f.
+
+| commit | what |
+|---|---|
+| `a72e2a3` | the prune is skipped when it provably cannot delete |
+| `38aebba` | …and needs the lock level as well, with the case that says so |
+| `a4ea46b` | the pre-lock `ORDER BY` elision, **reverted** — sound and a net loss (R44) |
+| `a89df5b` | the upsert stops rewriting rows nothing changed about, by default (R45) |
+| `a5672af` | the profile behind that, and the 1:150 that removes the gate (R47) |
+
+Build, as reported by the running server:
+
+    ./configure --prefix=/home/user/pgsql-opt --without-icu CFLAGS=-O2
+    debug_assertions = off
+    no --enable-injection-points
+
+That is the measurement build; R45 through R47 were taken on it, except R45,
+which says in its own protocol column that it was taken on an assertions build
+after a container reclaim.  Restore
+`-O2 --enable-cassert --enable-injection-points` before running the
+injection-point specs or the isolation suite.
+
+Gates at this point, all pristine: regress 250/250, isolation 135/135,
+injection_points 5 regress + 13 specs, the differential oracle's vector
+identical to `calibrate.baseline`, `fuzz.sh` PASS on all four modes,
+`mutations.py --check` 29/29, `profile.py --check` 15/15.
+
+---
+
 ## `c8beb05` — the patch as posted to -hackers
 
 Not a restore point so much as the reference: the original implementation,

@@ -66,7 +66,17 @@ Derived rules:
 
 **Roughly a quarter of a scope-1 partial refresh does the thing the user asked
 for.** The rest is machinery that earns its cost at large scope and does not at
-scope 1. Two candidates worth investigating, neither free of consequences:
+scope 1.
+
+**Two of these lines have since moved, and the table is not re-measured.**  The
+prune is now skipped entirely when it provably cannot delete — the bare form
+over a key-only predicate with nothing orphaned (RESULTS.md **R42**) — and the
+upsert no longer rewrites a row whose values did not change, which is on by
+default and is most of the DML at low churn (**R45**, **R47**).  So both the
+23% and the 27% are upper bounds on today's code.  The decomposition is kept
+because the *shape* of it is what the argument below rests on, and because
+PLAN.md owns the profiles: read Phase 3 and 4 there, and RESULTS.md for the
+settled numbers, before quoting anything here. Two candidates worth investigating, neither free of consequences:
 
 - upsert and prune as **two plain statements** cost 20.7 µs against the fused
   CTE's 32.0 — 1.5× cheaper. But the fusion is what closed A3's consistency gap,

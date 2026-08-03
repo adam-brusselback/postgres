@@ -671,7 +671,9 @@ supported, the write side is not.
 ## 2.1 The read side — low risk, high payoff
 
 **Done** — `9a5195b`, behind `matview_partial_refresh_querytree`, off by
-default so `safety/rundiff.sh spi querytree` can compare the two.
+default so `safety/rundiff.sh spi querytree` could compare the two.  (That GUC
+and the text path it selected are gone — `82f71d8`.  Left as written because it
+records what 2.1 did; do not go looking for the setting.)
 
 Replace `pg_get_viewdef()` → text → SPI with `copyObject(dataQuery)` +
 `AddQual(predicate)`. The relcache copy must not be scribbled on, hence the
@@ -1227,7 +1229,16 @@ predicate pays ~3.7x for per-call re-planning**, which is core plancache
 estimation behaviour rather than anything this patch controls.  A fix narrow
 enough to leave the array case alone is not a one-line change.
 
-**4.2 Suppress the write when the row has not changed.**  The upsert writes a
+**4.2 Suppress the write when the row has not changed.**  **DONE, and ON by
+default** -- this is the row comparison, and the numbers below are superseded by
+**R45** (scope), **R46** (churn) and **R47** (the profile and the 1:150 that
+explains why it needs no gate).  Two of the three claims in this entry did not
+survive re-measurement: it is **not** 2 us worse at scope 1 (+2.2% over 23
+bands), and the effect does **not** vanish without an index on the updated
+columns (+38.5% at scope 1000 without one, X17).  What stands is the shape --
+the saving grows with scope and shrinks with churn.  Original entry follows.
+
+The upsert writes a
 new row version for every row in scope whether or not anything about it
 differs.  Adding `WHERE mv IS DISTINCT FROM EXCLUDED` to the `DO UPDATE`
 measured, against a target with indexes on the updated columns and a source
@@ -1445,9 +1456,9 @@ static suite it produced, against whatever implementation actually landed.
   | `pg_stat_statements` structural block, "delete at the start of Phase 2" | Phase 2 opening | **fired** — deleted before the first line of the rewrite, not after |
   | `matview-where-snapshot`, "delete when the premise goes" | the rewrite fusing the lock into one plan | **read at Phase 2 exit** |
   | `matview_where_privs` Test 1, "rewrite if the predicate runs as the invoker" | Phase 2's privilege model | **read at Phase 2 exit** — it inverts rather than lapsing, so it must be rewritten, not regenerated |
-  | `matview_partial_refresh_querytree` and `matview_partial_refresh_optimized` GUCs + the paths they select | the fuzzer's exit criterion, not "the new path looks finished" | **fires here** — delete both GUCs (`guc_parameters.dat`, the `commands/matview.h` declarations, the `guc_tables.c` include), the text branch, and every `SET` of either: the two in `matview-where-prune-gap.spec`, and the `SET`/`RESET` pairs around `matview_where` Tests 17 and 18 and `matview_where_cache` Tests 5 and 6. Losing the querytree GUC also loses `rundiff.sh`'s old-vs-new mode, which is why it is the last thing to go |
+  | `matview_partial_refresh_querytree` and `matview_partial_refresh_optimized` GUCs + the paths they select | the fuzzer's exit criterion, not "the new path looks finished" | **half fired already** — the `querytree` GUC and the text branch went in `82f71d8`, and Tests 17 and 18 lost their `SET`/`RESET` pairs when the row comparison became the default (R45).  What is left is `matview_partial_refresh_optimized` (`guc_parameters.dat`, the `commands/matview.h` declaration), the `SET`s in `matview_where_cache` Tests 5 and 6, and every use in `matview_where_stress` — which is most of the measurement suite, so it goes last. Losing the querytree GUC also loses `rundiff.sh`'s old-vs-new mode, which is why it is the last thing to go |
   | `matview_where` Tests 17 and 18, added for B27 and B30 | the optimisation stops being optional | **fired early, and partly** — the comparison is now ON by default (R45), so both `SET` lines are gone already and the tests are what goes red if the default is flipped back.  Calibrated: Test 17 red under B7, Test 18 red under O1.  The GUC itself survives to Phase 4 as the off-switch every measurement instrument here uses. Both properties outlive the flag: a comparison that is not NULL-safe corrupts the matview, and not rewriting a row nothing changed about is the promise that makes re-refreshing an already-current scope cheap |
-  | `matview_where_cache` Test 6, added for B31 | the two GUCs going away | **fires with them** — its two settings are the only inputs to the cache key that currently change the generated SQL. Delete it *unless* the key has by then gained another such input, in which case rewrite it around that: the rule it asserts outlives the flags illustrating it |
+  | `matview_where_cache` Test 6, added for B31 | the GUC going away | **fires with it** — `matview_partial_refresh_optimized` is now the ONLY input to the cache key that changes the generated SQL, the `querytree` half having gone in `82f71d8`. Delete it *unless* the key has by then gained another such input, in which case rewrite it around that: the rule it asserts outlives the flags illustrating it |
   | `matview-where-prune-gap.spec`, "delete if the seam closes" | an implementation with no separate evaluation step | **read at Phase 2 exit** — the *property* is data loss and is not scaffolding; the injection point and the GUC are. If the seam closes, delete it and say why |
 
   A conditional disposition nobody re-reads is how Test 14 came to sit in the

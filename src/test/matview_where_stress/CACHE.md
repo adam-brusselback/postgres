@@ -21,10 +21,10 @@ tail:
 
 | | | state |
 |---|---|---|
-| **1** | **this file** — cache the source plan | **next** |
-| 2 | flip `matview_partial_refresh_querytree` on, re-measure | blocked on 1 |
-| 3 | B2 / the invalidation restructure | **its own item, no longer inside 1** — §4 |
-| 4 | delete the text path, the two GUCs, and the oracle's A/B axis | blocked on 2 |
+| **1** | **this file** — cache the source plan | **DONE** — R34 |
+| 2 | flip `matview_partial_refresh_querytree` on, re-measure | **DONE** — R35 |
+| 3 | B2 / the invalidation restructure | **STILL OPEN**, its own item — §4 |
+| 4 | delete the text path, the two GUCs, and the oracle's A/B axis | **DONE**, `82f71d8`.  Only `matview_partial_refresh_optimized` is left, defaulting ON since R45 and due out with the rest of the scaffolding |
 | 5 | B15 — warn, error, or document the blast radius | independent, needs a decision |
 | 6 | B25, derived `no_delete` | `no_delete` **done** (RESULTS.md R42, R43); B25 independent and open |
 
@@ -342,9 +342,12 @@ each looks like ordinary care.
   worked. R3/R5's heap-state control belongs to a comparison where one arm writes
   and the other does not (RESULTS.md X1); both arms here write identically.
 - **Arms are `querytree=off` against `querytree=on`, not `qtopt`.**
-  `optimized=on` adds the row comparison, separately measured **18.5% slower at
-  scope 1** — the exact cell and direction of the bar — handing the arm that must
-  reach parity a handicap unrelated to 3.7. It is also not what R26 measured (the
+  `optimized=on` adds the row comparison, ~~separately measured **18.5% slower
+  at scope 1**~~ — **that figure is retracted (R45): it is +2.2% faster there,
+  and it is the default now rather than an arm** — handing the arm that must
+  reach parity a handicap unrelated to 3.7.  The rule survives the number:
+  bundling any second change into a measurement makes a measurable effect
+  unmeasurable, whichever way the second one points. It is also not what R26 measured (the
   phase table has two arms) nor what step 2 ships. SPECIALIZE.md §3f: *"Do not
   bundle … pairing them would make a measurable change unmeasurable."*
 - **Cell: constant literal, scope 1, warm** — R26's cell, per §1. Not a bound
