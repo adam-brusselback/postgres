@@ -190,7 +190,7 @@ is better everywhere in it, and a *slower* entry is spelled out as such.
 
 | specialisation | tier | effect (higher = better) | detector |
 |---|---|---|---|
-| **row comparison** — `WHERE (mv.cols) IS DISTINCT FROM (EXCLUDED.cols)` on the `DO UPDATE`. *Implemented*, currently a GUC; should be T3 churn with a T1 veto when no index covers a written column | 3 + 1 | **25–54% faster** at zero churn — scope ≥1000, covering index, settled heap. Degrades with churn to **9% slower** at full churn, and is **18.5% slower** at scope 1, where the comparison costs more than the write it avoids. No effect at all without a covering index. Always quote the protocol with the number — see heap state in §1 | oracle — 22 shapes, 1636 mutations, 0 divergences |
+| **row comparison** — `WHERE (mv.cols) IS DISTINCT FROM (EXCLUDED.cols)` on the `DO UPDATE`. **Implemented and ON by default.**  It was going to be *T3 churn with a T1 veto when no index covers a written column*; **both of those are gone** — the veto because it does not reproduce (X17) and the churn gate because nothing below full churn needs one.  No tier decides it | — | **+2.2% at scope 1, +15.1% at 25, +29.0% at 100, +44.6% at 1000, +70.1% at 10,000** (R45), zero churn, settled heap.  **The two figures that used to argue for gating it are retracted**: it is not 18.5% slower at scope 1 (all three statistics positive over 23 bands) and it does not need a covering index (+38.5% without one).  Degrades with churn — break-even 60–70% (R4) — and a scope where nearly everything changed pays a few percent, which is the price of not keeping churn history.  Always quote the protocol with the number — see heap state in §1 | oracle — 23 shapes, **and the vector is identical to a baseline recorded with it OFF**, which is what says it is behaviour-neutral rather than merely untested; plus `matview_where` Test 17 (`mutations.py` B7, NULL safety) and Test 18 (O1, the row version), both of which now carry no `SET` and so are the **default's** detectors |
 | **cache the source plan** — removes rewrite + plan from every refresh | — | **12.2 µs faster** per refresh — worth **16.2%** at scope 1 and nothing at scale, because it is a fixed cost | `matview_where_cache` 1–3, which need a **base-table** variant: a stashed `PlannedStmt` is not revalidated when a base table changes, so this must go through the plancache, not a pointer |
 | **stop deparsing for the cache key** — store the qual tree, compare with `equal()`, deparse only on a miss | — | **4.5–5.3 µs faster** per refresh, **7.4%** at scope 1, again fixed. Closes **B3**: the tree carries parameter types, `$1` does not | `matview_where_cache` Test 4, already two predicates that deparse identically and need different plans |
 | **parameterise predicate `Const`s** — *implemented*; each Const becomes a `Param` of the same type, typmod and collation before the deparse, and the values ride the `ParamListInfo` the path already carried | — | **8× in-backend** (R15), **0.3-45.3% end to end across 40 paired cells, none slower** (R37).  It turns refreshes that would miss the plan cache into hits | oracle, plus `matview_where` Test 19 for the values reaching the right rows and `matview_where_source_plan` part 3 for the plan actually being reused.  Changes what the cache key *is*, so it lands first or last, never in the middle |
@@ -377,10 +377,16 @@ concurrency gain that will never appear in a single-client sweep.
   the detector described in §3c.
 - Source plan + deparse elision **together** — one change to the cache-entry
   miss path, not two.
-- T3 churn gate next — turns the row comparison from a GUC into a decision, and
-  the curve it needs now exists (§1, churn fraction). Break-even 60–70% churn,
-  which is far from where the current scope-based gate sits; the gate was right
-  by correlation and should stop relying on it.
+- ~~T3 churn gate next — turns the row comparison from a GUC into a decision.~~
+  **The GUC part is done and the gate turned out not to be needed.** The
+  comparison is on by default, decided by nothing: measured, it pays from one
+  row upward and without a covering index, so neither the scope proxy nor the
+  T1 veto this line assumed has anything to gate on (R45, X17). What is left of
+  the item is the far end of the churn curve — above 60–70% changed rows the
+  comparison is bought for nothing, and recovering that needs history the cache
+  does not keep. Worth a few percent in the least common regime, so it is
+  recorded rather than built; do not open it without a workload that shows the
+  loss.
 - `Const` parameterisation after that, since it redefines the cache key.
   **Done, and it went before the churn gate rather than after** — it was
   unblocked the moment the benchmark could tell the two predicate modes
@@ -536,6 +542,10 @@ deliberately (§4). `FOR NO KEY UPDATE` on the pre-lock.
 
 **Implemented since that line was written, part 2** — derived `no_delete`
 (R42, R43), bare form only.
+
+**Implemented since that line was written, part 3** — the row comparison is
+**on by default** (R45), which is the first time any of its measured saving has
+been reachable without a developer GUC.
 
 **The gate, run pristine on one `-O2 --enable-cassert --enable-injection-points`
 build** after that landed: regress **250/250**, isolation **135/135**,
