@@ -1975,14 +1975,6 @@
   max => 'MAX_KILOBYTES',
 },
 
-{ name => 'matview_partial_refresh_optimized', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
-  short_desc => 'Lets a partial refresh skip rewriting a row whose values did not change.',
-  long_desc => 'On by default.  Exists so that the two can be measured against each other on one binary, and is to be removed with the rest of the development scaffolding.',
-  flags => 'GUC_NOT_IN_SAMPLE',
-  variable => 'matview_partial_refresh_optimized',
-  boot_val => 'true',
-},
-
 { name => 'max_active_replication_origins', type => 'int', context => 'PGC_POSTMASTER', group => 'REPLICATION_SUBSCRIBERS',
   short_desc => 'Sets the maximum number of active replication origins.',
   variable => 'max_active_replication_origins',

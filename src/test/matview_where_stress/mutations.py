@@ -117,13 +117,11 @@ MUTATIONS = {
     # one derived from a primary key, so there is no catalog fact to prove
     # non-nullness from.
     #
-    # Needs the optimized GUC on to be reachable at all, which needs querytree
-    # on too -- see the note on use_optimized.
     'B7': ('-', 'data',
            'row comparison uses <> instead of IS DISTINCT FROM '
            '(NULL-valued rows silently never update)', [
-               ('appendStringInfo(&buf, "WHERE (%s) IS DISTINCT FROM (%s) ",',
-                'appendStringInfo(&buf, "WHERE (%s) <> (%s) ",', 1),
+               ('"UPDATE SET %s WHERE (%s) IS DISTINCT FROM (%s) ",',
+                '"UPDATE SET %s WHERE (%s) <> (%s) ",', 1),
            ]),
 
     # B7's neighbour, and the one that says whether B7's gate is measuring
@@ -131,33 +129,29 @@ MUTATIONS = {
     # is rewritten, which is what the code did before 03cb4f0 and is still
     # correct, so nothing about the matview's *contents* changes.
     #
-    # That is exactly why it belongs here.  A test that turns the optimisation
-    # on and then only reads values back cannot tell the optimisation from its
-    # absence, and would pass unchanged on a tree where it had silently stopped
-    # applying.  The realistic accident is small: a rewrite that stops threading
-    # the flag through leaves all the code in place and none of it reachable.
-    # It was smaller still when use_optimized was an && of two GUCs and dropping
-    # either one did it; the text path is gone and only one remains.
+    # That is exactly why it belongs here.  A test that only reads values back
+    # cannot tell the comparison from its absence, and would pass unchanged on a
+    # tree where it had silently stopped being emitted.
     'O1': ('-', 'perf',
            'the row comparison is never emitted (optimisation silently off)', [
-               ('\tbool\t\tuse_optimized = matview_partial_refresh_optimized;',
-                '\tbool\t\tuse_optimized = false;\t/* O1 */'),
+               ('\t\t\tappendStringInfo(&buf,\n'
+                '\t\t\t\t\t\t\t "UPDATE SET %s WHERE (%s) IS DISTINCT FROM (%s) ",\n'
+                '\t\t\t\t\t\t\t set_clause.data, mv_cols.data, excluded_cols.data);',
+                '\t\t\tappendStringInfo(&buf, "UPDATE SET %s ",\t/* O1 */\n'
+                '\t\t\t\t\t\t\t set_clause.data);'),
            ]),
 
-    # The optimisation flag drops out of the plan-cache key.
+    # O2 was DELETED with the developer GUC it mutated, and the reason it is not
+    # simply repointed is worth keeping.
     #
-    # use_optimized changes the generated SQL, so a plan built with it off is
-    # the wrong plan to run with it on and the other way round.  The entry is
-    # keyed on the matview OID, so the stale plan is then reused for the rest of
-    # the session -- silently, because both plans are valid SQL that refreshes
-    # the same rows.  Only the row versions differ, so nothing reading the
-    # matview's contents can see it, which is the same blind spot O1 exposes
-    # reached by a different route.
-    'O2': ('-', 'cache',
-           'drop the optimisation flag from the plan-cache key '
-           '(a plan built one way is reused for the other)', [
-               ('\t\tcacheEntry->optimized == use_optimized &&\n', ''),
-           ]),
+    # It dropped `optimized` from the plan-cache key, which was the only input
+    # to that key that changed the generated SQL without changing the matview's
+    # contents -- so it needed matview_where_cache Test 6 to read ctids back.
+    # The GUC is gone and the row comparison is unconditional, so there is no
+    # such input left.  What remains of the rule -- that the key must look at
+    # what the plans were built from -- is C7's, and C7's gate reads values
+    # rather than row versions because a confused predicate refreshes the wrong
+    # rows outright.
 
     # B6 was DELETED, not repointed, and the reason is worth keeping.
     #

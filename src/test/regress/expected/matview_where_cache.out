@@ -4,7 +4,7 @@
 -- refresh_by_direct_modification() caches the two SPI plans it builds (the
 -- row-locking SELECT and the fused upsert/delete CTE) in a session-level hash
 -- table keyed on the matview OID.  An entry is reused when the arbiter index
--- OID and the deparsed WHERE clause text both match.
+-- OID, the predicate and the parameter types all match.
 --
 -- These tests all depend on cache state accumulated over the session, so they
 -- live in their own file to keep that state predictable, and they must run in
@@ -15,8 +15,8 @@
 -- what selects it has changed twice.  It is now the number of unique indexes:
 -- a predicate on a matview with one takes direct modification whichever way the
 -- command is spelled.  Every matview below has exactly one, so all of them
--- qualify.  Tests 1 to 5 say CONCURRENTLY because that is how they were
--- written; it no longer decides anything, and Test 6 does not bother.
+-- qualify.  They say CONCURRENTLY because that is how they were written; it no
+-- longer decides anything.
 --
 -- It did decide once, and how that went wrong is the reason for this
 -- paragraph.  These tests predate commit 0607847, which swapped which spelling
@@ -288,9 +288,6 @@ SELECT * FROM mv_c4 ORDER BY id;
 -- path, not a detector.  If the cache stops being reused across nested
 -- refreshes, this test stops asserting anything and needs rebuilding, not
 -- deleting.
---
--- Without the row comparison, so the upsert rewrites every matched row.
-SET matview_partial_refresh_optimized = off;
 UPDATE mv_c4_base SET v = 102 WHERE id = 2;
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c4 WHERE id = 2;
 SELECT * FROM mv_c4 ORDER BY id;
@@ -317,9 +314,9 @@ SELECT * FROM mv_c4 ORDER BY id;
   5 |   5
 (5 rows)
 
--- And with it.  Before the fix this reported "cannot change materialized view
--- mv_c4_inner" from a refresh of mv_c4: the enclosing refresh had picked up the
--- nested one's plan out of the reused entry.
+-- Before the fix this reported "cannot change materialized view mv_c4_inner"
+-- from a refresh of mv_c4: the enclosing refresh had picked up the nested one's
+-- plan out of the reused entry.
 UPDATE mv_c4_base SET v = 104 WHERE id = 4;
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c4 WHERE id = 4;
 SELECT * FROM mv_c4 ORDER BY id;
@@ -344,7 +341,6 @@ SELECT * FROM mv_c4 ORDER BY id;
   5 | 105
 (5 rows)
 
-RESET matview_partial_refresh_optimized;
 -- The nested refresh never committed anything, and must not have: it failed at
 -- the locking step every time.
 SELECT * FROM mv_c4_inner ORDER BY id;
@@ -363,76 +359,7 @@ DROP FUNCTION mv_c4_nested(int);
 DROP TABLE mv_c4_base;
 DROP TABLE mv_c4_inner_base;
 --
--- Test 6: What changes the generated statement is part of the cache key
---
--- The entry is reused when the arbiter index, the deparsed predicate and the
--- argument types all match.  None of those describes the statement the plans
--- were built from, and matview_partial_refresh_optimized changes it: it decides
--- whether the upsert carries the row comparison that lets it skip a row nothing
--- changed about.  So it is in the key.
---
--- Without them a plan prepared under one setting is reused under the other for
--- the rest of the session, and reused silently: the stale plan is still valid
--- SQL that refreshes exactly the right rows.  The only difference is which row
--- versions it writes, so nothing reading the matview's contents can see it.
--- This asks the heap instead.  Measured rather than supposed -- calibrate-all.sh
--- reported O2, the optimisation flag dropped from the key, UNCAUGHT by all four
--- instruments.
---
--- No DDL may run between the two refreshes.  InvalidateMatViewCache() ignores
--- the relid it is passed and marks every entry, so any relcache invalidation
--- the session receives discards the entry this case exists to reuse -- and then
--- the plan is rebuilt for the right reason by accident, the case goes green,
--- and it detects nothing.  Creating the snapshot table between the refreshes is
--- exactly that mistake, and is why it is filled first.
---
--- A refresh of the matview is not such an event, which is worth stating because
--- it is the obvious guess and it is wrong: verified under this mutation with
--- only DML and a SET in between, the entry survived a refresh that rewrote
--- every row in scope and the stale plan was still reused.  That agrees with
--- B16 -- SetMatViewPopulatedState() early-returns when the state already
--- matches, so a partial refresh emits no invalidation of its own.
---
--- Verified as a detector rather than assumed: under O2 all three rows come
--- back t.
---
--- Disposition: DELETE with the remaining developer GUC, as part of the Phase 4
--- removal -- unless the cache has by then acquired another input that changes
--- the generated SQL.  If it has, rewrite this around that instead of deleting
--- it: the rule outlives the flag that illustrates it.
---
-SET matview_partial_refresh_optimized = on;
-CREATE TABLE mv_c5_base (id int primary key, v int);
-INSERT INTO mv_c5_base SELECT g, g * 10 FROM generate_series(1, 3) g;
-CREATE MATERIALIZED VIEW mv_c5 AS SELECT id, v FROM mv_c5_base;
-CREATE UNIQUE INDEX ON mv_c5(id);
--- Filled before either refresh: see above.
-CREATE TEMP TABLE mv_c5_was AS SELECT id, ctid AS was FROM mv_c5;
--- Warm the entry.  Nothing has changed since the matview was built, so with the
--- optimisation on this refresh writes nothing.
-REFRESH MATERIALIZED VIEW mv_c5 WHERE id BETWEEN 1 AND 3;
--- Same matview, same predicate, same argument types, same arbiter index.  Only
--- the statement the plans should be built from is different now.
-SET matview_partial_refresh_optimized = off;
--- So this must build new plans, and they rewrite all three rows because the
--- DO UPDATE no longer has a comparison to skip on.  Reusing the warmed plan
--- writes nothing at all.
-REFRESH MATERIALIZED VIEW mv_c5 WHERE id BETWEEN 1 AND 3;
-SELECT w.id, (w.was = m.ctid) AS same_row_version
-  FROM mv_c5_was w JOIN mv_c5 m USING (id) ORDER BY w.id;
- id | same_row_version 
-----+------------------
-  1 | f
-  2 | f
-  3 | f
-(3 rows)
-
-DROP TABLE mv_c5_was;
-DROP MATERIALIZED VIEW mv_c5;
-DROP TABLE mv_c5_base;
-RESET matview_partial_refresh_optimized;
---
--- Test 7: The predicate itself is part of the cache key
+-- Test 6: The predicate itself is part of the cache key
 --
 -- Tests 1 to 4 all cover ways the key can be right and the plans still wrong --
 -- a rename underneath it, a parameter type it cannot see.  None of them covers
@@ -453,9 +380,15 @@ RESET matview_partial_refresh_optimized;
 -- answer refreshes exactly the rows the right one leaves alone, which no
 -- rounding of "it did nothing" can produce.
 --
--- No DDL between the two refreshes, for Test 6's reason: any relcache
--- invalidation discards the entry this case exists to reuse, and the plans are
--- then rebuilt correctly by accident.
+-- No DDL may run between the two refreshes.  InvalidateMatViewCache() ignores
+-- the relid it is passed and marks every entry, so any relcache invalidation
+-- the session receives discards the entry this case exists to reuse -- and then
+-- the plans are rebuilt correctly by accident, the case goes green, and it
+-- detects nothing.  A refresh of the matview is not such an event, which is
+-- worth stating because it is the obvious guess and it is wrong: verified under
+-- C7, the entry survived a refresh that rewrote every row in scope.  That
+-- agrees with B16 -- SetMatViewPopulatedState() early-returns when the state
+-- already matches, so a partial refresh emits no invalidation of its own.
 --
 -- Verified as a detector: under C7 rows 1 and 2 keep their pre-update values
 -- and row 3 is the one that moves.

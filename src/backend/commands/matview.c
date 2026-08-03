@@ -62,8 +62,6 @@
 #include "utils/syscache.h"
 #include "utils/tuplestore.h"
 
-bool		matview_partial_refresh_optimized = true;
-
 /*
  * query_string for the source plansource.  CreateCachedPlan() requires one and
  * this path has no SQL text to give it -- the source is a Query tree.  It shows
@@ -112,9 +110,6 @@ typedef struct MatViewPartialRefreshCache
 								 * names, and the statements declare them all */
 	MemoryContext metacxt;		/* holds qual and argtypes; a node tree cannot
 								 * be freed piecemeal */
-	bool		optimized;		/* matview_partial_refresh_optimized as it was
-								 * when these plans were built; it changes the
-								 * generated SQL */
 
 	SPIPlanPtr	lockPlan;		/* SELECT ... FOR NO KEY UPDATE */
 	SPIPlanPtr	refreshPlan;	/* the fused upsert and prune */
@@ -1639,7 +1634,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	uint64		result_processed = 0;
 	int			old_depth;
 	Oid			old_relid;
-	bool		use_optimized = matview_partial_refresh_optimized;
 	int			nkeyatts = 0;
 	int16	   *keyattnums = NULL;
 	Tuplestorestate *sourceStore = NULL;
@@ -1708,15 +1702,14 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		found = false;
 	}
 
+	/*
+	 * Same predicate means an equal() tree: the plans were built by deparsing
+	 * this tree, so two trees that compare equal deparse to the same
+	 * statement.  argtypes is still checked, since a caller may bind a
+	 * parameter the predicate never names.
+	 */
 	if (found &&
 		cacheEntry->uniqueIndexOid == uniqueIndexOid &&
-		cacheEntry->optimized == use_optimized &&
-		/*
-		 * Same predicate means an equal() tree: the plans were built by deparsing
-		 * this tree, so two trees that compare equal deparse to the same statement.
-		 * argtypes is still checked, since a caller may bind a parameter the
-		 * predicate never names.
-		 */
 		cacheEntry->qual != NULL &&
 		equal(cacheEntry->qual, qual) &&
 		cacheEntry->nargs == (params ? params->numParams : 0) &&
@@ -1743,7 +1736,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		cacheEntry->qual = NULL;
 		cacheEntry->nargs = 0;
 		cacheEntry->argtypes = NULL;
-		cacheEntry->optimized = use_optimized;
 		cacheEntry->invalid = false;
 	}
 
@@ -1959,12 +1951,9 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 						 matview_name, conflict_cols.data);
 
 		if (has_non_key_cols)
-		{
-			appendStringInfo(&buf, "UPDATE SET %s ", set_clause.data);
-			if (use_optimized)
-				appendStringInfo(&buf, "WHERE (%s) IS DISTINCT FROM (%s) ",
-								 mv_cols.data, excluded_cols.data);
-		}
+			appendStringInfo(&buf,
+							 "UPDATE SET %s WHERE (%s) IS DISTINCT FROM (%s) ",
+							 set_clause.data, mv_cols.data, excluded_cols.data);
 		else
 			appendStringInfoString(&buf, "NOTHING ");
 

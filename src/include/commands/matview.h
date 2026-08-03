@@ -21,13 +21,6 @@
 #include "utils/relcache.h"
 
 
-/*
- * Apply the Phase 3 optimisations.  Scaffolding: this exists so both can run
- * in one binary and be measured against each
- * other, and goes away when the optimisations are no longer optional.
- */
-extern PGDLLIMPORT bool matview_partial_refresh_optimized;
-
 extern void SetMatViewPopulatedState(Relation relation, bool newstate);
 
 extern ObjectAddress ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
