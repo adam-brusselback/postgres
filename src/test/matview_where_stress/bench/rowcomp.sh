@@ -53,6 +53,12 @@ LABEL=${LABEL:-pristine}
 # at "no effect at all" there, and that claim is what a static veto would rest
 # on, so it needs checking on the code in front of us rather than quoting.
 COVER=${COVER:-on}
+# CHURN is the percentage of the scope whose values really change before each
+# timed refresh.  0 is the favourable end and was the only point the first
+# version of this script measured -- one point, not a curve, and the point at
+# which the comparison never fails.  The changed rows are the low ids of the
+# scope, so the fraction is exact rather than sampled.
+CHURN=${CHURN:-0}
 # key    -- "id BETWEEN k AND k+SPAN-1", on the arbiter key.  Both elisions fire
 #           for the bare arm: the predicate is key-only, so the prune is skipped,
 #           and the pre-lock's ORDER BY goes with the lock level.  R10 says the
@@ -76,7 +82,7 @@ trap 'rm -rf "$T"' EXIT
 
 run() { su "$RUNAS" -c "PGOPTIONS='$PGOPTIONS' $PSQL $*"; }
 
-echo "rowcomp: label=$LABEL cover=$COVER pred=$PRED span=$SPAN groups=$GROUPS scale=$SCALE optimized=$OPT"
+echo "rowcomp: label=$LABEL cover=$COVER churn=$CHURN% pred=$PRED span=$SPAN groups=$GROUPS scale=$SCALE optimized=$OPT"
 echo "            rounds=$ROUNDS n=$N sync=$SYNC"
 run -Atc "'SELECT setting FROM pg_config() WHERE name = '\''CONFIGURE'\''" 2>/dev/null || true
 run -Atc "'SHOW debug_assertions'" | sed 's/^/  assertions=/'
@@ -99,17 +105,39 @@ SQL
 # One statement file per arm.  Both walk the same keys in the same order, so
 # the comparison carries no data-distribution difference.  The predicate is a
 # range on the arbiter key: key-only, which the count rule is gated on.
-awk -v n="$N" -v span="$SPAN" -v scale="$SCALE" -v opt="$OPT" \
-    -v pred="$PRED" -v groups="$GROUPS" '
+awk -v n="$N" -v nrefresh="$N" -v span="$SPAN" -v scale="$SCALE" -v opt="$OPT" \
+    -v pred="$PRED" -v groups="$GROUPS" -v churn="$CHURN" '
+# Flips the sign of cust on the first churn% of the scope, so the value really
+# does change on every refresh.  A no-op UPDATE would leave every comparison
+# succeeding and measure churn 0 while claiming otherwise -- which is this
+# suite recurring failure shape, so it is worth stating.  cust is indexed,
+# so this pays the index maintenance a real change pays.
+function churn_stmt(i,   k, n) {
+  n = int(span * churn / 100); if (n < 1) n = 1;
+  k = 1 + i * int((scale - span) / nrefresh);
+  return sprintf("UPDATE pe_ord SET cust = -cust WHERE id BETWEEN %d AND %d;",
+                 k, k + n - 1);
+}
 function predicate(i,   k) {
   if (pred == "nonkey") return sprintf("cust = %d", i % groups);
-  k = 1 + i * int((scale - span) / n);
+  k = 1 + i * int((scale - span) / nrefresh);
   return sprintf("id BETWEEN %d AND %d", k, k + span - 1);
 }
 BEGIN {
   printf "SET matview_partial_refresh_optimized = on;\n"  > "'"$T"'/cmp.sql";
   printf "SET matview_partial_refresh_optimized = off;\n" > "'"$T"'/plain.sql";
   for (i = 0; i < n; i++) {
+    # The churn UPDATE sits INSIDE the timed block, identically in both arms, so
+    # it cancels in the difference.  It is deliberately NOT subtracted: a large
+    # separately measured block subtracted from a small measurement is how
+    # predskew.sh once reported 1.40x from an arm whose minimum was below the
+    # other arms.  So read the microseconds, and read the percentage knowing
+    # its denominator carries the update as well as the refresh -- which makes
+    # every churn > 0 percentage a LOWER bound on the effect.
+    if (churn > 0) {
+      printf "%s\n", churn_stmt(i)                     > "'"$T"'/cmp.sql";
+      printf "%s\n", churn_stmt(i)                     > "'"$T"'/plain.sql";
+    }
     printf "REFRESH MATERIALIZED VIEW pe_mv WHERE %s;\n",
            predicate(i)                                 > "'"$T"'/cmp.sql";
     printf "REFRESH MATERIALIZED VIEW pe_mv WHERE %s;\n",
@@ -151,7 +179,7 @@ done
 
 echo
 echo "per refresh, us -- round 1 discarded"
-awk -v label="$LABEL" -v scope="$([ "$PRED" = nonkey ] && echo $((SCALE / GROUPS)) || echo $SPAN)" -v pred="$PRED" '
+awk -v churn="$CHURN" -v label="$LABEL" -v scope="$([ "$PRED" = nonkey ] && echo $((SCALE / GROUPS)) || echo $SPAN)" -v pred="$PRED" '
   $1 > 1 { s[$2] += $3; v[$2, n[$2]++] = $3;
            if (!($2 in lo) || $3 < lo[$2]) lo[$2] = $3;
            if ($3 > hi[$2]) hi[$2] = $3 }
@@ -170,7 +198,7 @@ awk -v label="$LABEL" -v scope="$([ "$PRED" = nonkey ] && echo $((SCALE / GROUPS
              a, md[a], s[a]/n[a], lo[a], hi[a], n[a];
       m[a] = s[a]/n[a] }
     if (("plain" in m) && ("cmp" in m)) {
-      printf "\n  %s %s/scope=%s -- row comparison against plain, three statistics:\n", label, pred, scope;
+      printf "\n  %s %s/scope=%s/churn=%s%% -- row comparison against plain:\n", label, pred, scope, churn;
       printf "    median  %+8.1f us  %6.1f%%   <- quote this one\n",
              md["plain"] - md["cmp"], 100 * (md["plain"] - md["cmp"]) / md["plain"];
       printf "    mean    %+8.1f us  %6.1f%%\n",
