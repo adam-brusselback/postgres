@@ -279,6 +279,30 @@ MUTATIONS = {
                 'refresh_const_is_paramizable(Const *con)\n{\n\treturn false;\n', 1),
            ]),
 
+    # C6 is the other half of C5, and the two are not interchangeable.
+    #
+    # C5 turns the parameterisation OFF, which is what the code did before and
+    # is still correct: the right rows are refreshed, just after re-planning
+    # every call.  So C5 is what matview_where_source_plan part 3 goes red
+    # against, and matview_where Test 19 stays green under it -- correctly,
+    # because there is nothing wrong to see.
+    #
+    # C6 leaves it on and breaks the BINDING.  lcons prepends where lappend
+    # appends, so the collected Consts land in the reverse of the order their
+    # paramids were handed out in, and "WHERE a = 1 AND b = 2" binds a=2, b=1.
+    # That refreshes a real row with a valid plan and reports success; the only
+    # evidence is that it is the wrong row.  This is the failure the shared
+    # cache entry makes possible and the one Test 19 exists for.
+    #
+    # A predicate with a single constant is unaffected, which is the point: the
+    # detector has to be a case that carries two, and most of the suite does
+    # not.
+    'C6': ('-', 'data',
+           'predicate constants bind in reverse order (wrong rows refreshed)', [
+               ('\t\tctx->consts = lappend(ctx->consts, con);',
+                '\t\tctx->consts = lcons(con, ctx->consts);', 1),
+           ]),
+
     # The leak, as distinct from C3's crash.  C3 keeps the old plansource *and*
     # keeps using it, which segfaults; this forgets it instead -- the pointer is
     # cleared, so nothing stale is ever dereferenced and the plansource simply

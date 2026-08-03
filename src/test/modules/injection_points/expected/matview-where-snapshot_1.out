@@ -1,0 +1,45 @@
+Parsed test spec with 4 sessions
+
+starting permutation: s1_ref s2b_ref s2_move s2_wake s1_noop s2_detach s3_state s3_truth
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_ref: REFRESH MATERIALIZED VIEW CONCURRENTLY mvsnap WHERE grp = 1; <waiting ...>
+step s2b_ref: REFRESH MATERIALIZED VIEW CONCURRENTLY mvsnap WHERE grp = 1; <waiting ...>
+step s2_move: UPDATE mvsnap_base SET grp = 1 WHERE id = 4;
+                 UPDATE mvsnap_base SET grp = 9 WHERE id = 3;
+step s2_wake: SELECT injection_points_wakeup('matview-where-locked');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s2b_ref: <... completed>
+step s1_ref: <... completed>
+step s1_noop: 
+step s2_detach: SELECT injection_points_detach('matview-where-locked');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step s3_state: SELECT id, grp, v FROM mvsnap ORDER BY id;
+id|grp| v
+--+---+--
+ 1|  1|10
+ 2|  1|20
+ 4|  1|40
+(3 rows)
+
+step s3_truth: REFRESH MATERIALIZED VIEW mvsnap;
+                 SELECT id, grp, v FROM mvsnap ORDER BY id;
+id|grp| v
+--+---+--
+ 1|  1|10
+ 2|  1|20
+ 3|  9|30
+ 4|  1|40
+(4 rows)
+
