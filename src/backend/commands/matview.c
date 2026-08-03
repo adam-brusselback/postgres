@@ -125,6 +125,18 @@ typedef struct MatViewPartialRefreshCache
 								 * generated SQL, so a plan built one way is
 								 * wrong for the other */
 
+	bool		serialized;		/* was the matview held at ExclusiveLock or
+								 * stronger when these plans were built?  It
+								 * decides whether the pre-lock carries its
+								 * ORDER BY, so it changes the generated SQL
+								 * too -- and unlike the flag above it can
+								 * differ between two ADJACENT refreshes of one
+								 * matview, since it is the difference between
+								 * writing CONCURRENTLY and not.  Reusing the
+								 * bare form's unordered plan under
+								 * RowExclusiveLock is a deadlock generator
+								 * (B31, and matview_where_cache Test 6) */
+
 	/* The cached plans */
 	SPIPlanPtr	lockPlan;		/* SELECT ... FOR NO KEY UPDATE */
 	SPIPlanPtr	refreshPlan;	/* Fused CTE: Evaluate -> Upsert -> Delete */
@@ -2077,6 +2089,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	if (found &&
 		cacheEntry->uniqueIndexOid == uniqueIndexOid &&
 		cacheEntry->optimized == use_optimized &&
+		cacheEntry->serialized == serialized &&
 		cacheEntry->whereClauseStr != NULL &&
 		whereClauseStr != NULL &&
 		strcmp(cacheEntry->whereClauseStr, whereClauseStr) == 0 &&
@@ -2109,6 +2122,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		cacheEntry->nargs = 0;
 		cacheEntry->argtypes = NULL;
 		cacheEntry->optimized = use_optimized;
+		cacheEntry->serialized = serialized;
 		cacheEntry->invalid = false;
 	}
 
@@ -2374,12 +2388,34 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		 * cannot take the same rows in opposite orders and deadlock.  When the
 		 * predicate is on the key columns the index already returns rows in
 		 * this order, so the ORDER BY adds no sort.
+		 *
+		 * Unless there cannot be a second refresh.  The ordering is not there
+		 * for speed and it is not free: when the predicate's column is not the
+		 * arbiter key's, ordering by the key hands LockRows the heap in random
+		 * order where the scan had handed it physical order, and that costs
+		 * 20-69% of this statement, growing with scope (RESULTS.md R10).  It
+		 * buys a deterministic order for two refreshes to queue on -- and at
+		 * ExclusiveLock there is no second refresh to queue with, nor any other
+		 * writer at all: that level conflicts with the RowExclusiveLock a
+		 * CONCURRENTLY partial refresh takes and with another bare refresh's
+		 * ExclusiveLock, and nothing else can take row locks on a matview in
+		 * the first place ("cannot lock rows in materialized view").
+		 *
+		 * So the clause is emitted for CONCURRENTLY and not for the bare form.
+		 * That makes the lock level an input to the generated SQL, and
+		 * therefore to the plan cache's key -- B31, and it is a sharper case
+		 * than the GUCs that rule was written for, because the two settings are
+		 * two spellings of the same command and can alternate between adjacent
+		 * refreshes of one matview.  Reusing the bare form's unordered plan
+		 * under RowExclusiveLock would be mutation M1, arrived at through the
+		 * cache instead of through the code.
 		 */
 		initStringInfo(&buf);
-		appendStringInfo(&buf,
-						 "SELECT 1 FROM %s mv WHERE (%s) ORDER BY %s "
-						 "FOR NO KEY UPDATE",
-						 matview_name, whereClauseStr, conflict_cols.data);
+		appendStringInfo(&buf, "SELECT 1 FROM %s mv WHERE (%s) ",
+						 matview_name, whereClauseStr);
+		if (!serialized)
+			appendStringInfo(&buf, "ORDER BY %s ", conflict_cols.data);
+		appendStringInfoString(&buf, "FOR NO KEY UPDATE");
 
 		cacheEntry->lockPlan = SPI_prepare(buf.data, nargs, argtypes);
 		if (cacheEntry->lockPlan == NULL)

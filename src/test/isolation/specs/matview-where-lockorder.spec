@@ -35,6 +35,28 @@
 # Verified as a detector, not assumed: with the ORDER BY removed from the
 # locking SELECT in refresh_by_direct_modification(), the locked column inverts.
 #
+# The second permutation guards the same property against a different way of
+# losing it.  The ORDER BY is now emitted only for CONCURRENTLY: under the bare
+# form's ExclusiveLock there is no second refresh to order against, so the
+# clause has no job and costs 20-69% of this statement when the predicate's
+# column is not the arbiter key's.  That makes the lock level an input to the
+# generated SQL and therefore to the plan cache's key -- and it is a sharper
+# case than the developer GUC that rule was written for (B31), because the two
+# settings are two spellings of one command and can alternate between adjacent
+# refreshes.  Drop it from the key and a CONCURRENTLY refresh silently reuses
+# the bare form's unordered plan, which is mutation M1 arrived at through the
+# cache instead of through the code.
+#
+# The warm-up refresh names 'cold' rather than 'hot' deliberately, and it is the
+# whole reason the permutation can exist.  It has to share a cache entry with
+# wide_ref and touch none of the rows the observation reads: predicate constants
+# are parameterised, so "tag = 'hot'" and "tag = 'cold'" deparse identically to
+# "tag = $1" and land on one entry, while the rows they refresh are disjoint.
+# A warm-up over 'hot' would lock and rewrite the very rows obs_locked reads --
+# leaving every one of them carrying an xmax, and re-writing them in key order
+# so that a heap-order scan and a key-order scan agree.  That is a test that
+# cannot fail, built out of a test that can.
+#
 # Disposition: keep.  This is the only gate on the A5 fix.  The shell reproducer
 # in src/test/matview_where_stress/ tests the same property probabilistically
 # and goes away with that directory.
@@ -69,6 +91,12 @@ step pin_commit { COMMIT; }
 # locking SELECT's order is whatever the implementation chooses.
 session wide
 setup            { BEGIN; }
+# Warms this backend's plan cache with the BARE form's plans, which carry no
+# ORDER BY.  Commits before returning, because the bare form holds
+# ExclusiveLock and pin_mid could not run beside it; the fresh BEGIN puts the
+# session back where the permutations below expect it.
+step wide_warm   { REFRESH MATERIALIZED VIEW mvlo WHERE tag = 'cold';
+                   COMMIT; BEGIN; }
 step wide_ref    { REFRESH MATERIALIZED VIEW CONCURRENTLY mvlo WHERE tag = 'hot'; }
 step wide_commit { COMMIT; }
 
@@ -82,3 +110,10 @@ step obs_locked  { SELECT id, xmax <> '0'::xid AS locked
 # -- a sequence that terminates whichever direction the refresh locked in, which
 # is why the observer must not hold anything.
 permutation pin_mid wide_ref obs_locked pin_commit wide_commit
+
+# The same assertion after the entry has been warmed by the bare form.  Same
+# matview, same deparsed predicate, same argument types, same arbiter index --
+# only the lock level differs, and with it the statement the plans should be
+# built from.  If that is not in the key, wide_ref runs the unordered plan and
+# the locked column inverts.
+permutation wide_warm pin_mid wide_ref obs_locked pin_commit wide_commit

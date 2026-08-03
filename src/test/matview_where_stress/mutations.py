@@ -365,6 +365,25 @@ MUTATIONS = {
                 '\t\t\t\t\t\t\t\t\t InvalidSnapshot, false) < 0)', 1),
            ]),
 
+    # O3 is B31 again, and a sharper case than the one that rule was written
+    # for.  The pre-lock's ORDER BY is emitted for CONCURRENTLY and not for the
+    # bare form -- under ExclusiveLock there is no second refresh to order
+    # against -- so the lock level changes the generated SQL and belongs in the
+    # plan cache's key.  O2 dropped a developer GUC from that key; this drops
+    # something two adjacent statements can differ in, since the two settings
+    # are just the two spellings of REFRESH.
+    #
+    # The failure is not a stale row version, as O2's was.  It is a CONCURRENTLY
+    # refresh running the bare form's unordered plan: mutation M1 arrived at
+    # through the cache rather than through the code, with M1's consequence.
+    # Caught by matview-where-lockorder's second permutation and by nothing
+    # else -- the single-session suite cannot see a lock order.
+    'O3': ('-', 'concur',
+           'the lock level is dropped from the plan cache key '
+           '(CONCURRENTLY reuses the bare form\'s unordered pre-lock)', [
+               ('\t\tcacheEntry->serialized == serialized &&\n', ''),
+           ]),
+
     # N1 is the detector SPECIALIZE.md 3b asks for by name: it drops the
     # key-only gate and leaves the count comparison, which is the rule 3b
     # refutes and the rule an earlier draft of this work was going to ship.
