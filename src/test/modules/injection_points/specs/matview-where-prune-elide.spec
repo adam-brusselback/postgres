@@ -32,6 +32,15 @@
 # left row 3 in the matview -- in scope, in the matview, produced by nothing --
 # and is the reason the condition exists.
 #
+# There are two expected files.  In the second permutation s1_bare and s2_add
+# are both waiting when s3_wake fires, and isolationtester reports whichever it
+# notices first -- a reporting race, not a semantic one: s2_add cannot complete
+# before s1_bare commits and releases the ExclusiveLock, which is the thing the
+# permutation exists to show.  matview-where-prune-elide_1.out is the other
+# order, and like B32's it is taken verbatim from a run that actually produced
+# it rather than typed out, because an expected file written by hand is a test
+# that cannot fail.
+#
 # Disposition: keep while the prune is elided at all.  The property is data
 # loss, not scaffolding; the injection point is scaffolding, and lives only
 # where the seam does.
