@@ -195,7 +195,7 @@ is better everywhere in it, and a *slower* entry is spelled out as such.
 | **stop deparsing for the cache key** — store the qual tree, compare with `equal()`, deparse only on a miss | — | **4.5–5.3 µs faster** per refresh, **7.4%** at scope 1, again fixed. Closes **B3**: the tree carries parameter types, `$1` does not | `matview_where_cache` Test 4, already two predicates that deparse identically and need different plans |
 | **parameterise predicate `Const`s** — *implemented*; each Const becomes a `Param` of the same type, typmod and collation before the deparse, and the values ride the `ParamListInfo` the path already carried | — | **8× in-backend** (R15), **0.3-45.3% end to end across 40 paired cells, none slower** (R37).  It turns refreshes that would miss the plan cache into hits | oracle, plus `matview_where` Test 19 for the values reaching the right rows and `matview_where_source_plan` part 3 for the plan actually being reused.  Changes what the cache key *is*, so it lands first or last, never in the middle |
 | **skip the UPSERT** when the source is **empty** — ~~skip the prune~~, which is what this row said and is the opposite of the truth: with an empty source the prune is the only thing that can do anything, and skipping it leaves every row that should have left. §3c states it correctly (*"if the source is empty, the mirror holds and the refresh is the `DELETE` alone"*); the row title was wrong for long enough to be worth a retraction rather than a quiet fix. The non-empty half is covered by derived `no_delete` below | 1 + 2 | unmeasured. It is the mirror of `no_delete` — the row-trigger **delete** path, where a trigger refreshes the key of a row that has just gone — and it applies at *any* scope | **none yet** — see 3c |
-| **drop the pre-lock's `ORDER BY`** — *not* the source's, and gated on the **lock level**, not on index alignment | 1 | **Measured directly on the pre-lock: 20–69% of it** when misaligned, growing with scope, and 4–26% when aligned. The pre-lock is 12–15% of a refresh, so the implied whole-refresh saving is **~3–10% — implied, not measured.** Direct whole-refresh measurement cannot resolve it at scope 1000, where the effect is smaller than the harness's own ±11% wobble; only `nonkey`/scope 10000 (+4.8 to +9.4%) is plausibly resolved. Do **not** bundle the source `ORDER BY` in — see below | oracle, plus an isolation permutation showing two refreshes deadlocking if it is dropped under `RowExclusiveLock` |
+| **drop the pre-lock's `ORDER BY`** — *not* the source's, gated on the **lock level**. **IMPLEMENTED, MEASURED AND REVERTED — R44.** | 1 | **It does not pay.** In-backend, paired: **137 µs faster** on a non-key predicate and **613 µs SLOWER** on an aligned range predicate over a matview whose physical order has drifted from its key. The regression is plancache, not the ordering — both forced plan modes read equal — and it is PLAN.md 4.1's narrow-range case reached from an unexpected direction: making a cached statement *cheaper* can stop `auto` settling on a generic plan, and the re-planning costs more than the clause did. The numbers below stand as sub-component measurements and are what a fresh plain-heap clone says: **20–69% of the pre-lock** when misaligned, **4–26%** when aligned. The whole-refresh figure was always *implied, not measured*, and R44 is what happened when it was measured | oracle, plus an isolation permutation showing two refreshes deadlocking if it is dropped under `RowExclusiveLock` — built, seen to fail, and removed with the change |
 | **drop the prune** — `no_delete`, **derived** rather than declared, but **not by the rule this row used to state**: `n_locked + n_inserted == n_source` is unsound on its own, and unsound again under concurrency. §3b has the first counterexample, §3b-ii the second. *Implemented*, gated on the qual being key-only **and** on holding `ExclusiveLock` | **2 + 1**, and a lock level | **10.9% faster at scope 1000 and 13.7% at scope 10000** on the implementation (R42), against a control that reads 0.  R6's model said 13–19% and this is the bottom of that band, which is the direction to expect.  Bare form only.  Model figures: only **1.1% faster** on `expensive`, where GIN maintenance dominates | matview_where Test 20 with `mutations.py` **N1** (drop the key-only gate) and **N2** (skip unconditionally); `matview-where-prune-elide.spec` with **N4** (drop the lock-level condition) — each seen to fail, and each fails a different file |
 | **`DO NOTHING`** (`append_only`) — the half that cannot be derived, because no count taken during a refresh proves existing rows never need rewriting | 4 | a further **10–22 points** on top of `no_delete`, taking the pair to **26–39% faster** at scope ≥1000 | sampling verifier, plus a `mutations.py` entry declaring `append_only` on a view that updates |
 
@@ -385,22 +385,16 @@ concurrency gain that will never appear in a single-client sweep.
   **Done, and it went before the churn gate rather than after** — it was
   unblocked the moment the benchmark could tell the two predicate modes
   apart, and nothing else in Phase 3 could be evaluated until then.
-- The pre-lock `ORDER BY` elision whenever the bare form is being worked on
-  anyway — **and that condition has now fired**: `no_delete` put a
-  lock-level test in `refresh_by_direct_modification()`, so the second customer
-  for §4's `ExclusiveLock` costs a condition rather than a mechanism. It removes
-  a clause measured at 20–69% of the pre-lock, on the lock level rather than on
-  anything about the predicate. Do **not** bundle the source `ORDER BY` into it
-  — that one has never been resolved above the noise, and pairing them would
-  make a measurable change unmeasurable. **Nor bundle it with `no_delete`**: on
-  the bare form both fire at once, so a bare-against-`CONCURRENTLY` measurement
-  reads their sum. The way to separate them is the predicate — a non-key
-  predicate disables `no_delete` and leaves the ordering, which is also the cell
-  where R10 says the ordering costs the most.
-- `append_only` **last, or never**. It is worth 10–22 points faster on top of
-  `no_delete`, which is real, but it is the only item left that needs a
-  declaration — and a declaration whose failure mode is rows that silently
-  never leave has to earn its surface against that number, not against zero.
+- ~~The pre-lock `ORDER BY` elision whenever the bare form is being worked on
+  anyway.~~ **Done, and rejected on its own evidence — R44.** The condition
+  fired (`no_delete` had already put a lock-level test in the right place), the
+  change was three lines, it was sound, and it is a net loss: 137 µs where it
+  helps against 613 µs where plancache reacts to the cheaper statement by
+  re-planning it every call. Recorded here rather than deleted because the
+  reasoning that put it on this list was good and the conclusion still went the
+  other way — R10's 20–69% is a real sub-component number and was never a
+  whole-refresh saving you could add up (X16). Do **not** re-propose it without
+  a cell where it is measured end to end.
 
 ---
 
@@ -558,7 +552,8 @@ setting was in effect.
 **Measured and rejected** — forcing a generic plan (**21.7% slower** net over 94
 comparisons; faster only on range/span 1, where it is +28.6%), the arbiter index
 scan (0.08 µs), the cache sweep (below timer resolution), bypassing SPI (~2 µs
-per statement, not the ~20 a noisy run suggested).
+per statement, not the ~20 a noisy run suggested), and **dropping the pre-lock's `ORDER BY` under `ExclusiveLock`**
+(R44: sound, and a net loss).
 
 **Benchmark `p3opt`** — 4 of 7 workloads: `nonkey` **26–35% faster**, others
 **4–16% faster** at scope ≥100, and **18.5% slower** at scope 1. **Do not quote

@@ -365,41 +365,6 @@ MUTATIONS = {
                 '\t\t\t\t\t\t\t\t\t InvalidSnapshot, false) < 0)', 1),
            ]),
 
-    # O4 is to the pre-lock's ORDER BY what N3 is to the prune elision: it turns
-    # the optimisation off and changes nothing else, so both arms of a
-    # measurement sit inside one build.  The clause goes back to being
-    # unconditional, which is what the code did before and is still correct --
-    # ordering under ExclusiveLock is merely pointless, not wrong.
-    #
-    # Perf-only, and it must be quiet everywhere: M1 is the same line in the
-    # other direction and is a real bug.
-    'O4': ('-', 'perf',
-           'the pre-lock always carries its ORDER BY (the 4/3f elision off)', [
-               ('\t\tif (!serialized)\n'
-                '\t\t\tappendStringInfo(&buf, "ORDER BY %s ", conflict_cols.data);',
-                '\t\tif (true)\n'
-                '\t\t\tappendStringInfo(&buf, "ORDER BY %s ", conflict_cols.data);', 1),
-           ]),
-
-    # O3 is B31 again, and a sharper case than the one that rule was written
-    # for.  The pre-lock's ORDER BY is emitted for CONCURRENTLY and not for the
-    # bare form -- under ExclusiveLock there is no second refresh to order
-    # against -- so the lock level changes the generated SQL and belongs in the
-    # plan cache's key.  O2 dropped a developer GUC from that key; this drops
-    # something two adjacent statements can differ in, since the two settings
-    # are just the two spellings of REFRESH.
-    #
-    # The failure is not a stale row version, as O2's was.  It is a CONCURRENTLY
-    # refresh running the bare form's unordered plan: mutation M1 arrived at
-    # through the cache rather than through the code, with M1's consequence.
-    # Caught by matview-where-lockorder's second permutation and by nothing
-    # else -- the single-session suite cannot see a lock order.
-    'O3': ('-', 'concur',
-           'the lock level is dropped from the plan cache key '
-           '(CONCURRENTLY reuses the bare form\'s unordered pre-lock)', [
-               ('\t\tcacheEntry->serialized == serialized &&\n', ''),
-           ]),
-
     # N1 is the detector SPECIALIZE.md 3b asks for by name: it drops the
     # key-only gate and leaves the count comparison, which is the rule 3b
     # refutes and the rule an earlier draft of this work was going to ship.
@@ -488,17 +453,12 @@ MUTATIONS = {
                 '\tswitch (nodeTag(node))\n\t{\n\t\t/*\n\t\t * These cannot call a function or read a relation themselves, though\n\t\t * something below them might, so keep walking.\n\t\t */'),
            ]),
 
-    # Re-anchored when the clause became conditional on the lock level: it is
-    # now emitted for CONCURRENTLY and not for the bare form, so "drop it" is
-    # "drop it for CONCURRENTLY too" rather than an edit to the statement text.
-    # The bare form's arm is O3's business, and the two are worth keeping apart:
-    # this is A5 as it was reported, and O3 is A5 arriving through the cache.
     'M1': ('A5', 'concur',
            'drop ORDER BY from the row-locking SELECT (deadlock)', [
-               ('\t\tif (!serialized)\n'
-                '\t\t\tappendStringInfo(&buf, "ORDER BY %s ", conflict_cols.data);',
-                '\t\tif (false)\n'
-                '\t\t\tappendStringInfo(&buf, "ORDER BY %s ", conflict_cols.data);', 1),
+               ('"SELECT 1 FROM %s mv WHERE (%s) ORDER BY %s "\n'
+                '\t\t\t\t\t\t "FOR NO KEY UPDATE"',
+                '"SELECT 1 FROM %s mv WHERE (%s) /*%s*/ "\n'
+                '\t\t\t\t\t\t "FOR NO KEY UPDATE"', 1),
            ]),
 
     # The pre-lock weakened to a mode that does not conflict with itself.
@@ -548,13 +508,12 @@ MUTATIONS = {
                 '\tsourceQuery->sortClause = NIL;\t/* M2 */'),
            ]),
 
-    # Re-anchored with M1, and on the WHERE rather than on the FOR clause, so
-    # that the two edits cannot collide: this one makes the statement match no
-    # rows, which takes no locks at all whether or not the ORDER BY is emitted.
     'M3': ('A3', 'concur',
            'remove the row-locking statement entirely (serialization)', [
-               ('appendStringInfo(&buf, "SELECT 1 FROM %s mv WHERE (%s) ",',
-                'appendStringInfo(&buf, "SELECT 1 FROM %s mv WHERE false AND (%s) ",', 1),
+               ('"SELECT 1 FROM %s mv WHERE (%s) ORDER BY %s "\n'
+                '\t\t\t\t\t\t "FOR NO KEY UPDATE"',
+                '"SELECT 1 FROM %s mv WHERE (%s) AND false /*%s*/"\n'
+                '\t\t\t\t\t\t ""', 1),
            ]),
 
     # Kept for the record: verified behaviourally benign.  The planner does not

@@ -95,8 +95,16 @@ su "$RUNAS" -c "PGOPTIONS='$PGOPTIONS' $PSQL" <<SQL
 DROP MATERIALIZED VIEW IF EXISTS pe_mv;
 DROP TABLE IF EXISTS pe_ord;
 CREATE TABLE pe_ord(id bigint primary key, cust int, status text);
+-- Physical order decorrelated from id, deterministically.  Without this the
+-- nonkey cell measures nothing: cust = id % GROUPS leaves the rows of one cust
+-- group in ascending id order in the heap, so ordering the pre-lock by the
+-- arbiter key is the order the scan already returns, there is no Sort and no
+-- random heap access, and the misaligned case R10 measured never happens.  It
+-- read 1.6% that way against 20-69% of the pre-lock in R10, which is what said
+-- the fixture rather than the effect was wrong.
 INSERT INTO pe_ord
-  SELECT g, g % $GROUPS, 'S' || (g % 5) FROM generate_series(1, $SCALE) g;
+  SELECT g, g % $GROUPS, 'S' || (g % 5) FROM generate_series(1, $SCALE) g
+  ORDER BY md5(g::text);
 CREATE MATERIALIZED VIEW pe_mv AS SELECT id, cust, status FROM pe_ord;
 CREATE UNIQUE INDEX ON pe_mv(id);
 CREATE INDEX ON pe_mv(cust);
@@ -160,7 +168,7 @@ done
 
 echo
 echo "per refresh, us -- round 1 discarded"
-awk -v label="$LABEL" -v span="$SPAN" -v pred="$PRED" '
+awk -v label="$LABEL" -v scope="$([ "$PRED" = nonkey ] && echo $((SCALE / GROUPS)) || echo $SPAN)" -v pred="$PRED" '
   $1 > 1 { s[$2] += $3; v[$2, n[$2]++] = $3;
            if (!($2 in lo) || $3 < lo[$2]) lo[$2] = $3;
            if ($3 > hi[$2]) hi[$2] = $3 }
@@ -179,7 +187,7 @@ awk -v label="$LABEL" -v span="$SPAN" -v pred="$PRED" '
              a, md[a], s[a]/n[a], lo[a], hi[a], n[a];
       m[a] = s[a]/n[a] }
     if (("conc" in m) && ("bare" in m)) {
-      printf "\n  %s %s/span=%s -- bare against conc, three statistics:\n", label, pred, span;
+      printf "\n  %s %s/scope=%s -- bare against conc, three statistics:\n", label, pred, scope;
       printf "    median  %+8.1f us  %6.1f%%   <- quote this one\n",
              md["conc"] - md["bare"], 100 * (md["conc"] - md["bare"]) / md["conc"];
       printf "    mean    %+8.1f us  %6.1f%%\n",
