@@ -160,6 +160,24 @@ before any of the fixes in ISSUES.md.  Useful for answering "was this ever
 actually wrong" rather than "is it right now", which is a question that keeps
 coming up and that only the original code can answer.
 
-Build it in a worktree rather than by checking it out in place:
+Build it in a worktree rather than by checking it out in place.  **R51 needs it
+side by side with the current tree**, which means its own prefix, its own
+cluster and its own port -- and none of that survives a container reclaim, so
+the recipe is here rather than in anyone's shell history:
 
     git worktree add /home/user/pg-orig c8beb05
+    chown -R pgtest /home/user/pg-orig
+    mkdir -p /home/user/pgsql-v2 && chown pgtest /home/user/pgsql-v2
+    su pgtest -c "cd /home/user/pg-orig && \
+        ./configure --prefix=/home/user/pgsql-v2 --without-icu CFLAGS=-O2 && \
+        make -j2 install"
+    su pgtest -c "/home/user/pgsql-v2/bin/initdb -D /home/pgtest/pgdata-v2 -U pgtest"
+    su pgtest -c "/home/user/pgsql-v2/bin/pg_ctl -D /home/pgtest/pgdata-v2 \
+        -l /home/pgtest/pg-v2.log -o '-p 5611' -w start"
+
+`-O2` with assertions **off** on both sides, or the comparison is not one.  Then
+`bench/vsv2.sh correct` before `bench/vsv2.sh speed`, in that order and for the
+reason its header gives.  The current tree has to be on the measurement build
+too -- `rebuild.sh --full --prefix=/home/user/pgsql-opt --without-icu CFLAGS=-O2`
+-- and restored to `--enable-cassert --enable-injection-points` afterwards
+before any correctness work.
