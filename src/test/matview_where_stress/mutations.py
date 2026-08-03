@@ -262,6 +262,23 @@ MUTATIONS = {
                 '\t\tif (cacheEntry->sourcePlan == NULL)\n\t\t{'),
            ]),
 
+    # C5, like C4, is perf-only: leaving the predicate's constants as constants
+    # is what the code did before and is still correct in every observable way.
+    # The refresh acts on exactly the same rows; the only difference is that a
+    # caller varying the literal misses the plan cache on every call, which is
+    # 250 us a refresh and most of a scope-1 one.
+    #
+    # It switches the eligibility test off rather than the call site, so every
+    # function stays reachable and the compiler has nothing to say about it --
+    # and so the "before" arm of the measurement differs from the "after" arm in
+    # this one decision and nothing else, which is what C4 exists to provide for
+    # the source plan and is why R34 could be read inside one configuration.
+    'C5': ('-', 'perf',
+           'predicate constants stay constants (the plan cache misses again)', [
+               ('refresh_const_is_paramizable(Const *con)\n{\n',
+                'refresh_const_is_paramizable(Const *con)\n{\n\treturn false;\n', 1),
+           ]),
+
     # The leak, as distinct from C3's crash.  C3 keeps the old plansource *and*
     # keeps using it, which segfaults; this forgets it instead -- the pointer is
     # cleared, so nothing stale is ever dereferenced and the plansource simply

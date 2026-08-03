@@ -86,6 +86,50 @@ SELECT id, v FROM mvsp ORDER BY id;
 
 SELECT injection_points_detach('matview-where-source-planned');
 
+--
+-- ...and now a VARYING literal, which is the case the constant above was
+-- deliberately not.
+--
+-- The cache is keyed on the deparsed predicate, so "WHERE id = 1" and
+-- "WHERE id = 2" used to be two different statements and a caller refreshing
+-- one row at a time re-planned on every single call -- the 8x of RESULTS.md
+-- R15, and most of a scope-1 refresh.  The predicate's constants are now
+-- replaced with parameters before the deparse, so those two are one statement
+-- with different values and the plan is reused across them.
+--
+-- The probe is detached for the warm-up on purpose.  With parameters present
+-- plancache runs its usual custom-versus-generic comparison, which builds
+-- several plans before it settles, and a test that counted them would be
+-- asserting the number 5 in choose_custom_plan() rather than asserting that
+-- the plan gets reused.  Let it settle unwatched, then attach and require
+-- silence.
+--
+UPDATE mvsp_base SET v = 201 WHERE id = 1;
+REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
+REFRESH MATERIALIZED VIEW mvsp WHERE id = 2;
+REFRESH MATERIALIZED VIEW mvsp WHERE id = 3;
+REFRESH MATERIALIZED VIEW mvsp WHERE id = 4;
+REFRESH MATERIALIZED VIEW mvsp WHERE id = 5;
+REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
+REFRESH MATERIALIZED VIEW mvsp WHERE id = 2;
+REFRESH MATERIALIZED VIEW mvsp WHERE id = 3;
+
+SELECT injection_points_attach('matview-where-source-planned', 'notice');
+
+-- Every one of these is a different literal, and none of them may re-plan.
+-- Against a build that does not parameterise the predicate, all five report
+-- "notice triggered for injection point matview-where-source-planned".
+UPDATE mvsp_base SET v = 202 WHERE id = 1;
+REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
+REFRESH MATERIALIZED VIEW mvsp WHERE id = 2;
+REFRESH MATERIALIZED VIEW mvsp WHERE id = 3;
+REFRESH MATERIALIZED VIEW mvsp WHERE id = 4;
+REFRESH MATERIALIZED VIEW mvsp WHERE id = 5;
+
+SELECT id, v FROM mvsp ORDER BY id;
+
+SELECT injection_points_detach('matview-where-source-planned');
+
 DROP MATERIALIZED VIEW mvsp;
 DROP TABLE mvsp_base;
 DROP EXTENSION injection_points;

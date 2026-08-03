@@ -434,6 +434,182 @@ deparseRefreshWhereClause(Oid relid, Node *whereClause)
 }
 
 /*
+ * Working state for parameterizeRefreshWhereClause().
+ */
+typedef struct RefreshParamizeContext
+{
+	int			nextparam;		/* paramid last handed out */
+	List	   *consts;			/* the Consts replaced, in paramid order */
+} RefreshParamizeContext;
+
+/*
+ * May this Const become a Param?
+ *
+ * The deparsed clause renders a Param as "$n" and nothing else -- no type, no
+ * typmod (B3) -- so the type has to travel beside it in the argtypes array
+ * SPI_prepare is given.  A constant with no type to declare therefore cannot
+ * make the trip, and is left as a literal.
+ */
+static bool
+refresh_const_is_paramizable(Const *con)
+{
+	/*
+	 * UNKNOWNOID is the case this exists for.  Handing InvalidOid to
+	 * SPI_prepare does not mean "unknown", it means "resolve it from context",
+	 * and the context is the generated statement rather than the predicate the
+	 * caller wrote.  Rare -- parse analysis resolves almost everything -- and
+	 * one missed cache hit is a far better outcome than a parameter that binds
+	 * to a different type than the literal had.
+	 */
+	if (!OidIsValid(con->consttype) || con->consttype == UNKNOWNOID)
+		return false;
+
+	/* A pseudo-type cannot be the declared type of a parameter either. */
+	if (get_typtype(con->consttype) == TYPTYPE_PSEUDO)
+		return false;
+
+	return true;
+}
+
+static Node *
+paramize_refresh_consts_mutator(Node *node, void *context)
+{
+	RefreshParamizeContext *ctx = (RefreshParamizeContext *) context;
+
+	if (node == NULL)
+		return NULL;
+
+	if (IsA(node, Const))
+	{
+		Const	   *con = (Const *) node;
+		Param	   *param;
+
+		if (!refresh_const_is_paramizable(con))
+			return node;
+
+		param = makeNode(Param);
+		param->paramkind = PARAM_EXTERN;
+		param->paramid = ++ctx->nextparam;
+		param->paramtype = con->consttype;
+		param->paramtypmod = con->consttypmod;
+		param->paramcollid = con->constcollid;
+		param->location = con->location;
+
+		ctx->consts = lappend(ctx->consts, con);
+
+		return (Node *) param;
+	}
+
+	/*
+	 * expression_tree_mutator() hands back a sub-Query untouched, so the
+	 * subselect of a SubLink keeps its constants and a predicate written as a
+	 * subquery still misses the cache when they vary.  That is a missed
+	 * optimisation and not a wrong answer: only the matview's owner may write
+	 * such a predicate at all (the leakproof check above), and reaching into a
+	 * Query needs query_tree_mutator and a decision about what to do with the
+	 * range table, neither of which this is the place for.
+	 */
+	return expression_tree_mutator(node, paramize_refresh_consts_mutator, context);
+}
+
+/*
+ * Turn the predicate's constants into parameters, and extend the caller's
+ * ParamListInfo with their values.
+ *
+ * The plan cache is keyed on the deparsed predicate (matview.c's cache entry,
+ * and SPI's own plancache entries under it), so "WHERE id = 1" and
+ * "WHERE id = 2" are two different statements and a caller refreshing one row
+ * at a time misses on every call.  A caller who binds the value instead hits,
+ * because pg_get_expr renders a Param as "$1" whatever it holds.  Both are
+ * ordinary things to write and they measured 8x apart (RESULTS.md R15).
+ *
+ * So write the second one on the first one's behalf: replace each Const with a
+ * Param of the same type, typmod and collation, and hand the value over in
+ * `params`.  The predicate now deparses to a shape rather than a value, the
+ * key is stable across values, and everything downstream -- the two SPI plans,
+ * the source plansource, and the match/merge path's generated INSERT -- takes
+ * the values through the parameter list it already had for a caller who bound
+ * them.
+ *
+ * PARAM_FLAG_CONST is what keeps a custom plan as good as the literal plan it
+ * replaces: it is the flag eval_const_expressions() looks for before folding
+ * an external parameter back into the constant it came from.  Without it a
+ * custom plan would be planned as blind as a generic one, which is the whole
+ * cost and none of the benefit.  SPI sets the same flag on the parameters it
+ * builds (_SPI_convert_params), so this matches what the path already did for
+ * a caller-supplied parameter.
+ *
+ * Which plan gets used is then plancache's usual decision.  It is not this
+ * function's to make and should not be forced: forcing generic was measured
+ * across 94 comparisons at 21.7% slower net (RESULTS.md R1), and the cases
+ * where a generic plan is wrong -- an array whose selectivity cannot be
+ * estimated without seeing it -- are exactly the ones choose_custom_plan()
+ * already gets right.
+ *
+ * Returns the rewritten clause, and replaces *params.  Both are unchanged when
+ * there was nothing to do.
+ */
+static Node *
+parameterizeRefreshWhereClause(Node *qual, ParamListInfo *params)
+{
+	RefreshParamizeContext ctx;
+	ParamListInfo base = *params;
+	ParamListInfo newparams;
+	Node	   *newqual;
+	ListCell   *lc;
+	int			i;
+
+	/*
+	 * A ParamListInfo that supplies its values through hooks may leave the
+	 * array unpopulated, and its hooks would not survive being copied into a
+	 * longer list of a different shape.  Nothing in the tree reaches REFRESH
+	 * that way -- the extended protocol and SPI both hand over a plain, filled
+	 * array -- but a wrong guess about a rare path is how a rare path becomes a
+	 * wrong answer, so decline it and leave the constants alone.  The refresh
+	 * is then exactly as fast as it was before, which is the right way to fail.
+	 */
+	if (base != NULL && (base->paramFetch != NULL || base->paramCompile != NULL))
+		return qual;
+
+	ctx.nextparam = base ? base->numParams : 0;
+	ctx.consts = NIL;
+
+	newqual = paramize_refresh_consts_mutator(qual, &ctx);
+
+	/* A predicate with no constants -- "WHERE id = $1" already, say. */
+	if (ctx.consts == NIL)
+		return qual;
+
+	newparams = makeParamList(ctx.nextparam);
+
+	/*
+	 * The caller's parameters keep their numbers: the predicate the caller
+	 * wrote may name any of them, and the new ones are appended after.
+	 */
+	i = 0;
+	if (base != NULL)
+	{
+		for (; i < base->numParams; i++)
+			newparams->params[i] = base->params[i];
+	}
+
+	foreach(lc, ctx.consts)
+	{
+		Const	   *con = (Const *) lfirst(lc);
+		ParamExternData *prm = &newparams->params[i++];
+
+		prm->value = con->constvalue;
+		prm->isnull = con->constisnull;
+		prm->pflags = PARAM_FLAG_CONST;
+		prm->ptype = con->consttype;
+	}
+	Assert(i == ctx.nextparam);
+
+	*params = newparams;
+	return newqual;
+}
+
+/*
  * Helper to execute SPI commands with optional parameters.
  */
 static int
@@ -711,6 +887,15 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	{
 		qual = transformRefreshWhereClause(matviewOid, whereClause, params,
 										   save_userid);
+
+		/*
+		 * Before the deparse, because the deparsed text is the plan cache's
+		 * key and the tree is what the source query executes: rewriting one
+		 * and not the other would leave the two disagreeing about which rows
+		 * the predicate selects.
+		 */
+		qual = parameterizeRefreshWhereClause(qual, &params);
+
 		qual_str = deparseRefreshWhereClause(matviewOid, qual);
 	}
 
