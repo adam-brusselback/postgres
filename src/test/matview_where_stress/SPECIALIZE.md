@@ -525,6 +525,16 @@ deliberately (§4). `FOR NO KEY UPDATE` on the pre-lock.
 **Implemented since that line was written, part 2** — derived `no_delete`
 (R42, R43), bare form only.
 
+**The gate, run pristine on one `-O2 --enable-cassert --enable-injection-points`
+build** after that landed: regress **250/250**, isolation **135/135**,
+injection_points **5 regress + 13 specs**, the differential oracle's vector
+**identical to `calibrate.baseline`** (23 shapes, 0 errors) with `rundiff.sh`
+quiet in both arms, `fuzz.sh` **PASS** on all four modes, `mutations.py --check`
+**29/29**, `profile.py --check` **15/15** and seen to emit samples rather than
+only to match, and all five `matview_where*` files green under
+`debug_discard_caches = 1` — 118 s against 470 ms, which is how you can tell the
+setting was in effect.
+
 **Sized, unimplemented** — deparse elision, `append_only`.
 
 **Measured and rejected** — forcing a generic plan (**21.7% slower** net over 94
