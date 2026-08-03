@@ -212,7 +212,10 @@ REFRESH MATERIALIZED VIEW [ CONCURRENTLY ] <replaceable class="parameter">name</
       The <literal>WHERE</literal> clause cannot contain volatile functions or
       aggregates.  It is evaluated with the privileges of the owner of the
       materialized view, so a caller who is not the owner may only use
-      expressions whose functions are all leakproof.
+      expressions whose functions are all leakproof.  For the same reason it is
+      analyzed under the restricted <xref linkend="guc-search-path"/> that
+      applies while the command runs, so any object it names must be
+      schema-qualified.
      </para>
     </listitem>
    </varlistentry>
