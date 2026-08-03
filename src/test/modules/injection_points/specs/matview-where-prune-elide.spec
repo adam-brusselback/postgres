@@ -6,10 +6,12 @@
 # decide it: how many matview rows the pre-lock matched (n_locked), and how many
 # rows the source produced (n_source).  If every source row is accounted for by
 # a row already in scope or by one the upsert has just inserted, nothing in
-# scope is orphaned.  SPECIALIZE.md 3b has that argument and the predicate-shape
-# gate it needs; matview_where Test 20 is its single-session detector.
+# scope is orphaned.  The counts alone are not enough -- the qual must also read
+# only the arbiter key's columns, or a matview row can carry a source row's key
+# without satisfying the predicate and the two errors cancel.  matview_where
+# Test 19 is the single-session detector for that half.
 #
-# What Test 20 structurally cannot see is that n_locked is measured under an
+# What Test 19 structurally cannot see is that n_locked is measured under an
 # EARLIER SNAPSHOT than the DELETE it stands in for.  The pre-lock takes its
 # own; the source evaluation and the DML then take another, and they have to be
 # in that order -- a refresh that queued behind another would otherwise evaluate
@@ -25,8 +27,8 @@
 # So the guard needs a third condition, and it is not about the predicate at
 # all: no other session may be able to write the matview.  ExclusiveLock is
 # where that is true, and the bare WHERE form takes it deliberately for exactly
-# this class of reason (SPECIALIZE.md 4).  Under CONCURRENTLY's
-# RowExclusiveLock the elision is simply not available.
+# this class of reason.  Under CONCURRENTLY's RowExclusiveLock the elision is
+# simply not available.
 #
 # Both permutations were run against a build without that condition.  The first
 # left row 3 in the matview -- in scope, in the matview, produced by nothing --

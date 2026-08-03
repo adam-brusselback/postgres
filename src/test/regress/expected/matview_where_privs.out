@@ -37,7 +37,6 @@
 -- implementation as a security regression.  Rewrite it then to assert that the
 -- leak cannot happen rather than that the rejection does -- do not simply
 -- regenerate the expected output, which would silently retire the check.
--- See src/test/matview_where_stress/PLAN.md 1.4.
 --
 -- The last test deliberately leaves the session unable to protect any matview
 -- from direct DML, so nothing may be added after it.

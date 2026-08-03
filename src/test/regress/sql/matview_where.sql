@@ -517,13 +517,12 @@ DROP TABLE mv_sp_base;
 -- waiting on has fired -- and it asserts a lock level, which is the mechanism,
 -- not "does a concurrent writer block", which is the guarantee.  An
 -- implementation that blocks writers by some other means satisfies the
--- guarantee and fails this test, the same defect as Test 16 and the
--- pg_stat_statements block.
+-- guarantee and fails this test.
 --
 -- The behavioural replacement belongs in the isolation suite next to
 -- matview-where-serialize, which already pins "readers never block"; what is
 -- missing is "the bare form blocks a concurrent writer and CONCURRENTLY does
--- not".  Keep this until that exists.  See src/test/matview_where_stress/PLAN.md.
+-- not".  Keep this until that exists.
 --
 
 CREATE TABLE mv_lock_base (id int primary key, v text);
@@ -633,65 +632,7 @@ DROP MATERIALIZED VIEW mv_multi2;
 DROP TABLE mv_multi2_base;
 
 --
--- Test 16: the refresh inserts new rows in arbiter-key order
---
--- Found here, not on the -hackers thread.  The row-locking SELECT only covers
--- rows that ALREADY exist and match the predicate, so it says nothing about the
--- order the refresh takes locks in for rows it INSERTS.  Those are ordered by
--- the ORDER BY inside the fused CTE's new_data instead, and without it two
--- concurrent refreshes inserting the same new keys can take their speculative
--- insertion locks in opposite orders.
---
--- That ordering is observable without any concurrency: rows appended to the
--- matview land in the heap in the order the upsert touched them, so their
--- physical order is new_data's order.  Reading it back with ORDER BY ctid turns
--- a concurrency property into a deterministic single-session assertion.
---
--- Disposition: REPLACE.  This is a proxy, and it is worth being honest about
--- which.  The property is that two refreshes inserting the same new keys must
--- not deadlock; what is asserted here is physical order, which reveals that
--- property only while insertion order and lock order are the same thing.  An
--- implementation that acquires the locks separately, in order, and then inserts
--- in any order satisfies the property and fails this test.
---
--- The property-level replacement now exists: matview-where-insertorder.spec
--- pins the two ends of the key range in separate sessions and asks, through
--- pg_blocking_pids(), which end a covering refresh stopped on.  That names the
--- order the refresh actually took its speculative-insertion locks in, without
--- assuming insertion order and lock order are the same thing -- so the
--- separately-locking implementation described above passes it, as it should.
--- Verified as a detector: with the ORDER BY removed from new_data, blocked_by
--- flips from pin_lo to pin_hi.
---
--- This test is now redundant with that one and is kept only as a cheap
--- single-session smoke test.  Delete it at Phase 4.
--- See src/test/matview_where_stress/PLAN.md.
---
-
-CREATE TABLE mv_iord_base (id int primary key, tag text, v int);
-INSERT INTO mv_iord_base SELECT g, 'old', g FROM generate_series(1, 10) g;
-
-CREATE MATERIALIZED VIEW mv_iord AS SELECT id, tag, v FROM mv_iord_base;
-CREATE UNIQUE INDEX ON mv_iord(id);
-
--- Inserted descending, so the view query's heap order is the reverse of key
--- order and an unordered new_data would feed the upsert in that reverse order.
-INSERT INTO mv_iord_base SELECT g, 'new', g FROM generate_series(20, 11, -1) g;
-ANALYZE mv_iord_base;
-ANALYZE mv_iord;
-
-REFRESH MATERIALIZED VIEW CONCURRENTLY mv_iord WHERE tag = 'new';
-
--- Must be ascending.  Drop the ORDER BY from new_data and this comes back
--- {20,19,...,11}.
-SELECT array_agg(id ORDER BY ctid) AS insert_order
-  FROM mv_iord WHERE tag = 'new';
-
-DROP MATERIALIZED VIEW mv_iord;
-DROP TABLE mv_iord_base;
-
---
--- Test 17: the row comparison and NULL
+-- Test 16: the row comparison and NULL
 --
 -- The upsert's DO UPDATE carries WHERE (mv cols) IS DISTINCT FROM (EXCLUDED
 -- cols), so a row whose values did not change is not rewritten.  IS DISTINCT
@@ -701,7 +642,7 @@ DROP TABLE mv_iord_base;
 --
 -- Nothing tested that.  The comparison ran in other cases, but their data has
 -- no NULLs, and the two operators agree on every non-NULL row, so mutation B7
--- (`IS DISTINCT FROM` -> `<>`) passed the entire suite.  ISSUES.md B27.
+-- (`IS DISTINCT FROM` -> `<>`) passed the entire suite.
 --
 -- Both directions are needed and they fail differently: NULL -> value leaves the
 -- old NULL, value -> NULL leaves the old value.  A test doing only one of them
@@ -736,16 +677,15 @@ DROP MATERIALIZED VIEW mv_null;
 DROP TABLE mv_null_base;
 
 --
--- Test 18: an unchanged row is not rewritten
+-- Test 17: an unchanged row is not rewritten
 --
 -- Found here, not on the -hackers thread.
 --
--- Test 17 turns the row comparison on and reads values back, which is what a
--- NULL bug corrupts.  It cannot see the comparison being absent: without it
--- every matched row is rewritten, which is what the code did before 03cb4f0
--- and is still correct, so the values are right either way.  Measured rather
--- than supposed -- calibrate-all.sh reported O1, the comparison never emitted,
--- UNCAUGHT by all four instruments.
+-- Test 16 reads values back, which is what a NULL bug corrupts.  It cannot see
+-- the comparison being absent: without it every matched row is rewritten, which
+-- is what the code did before 03cb4f0 and is still correct, so the values are
+-- right either way.  Measured rather than supposed -- mutation O1, the
+-- comparison never emitted, was UNCAUGHT by every instrument in the tree.
 --
 -- What the optimisation is for is not visible in the contents at all, so this
 -- reads the heap instead.  An UPDATE writes a new tuple at a new location, so
@@ -757,14 +697,11 @@ DROP TABLE mv_null_base;
 --
 -- Verified as a detector rather than assumed: under O1 every row comes back f.
 --
--- Disposition: keep, and drop the two SET lines when the optimisation stops
--- being optional.  Not rewriting a row nothing changed about is the feature's
--- promise about write amplification -- it is what makes re-refreshing an
--- already-current scope cheap, and it is the reason a drain can be run often.
--- The promise outlives the flag.
+-- Disposition: keep.  Not rewriting a row nothing changed about is the
+-- feature's promise about write amplification -- it is what makes re-refreshing
+-- an already-current scope cheap, and it is the reason a drain can be run
+-- often.
 --
-
--- No SET here either, for the same reason: this is the default's test.
 
 CREATE TABLE mv_rowver_base (id int primary key, v int, note text);
 INSERT INTO mv_rowver_base SELECT g, g * 10, 'n' || g FROM generate_series(1, 5) g;
@@ -792,7 +729,7 @@ DROP TABLE mv_rowver_base;
 
 
 --
--- Test 19: the predicate's constants become parameters, and the values still
+-- Test 18: the predicate's constants become parameters, and the values still
 --          reach the right rows
 --
 -- The plan cache is keyed on the deparsed predicate, so "WHERE id = 1" and
@@ -864,7 +801,7 @@ DROP MATERIALIZED VIEW mv_pp;
 DROP TABLE mv_pp_base;
 
 --
--- Test 20: the prune is skipped only when it provably cannot delete
+-- Test 19: the prune is skipped only when it provably cannot delete
 --
 -- The fused statement's DELETE carries a guard so the scope is not scanned a
 -- second time when nothing in it can be orphaned.  Two counts decide it: how

@@ -39,10 +39,10 @@
 # XXX There is a second, non-deterministic variant that this spec cannot cover:
 # a *single* refresh statement locks rows in whatever order its plan happens to
 # produce, so two overlapping refreshes with different predicates (and therefore
-# different plans) deadlock against each other without any help.  See
-# src/test/matview_where_stress/.  Note that adding ORDER BY to the row-locking
-# SELECT fixes only that variant, not the one below -- ordering within one
-# statement says nothing about the order of separate statements.
+# different plans) deadlock against each other without any help.  Note that
+# adding ORDER BY to the row-locking SELECT fixes only that variant, not the
+# one below -- ordering within one statement says nothing about the order of
+# separate statements.
 
 setup
 {

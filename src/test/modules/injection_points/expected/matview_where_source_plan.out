@@ -1,10 +1,10 @@
 --
 -- REFRESH MATERIALIZED VIEW ... WHERE ... : is the source plan reused?
 --
--- The Query-tree path rewrites and plans the source query on every refresh,
--- and that line is 16.2% of a warm scope-1 refresh (RESULTS.md R13), of which
--- planning is 97.3% (R27).  Caching it is PLAN.md 3.7.  This is the gate on
--- whether the cache does what it claims.
+-- Rewriting and planning the source query on every refresh cost about a sixth
+-- of a warm scope-1 refresh, almost all of it the planning.  The plan is
+-- therefore cached, and this is the gate on whether that cache does what it
+-- claims.
 --
 -- It cannot be a timing test.  The effect is a few microseconds on a ~60 us
 -- cell and this protocol's noise floor is not established, so a benchmark
@@ -111,10 +111,10 @@ SELECT injection_points_detach('matview-where-source-planned');
 -- The cache is keyed on the deparsed predicate, so "WHERE id = 1" and
 -- "WHERE id = 2" used to be two different statements: a caller refreshing one
 -- row at a time rebuilt the generated SQL, re-prepared both SPI plans and
--- rebuilt and re-planned the source query on every single call.  That is the
--- 8x of RESULTS.md R15 and most of a scope-1 refresh.  Replacing the
--- predicate's constants with parameters makes those two one statement with
--- different values, and the plan is reused across them.
+-- rebuilt and re-planned the source query on every single call, which measured
+-- 8x the cost of a refresh that hits.  Replacing the predicate's constants with
+-- parameters makes those two one statement with different values, and the plan
+-- is reused across them.
 --
 -- Settle again first: part 2 invalidated the entry, so the plansource below is
 -- a new one with its own comparison to make.
@@ -134,9 +134,9 @@ SELECT injection_points_attach('matview-where-source-planned', 'notice');
 (1 row)
 
 -- Every one of these is a different literal, and none of them may re-plan.
--- Against a build that leaves the constants alone -- mutations.py C5 -- all
+-- Verified as a detector: against a build that leaves the constants alone all
 -- five report "notice triggered for injection point
--- matview-where-source-planned", because each is a different cache key and
+-- matview-where-source-planned", because each is then a different cache key and
 -- gets a whole new plansource.
 UPDATE mvsp_base SET v = 202 WHERE id = 1;
 REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;

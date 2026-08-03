@@ -23,10 +23,9 @@
 # and step 2, which is what this spec pins down.
 #
 # Splitting the fused CTE back into two statements reopens a gap of the same
-# family; that is demonstrated in matview_where_stress/safety/a3-split-gap.sh,
-# and it is why the CTE cannot be split for speed.  This spec is the in-tree
-# version of that concern, driven through the real command rather than
-# hand-written SQL.
+# family -- at READ COMMITTED each statement takes its own snapshot, so the
+# upsert can skip a row the prune then declines to delete, and the stale row
+# survives both.  That is why the CTE cannot be split for speed.
 #
 # The injection point is what makes it deterministic: without it the window
 # between the two statements is microseconds wide and nothing can be reliably
@@ -42,9 +41,10 @@
 # structure", which states the problem rather than a reason to keep it.  The
 # structure is not the promise.  The promise is P1: a base-table change landing
 # mid-refresh must not leave the matview holding rows that match no snapshot of
-# the base.  That is held behaviourally by fuzz.sh's serial mode, which detects
-# the two mutations that break it (M3 and M6) at 45 and 55 events per run --
-# see src/test/matview_where_stress/PLAN.md 1.1b and 1.4.
+# the base.  A correct implementation has no window in which that is
+# observable, so the promise itself admits no deterministic test; what is
+# testable is that the locks are held before the source is read, which is what
+# this spec does while the seam exists.
 #
 # So: keep while the two statements exist, because a cheap deterministic check
 # is worth having; delete it with them, and do not treat its removal as a loss

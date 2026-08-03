@@ -21,14 +21,11 @@
 # keys therefore runs beside a wider refresh over the same scope with nothing
 # ordering the two, which is the only way to be inside the window at all.
 #
-# That is also why the concurrent fuzzer cannot stand in for this.  fuzz.sh's
-# serial mode drives the base with UPDATEs, so every key it touches already
-# exists and every overlapping refresh is serialized by the lock -- it is
-# structurally unable to reach this.  An insert-driven fuzzer mode was written
-# and measured against a build with the bug deliberately present: it reported a
-# clean run, because the window is microseconds wide and the violation needs two
-# commits inside it.  The mode was deleted rather than kept as a detector that
-# has been watched not to detect.  See matview_where_stress/PLAN.md 2.1.
+# That is also why a probabilistic reproducer cannot stand in for this.  One was
+# written and run against a build with the bug deliberately present, and it
+# reported a clean run: the window is microseconds wide and the violation needs
+# two commits inside it.  A window needs an injection point; only a rate needs a
+# fuzzer.
 #
 # Disposition: keep, and rewrite the two SET lines away when the text path goes.
 # The property is not scaffolding -- a prune that deletes rows the base still

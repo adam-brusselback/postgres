@@ -41,18 +41,14 @@ MUTATIONS = {
     'A4': ('A4', 'data',
            'drop ON CONFLICT from the upsert (scope drift)', [
                ('"  ON CONFLICT (%s) DO ",', '"  /*%s*/ ",', 1),
-               ('\t\t\tappendStringInfo(&buf, "UPDATE SET %s ", set_clause.data);\n'
-                '\t\t\tif (use_optimized)\n'
-                '\t\t\t\tappendStringInfo(&buf, "WHERE (%s) IS DISTINCT FROM (%s) ",\n'
-                '\t\t\t\t\t\t\t\t mv_cols.data, excluded_cols.data);\n'
-                '\t\t}\n'
+               ('\t\t\tappendStringInfo(&buf,\n'
+                '\t\t\t\t\t\t\t "UPDATE SET %s WHERE (%s) IS DISTINCT FROM (%s) ",\n'
+                '\t\t\t\t\t\t\t set_clause.data, mv_cols.data, excluded_cols.data);\n'
                 '\t\telse\n'
                 '\t\t\tappendStringInfoString(&buf, "NOTHING ");',
-                '\t\t\tappendStringInfo(&buf, "/*%s*/ ", set_clause.data);\n'
-                '\t\t\tif (use_optimized)\n'
-                '\t\t\t\tappendStringInfo(&buf, "/*%s %s*/ ",\n'
-                '\t\t\t\t\t\t\t\t mv_cols.data, excluded_cols.data);\n'
-                '\t\t}\n'
+                '\t\t\tappendStringInfo(&buf,\n'
+                '\t\t\t\t\t\t\t "/*%s %s %s*/ ",\n'
+                '\t\t\t\t\t\t\t set_clause.data, mv_cols.data, excluded_cols.data);\n'
                 '\t\telse\n'
                 '\t\t\tappendStringInfoString(&buf, " ");', 1),
            ]),

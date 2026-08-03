@@ -25,15 +25,15 @@
 # This asserts the property (the insertion order is deterministic and ascending,
 # whoever is doing the inserting) rather than the mechanism.  An implementation
 # that acquires the locks separately and in order, then inserts in any order,
-# still passes -- which is the case that `matview_where` Test 16 gets wrong, and
-# the reason Test 16 is marked REPLACE.
+# still passes.  The single-session version of this -- reading the inserted rows
+# back in ctid order -- does not: it observes physical order, which reveals the
+# ordering only while insertion order and lock order are the same thing.
 #
 # Verified as a detector, not assumed: with the ORDER BY removed from new_data
 # in refresh_by_direct_modification(), blocked_by flips from pin_lo to pin_hi.
 #
 # Disposition: keep.  This and matview-where-lockorder are the two gates on the
-# lock-ordering guarantees; fuzz.sh tests the same property probabilistically
-# and goes away with that directory.
+# lock-ordering guarantees.
 
 setup
 {

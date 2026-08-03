@@ -378,9 +378,9 @@ SELECT * FROM refresh_forms(
 -- (`qual && !skipData && nUniqueIndexes <= 1`) sends every one of them to
 -- refresh_by_direct_modification().  That leaves quote_qualified_identifier()
 -- in refresh_by_match_merge() covered by nothing, and it is a separate call
--- site: mutation Q2 drops it and the whole file stays green, while Q1 and Q3 --
--- the same defect on the direct-modification path -- are both caught.  Found by
--- calibrate-all.sh; ISSUES.md B28.
+-- site: dropping it leaves the whole file green, while the same defect on the
+-- direct-modification path is caught twice over.  Found by removing each
+-- quoting call in turn and running every gate, not by reading.
 --
 -- Two unique indexes are what reaches the other path, and that is the only
 -- structural difference from Test 1.  The bare form is used deliberately: with

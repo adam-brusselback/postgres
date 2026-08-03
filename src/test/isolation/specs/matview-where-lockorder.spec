@@ -35,9 +35,7 @@
 # Verified as a detector, not assumed: with the ORDER BY removed from the
 # locking SELECT in refresh_by_direct_modification(), the locked column inverts.
 #
-# Disposition: keep.  This is the only gate on the A5 fix.  The shell reproducer
-# in src/test/matview_where_stress/ tests the same property probabilistically
-# and goes away with that directory.
+# Disposition: keep.  This is the only gate on the A5 fix.
 
 setup
 {

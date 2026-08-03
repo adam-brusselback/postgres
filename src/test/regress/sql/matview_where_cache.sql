@@ -309,12 +309,9 @@ DROP TABLE mv_c4_inner_base;
 -- the key simply not looking at the predicate, and that is the thing it is for:
 -- two different predicates on one matview must not share plans.
 --
--- Found by mutation, not by reading.  `mutations.py C7` drops the predicate
--- from the comparison and every instrument in the tree stayed quiet -- regress
--- 5/5, the differential oracle's vector identical to the recorded baseline, and
--- fuzz.sh PASS on all four modes.  Nothing anywhere refreshed one matview
--- through two different predicates in one session, so nothing could have seen
--- it.  Same shape as B22 and B30: a clean run meaning an absent test.
+-- Found by mutation, not by reading: dropping the predicate from the comparison
+-- outright left every gate in the tree green, because nothing anywhere
+-- refreshed one matview through two different predicates in one session.
 --
 -- The two predicates are chosen so a confusion is not merely visible but
 -- inverted.  Both carry a single int4 constant, so the argument types match and
