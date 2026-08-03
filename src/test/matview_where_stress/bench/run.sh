@@ -257,8 +257,37 @@ for w in $(list "$WORKLOADS"); do
          # same for every key value.  A predicate naming :k more than once (range,
          # and array once per element) reuses the one parameter, which is what a
          # caller binding it would write too.
+         #
+         # :arraylit and :span are expanded HERE rather than being left to the
+         # sed below, and the order is the whole point.  The array shape's
+         # predicate is "id = ANY(:arraylit)", which contains no :k at all --
+         # every :k it will eventually name arrives inside the array literal.
+         # Substituting :k -> $1 first therefore did nothing, the array literal
+         # landed afterwards still carrying its own :k, and pgbench replaced
+         # those client-side: the param arm measured the LITERAL path plus the
+         # DO-block wrapper and recorded it as param.  It read +10% against
+         # literal on projection/array where a direct four-arm probe reads
+         # 1.84x the other way (predparam.sh).  The range shape was unaffected,
+         # because it names :k itself, which is exactly why the failure was
+         # invisible until two shapes were compared against each other.
          if [ "$PREDMODE" = param ]; then
-           PRED_EXEC=$(echo "$PREDT" | sed 's/:k/$1/g')
+           PRED_EXEC=$(echo "$PREDT" |
+                       sed "s/:arraylit/$ARRLIT/g; s/:span/$span/g" |
+                       sed 's/:k/$1/g')
+           # Any surviving :name is an unexpanded placeholder, and the failure
+           # above is exactly that: an unexpanded :arraylit that pgbench went on
+           # to fill in itself.  A silently-wrong measurement is this suite's
+           # recurring failure, so refuse to take one.
+           case "$PRED_EXEC" in
+             *:[a-z]*) echo "predmode param: unexpanded placeholder in '$PRED_EXEC'" >&2
+                       echo "  every :name must be substituted before :k -> \$1" >&2
+                       exit 2 ;;
+           esac
+           case "$PRED_EXEC" in
+             *'$1'*) ;;
+             *) echo "predmode param: no \$1 in '$PRED_EXEC' -- nothing is bound" >&2
+                exit 2 ;;
+           esac
            REFRESH_STMT="DO \$pb\$ BEGIN EXECUTE 'REFRESH MATERIALIZED VIEW ${CONC}bench.mv WHERE ${PRED_EXEC}' USING :k; END \$pb\$;"
          else
            REFRESH_STMT="REFRESH MATERIALIZED VIEW ${CONC}bench.mv WHERE $PREDT;"
