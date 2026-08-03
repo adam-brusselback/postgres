@@ -177,7 +177,10 @@ the recipe is here rather than in anyone's shell history:
 
 `-O2` with assertions **off** on both sides, or the comparison is not one.  Then
 `bench/vsv2.sh correct` before `bench/vsv2.sh speed`, in that order and for the
-reason its header gives.  The current tree has to be on the measurement build
+reason its header gives — and leave `PRED` at its default of `move`.  A constant
+window is v2's most favourable configuration and current's least at the same
+time, so `PRED=const` is the adversarial cell and not the headline; three sweeps
+were run that way before anyone noticed.  The current tree has to be on the measurement build
 too -- `rebuild.sh --full --prefix=/home/user/pgsql-opt --without-icu CFLAGS=-O2`
 -- and restored to `--enable-cassert --enable-injection-points` afterwards
 before any correctness work.

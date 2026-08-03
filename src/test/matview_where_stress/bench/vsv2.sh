@@ -34,37 +34,44 @@
 #    exist about.  Report the median of the rounds; a mean over few rounds is
 #    not robust to one excursion (X14).
 #
-# 4. THE PREDICATE SHAPE DECIDES THE SMALL-SCOPE ANSWER, and getting this wrong
-#    would have shipped the headline backwards.  A narrow range predicate is
-#    PLAN.md 4.1's worst case for plancache: `auto` keeps choosing a custom plan
-#    for `id BETWEEN $1 AND $1` and re-plans on every execution.  Only the
-#    current tree is exposed to it, because only the current tree parameterises
-#    the predicate's constants; v2 leaves them as literals, so `params` is NULL,
-#    `choose_custom_plan()` short-circuits, and it gets a generic plan
-#    unconditionally and forever.  Measured at scope 1, bare, median of 40:
+# 4. THE PREDICATE SHAPE DECIDES THE SMALL-SCOPE ANSWER, and getting it wrong
+#    published the opposite of the truth twice before this note existed.
 #
-#      BETWEEN 1 AND 1            v2 0.107   cur 0.397    cur 3.7x slower
-#      id = 1                     v2 0.144   cur 0.107    cur 1.3x FASTER
-#      BETWEEN, cur forced generic           cur 0.146    the re-plan is 2.7x
+#    Only the CURRENT tree parameterises the predicate's constants.  v2 leaves
+#    them literal, so `params` is NULL, `choose_custom_plan()` short-circuits,
+#    and v2 gets a generic plan unconditionally and forever.  Two consequences
+#    pull in opposite directions:
 #
-#    So "current is 3.3x slower at scope 1" is a statement about plancache's
-#    handling of one predicate shape, not about the cost of the guarantees.
+#      * A CONSTANT predicate is v2's BEST case -- its cache is keyed on the
+#        predicate text, so it hits every call and never re-plans -- and
+#        current's WORST, because current hits and then pays PLAN.md 4.1's
+#        narrow-range re-plan on every execution.
+#      * A VARYING predicate is v2's worst case: every distinct literal is a
+#        fresh cache key and a fresh parse and plan.  Current is flat, because
+#        it parameterises and hits either way.
 #
-#    AND THE SHAPE HAS A SECOND HALF THAT MATTERS MORE.  A range predicate whose
-#    bounds never change is v2's BEST case: its cache is keyed on the predicate
-#    TEXT, so a constant window hits every call, and with `params` NULL
-#    choose_custom_plan() short-circuits to a generic plan forever and it never
-#    re-plans.  It is simultaneously current's WORST case, for the reason above.
-#    A real range window moves.  Measured, 10-row window, bare, median of 40:
+#    Measured, bare, 10-row window, median of 40:
 #
 #      constant window   v2 0.153   cur 0.422    cur 2.8x slower
 #      moving window     v2 0.499   cur 0.425    cur 1.2x FASTER
 #
-#    Current is flat across the two because it parameterises and hits either
-#    way; v2 triples because each distinct literal is a fresh key and a fresh
-#    plan.  So PRED defaults to `move`, and `const` is kept and labelled as the
-#    adversarial cell rather than quietly used as the headline -- which is what
-#    the first two runs of this script did.
+#    A range window that never moves is not a workload.  So PRED defaults to
+#    `move`; `const` is kept and LABELLED as the adversarial cell rather than
+#    quietly used as the headline, which is what the first three sweeps did.
+#
+#    The re-plan behind the `const` loss is a fixed ~0.25 ms, worth 71% of the
+#    refresh at scope 1, 67% at 10, 32% at 50, 24% at 100 and nothing by 500
+#    (current tree, `auto` against `force_generic_plan`).  It needs a fixed
+#    window AND a small scope AND a high rate to matter at all.
+#
+# 5. ONE CELL NEEDED MORE THAN A SWEEP.  scope-1 bare read +8.1 / -25.2 / +18.0%
+#    across three moving-window sweeps -- v2 tight at 0.457/0.472/0.518, current
+#    carrying one excursion at 0.591 against 0.420/0.425.  Settled by a focused
+#    probe rather than by averaging sweeps: 12 alternating rounds x 60
+#    refreshes, v2 median 0.470 / mean 0.476 / min 0.449 against current 0.381 /
+#    0.401 / 0.338, all three statistics favouring current and the ranges barely
+#    overlapping.  X14's rule, met: when a cell disagrees with itself across
+#    runs, sample that cell rather than quoting whichever run finished last.
 set -eu
 
 DIR=$(cd "$(dirname "$0")/.." && pwd)
