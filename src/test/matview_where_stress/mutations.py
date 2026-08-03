@@ -353,13 +353,63 @@ MUTATIONS = {
                 '\t\t\tDropCachedPlan(entry->sourcePlan);\n', ''),
            ]),
 
+    # NB: this stopped applying when the prune guard landed and gave the DML
+    # call site a third argument -- B23 again, and the occurrence count is what
+    # said so.  Anchored on the snapshot argument alone now, which is the only
+    # thing the mutation changes; it is unique because the lock call site sits
+    # at a different indentation.
     'S1': ('-', 'concur',
            'run the fused DML under a fresh snapshot, not the one the source '
            'was evaluated under (reopens the prune gap)', [
-               ('\t\tif (matview_execute_spi_plan(cacheEntry->refreshPlan, params,\n'
-                '\t\t\t\t\t\t\t\t\t snapshot, false) < 0)',
-                '\t\tif (matview_execute_spi_plan(cacheEntry->refreshPlan, params,\n'
-                '\t\t\t\t\t\t\t\t\t InvalidSnapshot, false) < 0)'),
+               ('\t\t\t\t\t\t\t\t\t snapshot, false) < 0)',
+                '\t\t\t\t\t\t\t\t\t InvalidSnapshot, false) < 0)', 1),
+           ]),
+
+    # N1 is the detector SPECIALIZE.md 3b asks for by name: it drops the
+    # key-only gate and leaves the count comparison, which is the rule 3b
+    # refutes and the rule an earlier draft of this work was going to ship.
+    #
+    # The failure is a silently missing DELETE.  Every refresh succeeds, the
+    # rowcount is plausible, and the matview keeps a row its own definition does
+    # not produce -- so the only thing that can see it is a case where the
+    # counts agree while a row IS orphaned, which needs a predicate on a non-key
+    # column and one row leaving the scope as another enters.  matview_where
+    # Test 20a and 20b are that case; nothing else in the suite is.
+    'N1': ('-', 'data',
+           'the prune elision drops its key-only gate '
+           '(scope drift survives the refresh)', [
+               ('\tprm->value = Int64GetDatum(qual_key_only ? n_source : -1);',
+                '\tprm->value = Int64GetDatum(n_source);', 1),
+           ]),
+
+    # N2 is the same optimisation failing the other way: the prune is skipped
+    # unconditionally.  Cruder than N1 and it belongs in the corpus anyway,
+    # because it is the calibration that says the guard's VALUES are what
+    # decides -- N1 leaves the boolean alone and N2 leaves the counts alone, so
+    # a detector that fires on both is reading the decision and not the shape of
+    # the statement.
+    #
+    # Loud, as it should be: it breaks the contract file's Promise 3 (a row that
+    # leaves the scope is deleted) as well as Test 20.
+    'N2': ('-', 'data',
+           'the prune is skipped unconditionally (nothing is ever deleted)', [
+               ('\tprm->value = BoolGetDatum(n_locked == 0);',
+                '\tprm->value = BoolGetDatum(true);', 1),
+           ]),
+
+    # N3 is perf-only, and it is C4's role for this optimisation: it turns the
+    # elision off and changes nothing else, so the "before" arm of a measurement
+    # differs from the "after" arm in this one decision rather than across two
+    # builds.  Both guard values are neutralised -- the boolean to false and the
+    # count to -1, which no non-negative left-hand side can equal -- so the
+    # statement, its plan and its cache key are untouched and only the DELETE's
+    # One-Time Filter changes.
+    'N3': ('-', 'perf',
+           'the prune runs on every refresh (the 3b elision silently off)', [
+               ('\tprm->value = BoolGetDatum(n_locked == 0);',
+                '\tprm->value = BoolGetDatum(false);', 1),
+               ('\tprm->value = Int64GetDatum(qual_key_only ? n_source : -1);',
+                '\tprm->value = Int64GetDatum(-1);', 1),
            ]),
 
     # The guard for matview_where_privs Test 3.

@@ -1008,3 +1008,124 @@ SELECT a, b, v FROM mv_pp ORDER BY a, b;
 
 DROP MATERIALIZED VIEW mv_pp;
 DROP TABLE mv_pp_base;
+--
+-- Test 20: the prune is skipped only when it provably cannot delete
+--
+-- The fused statement's DELETE carries a guard so the scope is not scanned a
+-- second time when nothing in it can be orphaned.  Two counts decide it: how
+-- many matview rows the pre-lock matched, and how many rows the source
+-- produced.  If every source row is accounted for by a row that was already in
+-- scope or by one the upsert has just inserted, nothing in scope is orphaned.
+--
+-- That accounting is UNSOUND on its own, and its failure is a silently missing
+-- DELETE rather than a slow refresh, so the interesting cases here are the ones
+-- where the counts agree and the prune must run anyway.  It assumes a source
+-- row that conflicts with an existing matview row conflicts with one IN SCOPE.
+-- A predicate reading a non-key column breaks that: ON CONFLICT arbitrates on
+-- the key and knows nothing about the predicate, so the upsert can match a row
+-- the pre-lock never counted -- and a genuinely orphaned row elsewhere in the
+-- scope cancels the discrepancy exactly.  Hence the gate: the predicate must
+-- read nothing but the arbiter index's key columns, where two rows with the
+-- same key necessarily agree on the predicate.
+--
+-- Disposition: keep.  These are not tests of an optimisation, they are tests of
+-- the promise the optimisation is allowed to keep -- "a row that leaves the
+-- scope is deleted" -- in the cases where a cheaper implementation would stop
+-- keeping it.  They outlive any particular guard.
+--
+-- 20a: the counterexample.  One row leaves the scope and one enters it, so
+-- locked, source and inserted balance while a row is orphaned all the same.
+CREATE TABLE mv_nd_base (k int PRIMARY KEY, status text);
+INSERT INTO mv_nd_base VALUES (1, 'A'), (2, 'B');
+CREATE MATERIALIZED VIEW mv_nd AS SELECT k, status FROM mv_nd_base;
+CREATE UNIQUE INDEX ON mv_nd (k);
+UPDATE mv_nd_base SET status = 'B' WHERE k = 1;   -- leaves the scope
+UPDATE mv_nd_base SET status = 'A' WHERE k = 2;   -- enters it
+-- n_locked = 1 (the matview's (1,'A')), n_source = 1 (the base's (2,'A')),
+-- n_inserted = 0 (k=2 conflicts with the matview's (2,'B')).  1 + 0 = 1, and
+-- k=1 must still be deleted.
+REFRESH MATERIALIZED VIEW mv_nd WHERE status = 'A';
+SELECT k, status FROM mv_nd ORDER BY k;
+ k | status 
+---+--------
+ 2 | A
+(1 row)
+
+-- 20b: the same cancellation with a predicate that DOES name a key column, so
+-- the gate cannot be "does the predicate mention the key".
+CREATE TABLE mv_nd5_base (k int PRIMARY KEY, status text, v text);
+INSERT INTO mv_nd5_base VALUES (1, 'A', 'p'), (2, 'B', 'q');
+CREATE MATERIALIZED VIEW mv_nd5 AS SELECT k, status, v FROM mv_nd5_base;
+CREATE UNIQUE INDEX ON mv_nd5 (k);
+UPDATE mv_nd5_base SET status = 'B' WHERE k = 1;
+UPDATE mv_nd5_base SET status = 'A' WHERE k = 2;
+REFRESH MATERIALIZED VIEW mv_nd5 WHERE k <= 2 AND status = 'A';
+SELECT k, status, v FROM mv_nd5 ORDER BY k;
+ k | status | v 
+---+--------+---
+ 2 | A      | q
+(1 row)
+
+-- 20c: a key-only predicate, both directions.  The first refresh is the case
+-- the elision exists for -- every source row matches a row already in scope --
+-- and the second is the same statement when a row really has gone.
+CREATE TABLE mv_nd2_base (k int PRIMARY KEY, v text);
+INSERT INTO mv_nd2_base VALUES (1, 'a'), (2, 'b'), (3, 'c');
+CREATE MATERIALIZED VIEW mv_nd2 AS SELECT k, v FROM mv_nd2_base;
+CREATE UNIQUE INDEX ON mv_nd2 (k);
+UPDATE mv_nd2_base SET v = 'A' WHERE k = 1;
+REFRESH MATERIALIZED VIEW mv_nd2 WHERE k <= 2;
+SELECT k, v FROM mv_nd2 ORDER BY k;
+ k | v 
+---+---
+ 1 | A
+ 2 | b
+ 3 | c
+(3 rows)
+
+DELETE FROM mv_nd2_base WHERE k = 2;
+REFRESH MATERIALIZED VIEW mv_nd2 WHERE k <= 2;
+SELECT k, v FROM mv_nd2 ORDER BY k;
+ k | v 
+---+---
+ 1 | A
+ 3 | c
+(2 rows)
+
+-- 20d: nothing in scope at all.  The matview holds no row the predicate
+-- selects, so the DELETE cannot match -- the upsert's own insert is not
+-- visible to it -- and the row still has to arrive.
+INSERT INTO mv_nd2_base VALUES (2, 'B');
+REFRESH MATERIALIZED VIEW mv_nd2 WHERE k = 2;
+SELECT k, v FROM mv_nd2 ORDER BY k;
+ k | v 
+---+---
+ 1 | A
+ 2 | B
+ 3 | c
+(3 rows)
+
+-- 20e: a composite key with the predicate covering only its leading column.
+-- Still key-only, and the counts still have to notice the row that went.
+CREATE TABLE mv_nd4_base (a int, b int, v text, PRIMARY KEY (a, b));
+INSERT INTO mv_nd4_base VALUES (1, 1, 'x'), (1, 2, 'y'), (2, 1, 'z');
+CREATE MATERIALIZED VIEW mv_nd4 AS SELECT a, b, v FROM mv_nd4_base;
+CREATE UNIQUE INDEX ON mv_nd4 (a, b);
+DELETE FROM mv_nd4_base WHERE a = 1 AND b = 2;
+UPDATE mv_nd4_base SET v = 'X' WHERE a = 1 AND b = 1;
+REFRESH MATERIALIZED VIEW mv_nd4 WHERE a = 1;
+SELECT a, b, v FROM mv_nd4 ORDER BY a, b;
+ a | b | v 
+---+---+---
+ 1 | 1 | X
+ 2 | 1 | z
+(2 rows)
+
+DROP MATERIALIZED VIEW mv_nd4;
+DROP TABLE mv_nd4_base;
+DROP MATERIALIZED VIEW mv_nd2;
+DROP TABLE mv_nd2_base;
+DROP MATERIALIZED VIEW mv_nd5;
+DROP TABLE mv_nd5_base;
+DROP MATERIALIZED VIEW mv_nd;
+DROP TABLE mv_nd_base;
