@@ -1140,11 +1140,33 @@ not exist before 2.1 and is the obvious asymmetry it left behind. Cache the
 invalidation.
 
 **3.8 The predicate is deparsed on every refresh, for the cache key alone.**
-`deparseRefreshWhereClause()` runs `nodeToString()` + `pg_get_expr()` on every
-call including a hit, and the only consumer on the Query-tree path is
-`strcmp()` against the stored key. Compare the trees with `equal()`, or hash
-the `nodeToString()` and compare hashes, or key on the jumble. 2.3 removes the
-other reason the deparse exists, so these land together.
+**DONE**, by the first of the three options this entry listed: the entry holds
+the qual tree and compares it with `equal()`, and the deparse moves into the
+cache-miss branch, where SPI still needs a string.  **R48**: 5.0–8.6 µs and
+8.6–17.3% at scope 1 in-backend, three runs with all nine statistics positive;
+**R49** confirms a warm refresh now deparses nothing at all, 0.00 µs in 54 warm
+bands.  Fixed cost, so it is nothing by scope 100.
+
+Three things this entry did not anticipate, each of which cost a step:
+
+- **The key had no gate.** `mutations.py C7` drops the predicate from the
+  comparison entirely and **all four instruments stayed quiet** — regress 5/5,
+  the oracle's vector identical to baseline, `fuzz.sh` PASS.  Nothing in the
+  tree refreshed one matview through two different predicates in one session.
+  `matview_where_cache` Test 7 closes it, and `C8` — comparing only the top node
+  — is the near miss that would pass everything C7 fails.  A replacement for an
+  ungated comparison is how a silent one ships, so the gate went in first, as
+  its own commit.
+- **A node tree cannot be `pfree`d.** The entry's metadata moved into a context
+  of its own, reset on a key change and deleted by the sweep, with `argtypes`
+  in it so one reset covers both.
+- **The measurement's off arm was outside the timer.**  See **X19**: the first
+  run reported the elision 8.2% *slower*, from two builds doing identical timed
+  work.
+
+This entry also said "2.3 removes the other reason the deparse exists, so these
+land together".  2.3 is closed for the cycle and the deparse is still needed on
+a miss, so they did not land together and did not need to.
 
 **3.9 The arbiter index is re-derived on every refresh.** `RelationGetIndexList()`
 plus an `index_open()` per index, before the cache is even probed — and the

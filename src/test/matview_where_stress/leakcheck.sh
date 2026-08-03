@@ -44,8 +44,19 @@
 # detector -- "it printed ok" is not evidence, which is the mistake that put
 # `nested` in this file reporting a clean bill while observing nothing.
 #
-#   churn    DETECTOR, calibrated.  Under L3 (key-mismatch drop removed):
-#            +400 plansources over 400 refreshes, one per refresh.
+#   churn    DETECTOR, calibrated TWICE and re-calibrated once.  Under L3
+#            (key-mismatch drop removed): +800 plansources, one per refresh,
+#            the body issuing two.  Under L5 (the cache key's context rebuilt
+#            instead of reset): +800 keys, and `steady` stays at +0, which is
+#            what says the leak is reached by the key CHANGING rather than by
+#            refreshing.
+#
+#            The earlier calibration recorded here was +400/400 and had gone
+#            stale without a word: the mode used to alternate `id = 1` with
+#            `id = 2`, and once the predicate's constants became parameters
+#            both deparsed to `id = $1`, every refresh hit, and the mismatch
+#            path was never taken.  Re-running L3 against it read +0.  That is
+#            what a recorded number is worth once the code under it has moved.
 #   dropmv   DETECTOR, calibrated.  Under L4 (sweep drop removed): +200 over
 #            200, one per dropped matview.  L3 leaves it at +0, so the modes
 #            are specific rather than all firing at once.
@@ -73,8 +84,17 @@ GUCS="SET matview_partial_refresh_optimized = off;"
 
 # Counted inside the session under test: a plansource leaked by one backend is
 # invisible to every other one.
+#
+# The third column is the cache entry's own metadata context, added when the
+# plan-cache key became the qual TREE rather than its deparsed text (R48).  A
+# node tree cannot be pfree'd, so the entry got a context to hold it, and a
+# context is a lifetime -- which means it is a thing that can be leaked, by
+# exactly the same slip L3 makes one level over.  Counting only plansources
+# would have been blind to it: this file's own reason for existing is that
+# "every result is correct and the backend grows forever" has no other detector.
 COUNT="SELECT count(*) FILTER (WHERE name = 'CachedPlanSource')
          || ' ' || count(*) FILTER (WHERE name = 'CachedPlan')
+         || ' ' || count(*) FILTER (WHERE name = 'MatView Partial Refresh Cache Key')
     FROM pg_backend_memory_contexts;"
 
 run_mode() {
@@ -88,10 +108,23 @@ run_mode() {
                CREATE UNIQUE INDEX ON lk_mv(id);"
         drop="DROP MATERIALIZED VIEW lk_mv; DROP TABLE lk_base;" ;;
     churn)
-        # Two predicates that deparse differently, so every other refresh is a
+        # Two predicates on DIFFERENT COLUMNS, so every other refresh is a
         # cache-key mismatch and rebuilds the entry.
+        #
+        # It used to be `id = 1` against `id = 2`, and that stopped being a
+        # mismatch when the predicate's constants started being replaced by
+        # parameters: both now deparse to `id = $1` and compare equal, so the
+        # entry is HIT every time and this mode had quietly stopped exercising
+        # the path it is named after.  Nothing said so -- it kept printing ok,
+        # which is what it prints when there is no leak and what it prints when
+        # it is not looking.  Caught by re-running L3 against it, whose recorded
+        # calibration here is +400 over 400 refreshes: it read +0.
+        #
+        # Different columns rather than different values is what survives
+        # parameterisation, since the Var is what differs and no substitution
+        # touches it.
         body="REFRESH MATERIALIZED VIEW lk_mv WHERE id = 1;
-              REFRESH MATERIALIZED VIEW lk_mv WHERE id = 2;"
+              REFRESH MATERIALIZED VIEW lk_mv WHERE v = 1;"
         setup="CREATE TABLE lk_base(id int primary key, v int);
                INSERT INTO lk_base SELECT g, g FROM generate_series(1,50) g;
                CREATE MATERIALIZED VIEW lk_mv AS SELECT id, v FROM lk_base;
@@ -154,17 +187,17 @@ run_mode() {
       | awk -v mode="$mode" -v runs="$RUNS" '
           /^MARK_BEFORE$/ { want = "b"; next }
           /^MARK_AFTER$/  { want = "a"; next }
-          want == "b" && NF { split($0, x, " "); bs = x[1]; bp = x[2]; want = "" }
-          want == "a" && NF { split($0, x, " "); as = x[1]; ap = x[2]; want = "" }
+          want == "b" && NF { split($0, x, " "); bs = x[1]; bp = x[2]; bk = x[3]; want = "" }
+          want == "a" && NF { split($0, x, " "); as = x[1]; ap = x[2]; ak = x[3]; want = "" }
           END {
             if (bs == "" || as == "") {
               printf "  %-7s NO SAMPLES -- markers never arrived; not reporting\n", mode
               exit 1
             }
-            ds = as - bs; dp = ap - bp
-            status = (ds > 0 || dp > 0) ? "LEAK" : "ok"
-            printf "  %-7s plansources %s -> %s (%+d)   plans %s -> %s (%+d)   over %d refreshes   %s\n",
-                   mode, bs, as, ds, bp, ap, dp, runs, status
+            ds = as - bs; dp = ap - bp; dk = ak - bk
+            status = (ds > 0 || dp > 0 || dk > 0) ? "LEAK" : "ok"
+            printf "  %-7s plansources %s -> %s (%+d)   plans %s -> %s (%+d)   keys %s -> %s (%+d)   over %d refreshes   %s\n",
+                   mode, bs, as, ds, bp, ap, dp, bk, ak, dk, runs, status
           }'
 }
 
@@ -173,7 +206,13 @@ if [ "${1:-}" = "--selftest" ]; then
 Calibration, run by hand because it needs a rebuild between the two halves:
 
     ./mutations.py L3 && ./rebuild.sh --source && ./leakcheck.sh churn nested
-      -> must report LEAK, with the count climbing by roughly one per refresh
+      -> must report LEAK in the PLANSOURCES column, climbing by roughly one
+         per refresh
+
+    ./mutations.py L5 && ./rebuild.sh --source && ./leakcheck.sh churn
+      -> must report LEAK in the KEYS column, one per cache-key mismatch, and
+         `steady` must stay ok: a key that never changes is never rebuilt, so
+         the leak is reached by the swap and not by the refresh
 
     ./mutations.py pristine && ./rebuild.sh --source && ./leakcheck.sh
       -> must report ok everywhere

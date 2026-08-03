@@ -381,6 +381,28 @@ MUTATIONS = {
     # Both drop sites, because they leak on different paths: the key-mismatch
     # rebuild leaks one per predicate switch, and the nested-refresh teardown
     # leaks one per nested refresh, on the success and error paths alike.
+    # L3's slip one level over, on the context the cache key moved into when it
+    # became a node tree (R48).  Building a fresh context instead of reusing the
+    # entry's own orphans the previous one on every cache-key mismatch: its
+    # contents are unreachable, nothing ever deletes it, and every answer the
+    # refresh gives is still correct.
+    #
+    # Reached by the key CHANGING, not by refreshing -- so leakcheck's `churn`
+    # mode is the detector and `steady` must stay quiet, which is what says the
+    # two modes are measuring different paths rather than the same one twice.
+    'L5': ('-', 'leak',
+           'the cache key\'s memory context is rebuilt instead of reset '
+           '(leaks one per predicate switch; every result still correct)', [
+               ('\t\t\tif (cacheEntry->metacxt == NULL)\n'
+                '\t\t\t\tcacheEntry->metacxt =\n'
+                '\t\t\t\t\tAllocSetContextCreate(CacheMemoryContext,',
+                '\t\t\t{\n'
+                '\t\t\t\tcacheEntry->metacxt =\n'
+                '\t\t\t\t\tAllocSetContextCreate(CacheMemoryContext,', 1),
+               ('\t\t\t\t\t\t\t\t\t\t  ALLOCSET_SMALL_SIZES);\n',
+                '\t\t\t\t\t\t\t\t\t\t  ALLOCSET_SMALL_SIZES);\n\t\t\t}\n', 1),
+           ]),
+
     'L3': ('-', 'leak',
            'the source plansource is forgotten instead of dropped '
            '(leaks one per rebuild; every result still correct)', [

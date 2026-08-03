@@ -452,10 +452,17 @@ something by reasoning.
   tests need `shared_preload_libraries`); it must be `make check`, and reading
   the no-op's silence as a pass is the same mistake one level up;
 - **`rundiff.sh` quiet: 23 shapes, 0 divergences, 0 errors in either arm**;
-- **no leaks**: `leakcheck.sh` reports +0 plansources on all four modes over 300
-  refreshes each, with `churn` calibrated against `L3` (+400/400) and `dropmv`
-  against `L4` (+200/200).  `steady` is a control and `nested` is not live --
-  the per-mode table in that script says which is which and why.
+- **no leaks**: `leakcheck.sh` reports +0 on all four modes over 400 refreshes
+  each, in all three columns.  `dropmv` is calibrated against `L4` (+200/200).
+  `churn` is calibrated against `L3` -- **at +800, not the +400 recorded here
+  before**: that figure went stale when the predicate's constants became
+  parameters, since `id = 1` and `id = 2` then deparsed alike and the mode
+  stopped taking the cache-key mismatch path at all while still printing ok
+  (ISSUES.md B37).  It now alternates two *columns*.  The third column counts
+  the cache key's own memory context, added when the key became a node tree,
+  and is calibrated against `L5` (+800 on `churn`, +0 on `steady`).  `steady` is
+  a control and `nested` is not live -- the per-mode table in that script says
+  which is which and why.
 
 **Step E is done and §8 is met.**  PLAN.md step 2 -- flip the `querytree`
 default and re-run 2.1b -- was blocked on this and is now unblocked by R34.

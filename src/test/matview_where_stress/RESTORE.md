@@ -122,6 +122,37 @@ identical to `calibrate.baseline`, `fuzz.sh` PASS on all four modes,
 
 ---
 
+## the deparse elision — the plan cache stops needing text
+
+The point at which the cache key is the qual tree rather than its deparsed
+form, and a refresh that hits the cache does no deparse at all.
+
+| commit | what |
+|---|---|
+| `0675444` | nothing checked that the key reads the predicate — the gate, first |
+| `09cf6ff` | the predicate is no longer deparsed on a refresh that hits |
+| `bcb81e2` | the arm that measures it, and `--overlay` so it can compose with the profiler |
+
+Build, as reported by the running server:
+
+    ./configure --prefix=/home/user/pgsql-opt --without-icu \
+                --enable-cassert --enable-injection-points CFLAGS=-O2
+    debug_assertions = on
+
+R48 and R49 were taken on the **measurement** build — the same flags without
+`--enable-cassert --enable-injection-points`.  The gate below was run on the
+assertions build.  Do not compare a timing across the two.
+
+Gates at this point, all pristine: regress **250/250**, isolation **135/135**,
+injection_points **5 regress + 13 specs**, the differential oracle's vector
+identical to `calibrate.baseline` (46 cells), `fuzz.sh` PASS on all four modes,
+`mutations.py --check` **33/33**, `profile.py --check` **15/15**,
+`leakcheck.sh` +0 on all four modes in all three columns, `pg_stat_statements`
+15/16 confirmed as B25's exact one-line diff, and all five `matview_where*`
+files green under `debug_discard_caches = 1`.
+
+---
+
 ## `c8beb05` — the patch as posted to -hackers
 
 Not a restore point so much as the reference: the original implementation,

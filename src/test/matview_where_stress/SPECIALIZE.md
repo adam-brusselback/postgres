@@ -192,7 +192,7 @@ is better everywhere in it, and a *slower* entry is spelled out as such.
 |---|---|---|---|
 | **row comparison** — `WHERE (mv.cols) IS DISTINCT FROM (EXCLUDED.cols)` on the `DO UPDATE`. **Implemented and ON by default.**  It was going to be *T3 churn with a T1 veto when no index covers a written column*; **both of those are gone** — the veto because it does not reproduce (X17) and the churn gate because nothing below full churn needs one.  No tier decides it | — | **+2.2% at scope 1, +15.1% at 25, +29.0% at 100, +44.6% at 1000, +70.1% at 10,000** (R45), zero churn, settled heap.  **The two figures that used to argue for gating it are retracted**: it is not 18.5% slower at scope 1 (all three statistics positive over 23 bands) and it does not need a covering index (+38.5% without one).  Degrades with churn but never measurably loses: **+16.8% at 50% churn and a wash at 100%** (R46), so the scope where nearly everything changed pays nothing rather than the few percent this row used to claim.  Always quote the protocol with the number — see heap state in §1 | oracle — 23 shapes, **and the vector is identical to a baseline recorded with it OFF**, which is what says it is behaviour-neutral rather than merely untested; plus `matview_where` Test 17 (`mutations.py` B7, NULL safety) and Test 18 (O1, the row version), both of which now carry no `SET` and so are the **default's** detectors |
 | **cache the source plan** — removes rewrite + plan from every refresh | — | **12.2 µs faster** per refresh — worth **16.2%** at scope 1 and nothing at scale, because it is a fixed cost | `matview_where_cache` 1–3, which need a **base-table** variant: a stashed `PlannedStmt` is not revalidated when a base table changes, so this must go through the plancache, not a pointer |
-| **stop deparsing for the cache key** — store the qual tree, compare with `equal()`, deparse only on a miss | — | **4.5–5.3 µs faster** per refresh, **7.4%** at scope 1, again fixed. Closes **B3**: the tree carries parameter types, `$1` does not | `matview_where_cache` Test 4, already two predicates that deparse identically and need different plans |
+| **stop deparsing for the cache key** — store the qual tree, compare with `equal()`, deparse only on a miss. **IMPLEMENTED**, exactly as this row describes it | — | **5.0–8.6 µs faster per refresh, 8.6–17.3%** at scope 1 in-backend, three runs and nine statistics all positive (**R48**); quote the minima band, **5.9–7.1 µs**, which is the tightest across runs. That is above this row's original **4.5–5.3 µs**, which was the *component* cost (R14) on an older tree with a 61.6 µs base rather than this 43 µs one — same direction, not a like-for-like pair. Fixed, so it is 0.0% by scope 100 and nothing here is a claim about a large scope. It does close **B3** as this row said: the tree carries `paramtype` and `paramtypmod` where `$1` carries nothing — though `argtypes` stays anyway, since a caller may bind a parameter the predicate never names and the generated statement still declares it | **not** Test 4, which was this row's original answer and is not enough: it pins parameter *types*, which `argtypes` decides either way. The gate is `matview_where_cache` **Test 7** with `mutations.py` **C7** (drop the predicate from the key) and **C8** (compare only its top node). Test 7 had to be written for this — C7 was quiet in **all four** instruments, because nothing in the tree refreshed one matview through two different predicates in one session |
 | **parameterise predicate `Const`s** — *implemented*; each Const becomes a `Param` of the same type, typmod and collation before the deparse, and the values ride the `ParamListInfo` the path already carried | — | **8× in-backend** (R15), **0.3-45.3% end to end across 40 paired cells, none slower** (R37).  It turns refreshes that would miss the plan cache into hits | oracle, plus `matview_where` Test 19 for the values reaching the right rows and `matview_where_source_plan` part 3 for the plan actually being reused.  Changes what the cache key *is*, so it lands first or last, never in the middle |
 | **skip the UPSERT** when the source is **empty** — ~~skip the prune~~, which is what this row said and is the opposite of the truth: with an empty source the prune is the only thing that can do anything, and skipping it leaves every row that should have left. §3c states it correctly (*"if the source is empty, the mirror holds and the refresh is the `DELETE` alone"*); the row title was wrong for long enough to be worth a retraction rather than a quiet fix. The non-empty half is covered by derived `no_delete` below | 1 + 2 | unmeasured. It is the mirror of `no_delete` — the row-trigger **delete** path, where a trigger refreshes the key of a row that has just gone — and it applies at *any* scope | **none yet** — see 3c |
 | **drop the pre-lock's `ORDER BY`** — *not* the source's, gated on the **lock level**. **IMPLEMENTED, MEASURED AND REVERTED — R44.** | 1 | **It does not pay.** In-backend, paired: **137 µs faster** on a non-key predicate and **613 µs SLOWER** on an aligned range predicate over a matview whose physical order has drifted from its key. The regression is plancache, not the ordering — both forced plan modes read equal — and it is PLAN.md 4.1's narrow-range case reached from an unexpected direction: making a cached statement *cheaper* can stop `auto` settling on a generic plan, and the re-planning costs more than the clause did. The numbers below stand as sub-component measurements and are what a fresh plain-heap clone says: **20–69% of the pre-lock** when misaligned, **4–26%** when aligned. The whole-refresh figure was always *implied, not measured*, and R44 is what happened when it was measured | oracle, plus an isolation permutation showing two refreshes deadlocking if it is dropped under `RowExclusiveLock` — built, seen to fail, and removed with the change |
@@ -375,8 +375,14 @@ concurrency gain that will never appear in a single-client sweep.
   elision, which is why that one dropped off this list entirely — what is left
   of it is the empty-source path, which is the row-trigger delete path and needs
   the detector described in §3c.
-- Source plan + deparse elision **together** — one change to the cache-entry
-  miss path, not two.
+- ~~Source plan + deparse elision **together** — one change to the cache-entry
+  miss path, not two.~~ **Both done, and separately, which was the better
+  order.** The source plan landed first (R34) and the deparse elision much
+  later (R48), with the `Const` parameterisation between them — and that gap is
+  what made the second one measurable at all, since a bundled pair would have
+  had one number covering two effects. It is the same rule §6 draws from the
+  18.5% figure, arriving from the other side: not bundling is what let each be
+  read. They do both touch the miss path and there was no conflict.
 - ~~T3 churn gate next — turns the row comparison from a GUC into a decision.~~
   **The GUC part is done and the gate turned out not to be needed.** The
   comparison is on by default, decided by nothing: measured, it pays from one
@@ -550,17 +556,27 @@ deliberately (§4). `FOR NO KEY UPDATE` on the pre-lock.
 **on by default** (R45), which is the first time any of its measured saving has
 been reachable without a developer GUC.
 
-**The gate, run pristine on one `-O2 --enable-cassert --enable-injection-points`
-build** after that landed: regress **250/250**, isolation **135/135**,
-injection_points **5 regress + 13 specs**, the differential oracle's vector
-**identical to `calibrate.baseline`** (23 shapes, 0 errors) with `rundiff.sh`
-quiet in both arms, `fuzz.sh` **PASS** on all four modes, `mutations.py --check`
-**29/29**, `profile.py --check` **15/15** and seen to emit samples rather than
-only to match, and all five `matview_where*` files green under
-`debug_discard_caches = 1` — 118 s against 470 ms, which is how you can tell the
-setting was in effect.
+**Implemented since that line was written, part 4** — the predicate is no longer
+deparsed on a refresh that hits the plan cache (R48, R49).  The cache entry
+holds the qual tree and compares it with `equal()`; the deparse moved into the
+miss branch, where SPI still needs a string.
 
-**Sized, unimplemented** — deparse elision, `append_only`.
+**The gate, run pristine on one `-O2 --enable-cassert --enable-injection-points`
+build**, most recently after the deparse elision (R48): regress **250/250**,
+isolation **135/135**, injection_points **5 regress + 13 specs** — which
+includes `matview_where_source_plan`, the probe that the plan is *reused*, and
+so is the check that keying on the tree did not turn every refresh into a miss
+— the differential oracle's vector **identical to `calibrate.baseline`** (46
+cells, 0 errors), `fuzz.sh` **PASS** on all four modes, `mutations.py --check`
+**33/33**, `profile.py --check` **15/15** and seen to emit samples rather than
+only to match, `leakcheck.sh` **+0 on all four modes** in all three columns,
+`pg_stat_statements` **15/16** with the failure confirmed as B25's exact
+one-line diff, and all five `matview_where*` files green under
+`debug_discard_caches = 1` — 111 / 34 / 12 / 17 / 42 s against ~0.15 s each
+normally, which is how you can tell the setting was in effect.
+
+**Sized, unimplemented** — `append_only`.  (The deparse elision was the other
+entry on this line and is now implemented — R48.)
 
 **Measured and rejected since** — the pre-lock `ORDER BY` elision (R44).
 
