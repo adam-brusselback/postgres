@@ -80,6 +80,14 @@ bool		matview_partial_refresh_optimized = false;
  */
 #define MATVIEW_SOURCE_ENR_NAME	"new_data"
 
+/*
+ * Parameters the fused statement takes beyond the predicate's own, carrying
+ * the prune guard: whether to skip the prune outright, how many matview rows
+ * the pre-lock matched, and how many rows the source produced.  See
+ * refresh_by_direct_modification().
+ */
+#define MATVIEW_PRUNE_GUARD_NARGS	3
+
 
 typedef struct
 {
@@ -179,6 +187,12 @@ static void InvalidateMatViewCache(Datum arg, Oid relid);
 static void matview_cache_sweep(void);
 static CachedPlanSource *matview_build_source_plansource(Query *sourceQuery);
 static bool refresh_where_clause_is_leakproof(Node *qual);
+static bool refresh_qual_is_key_only(Node *qual, int nkeyatts,
+									 const int16 *keyattnums);
+static ParamListInfo matview_prune_guard_params(ParamListInfo params,
+												bool qual_key_only,
+												int64 n_locked,
+												int64 n_source);
 static bool matview_argtypes_match(MatViewPartialRefreshCache *entry,
 								   ParamListInfo params);
 
@@ -1700,6 +1714,152 @@ matview_materialize_source(CachedPlanSource *plansource, ParamListInfo params,
 }
 
 /*
+ * Working state for refresh_qual_is_key_only().
+ */
+typedef struct RefreshKeyOnlyContext
+{
+	int			nkeyatts;
+	const int16 *keyattnums;
+} RefreshKeyOnlyContext;
+
+static bool
+refresh_qual_key_only_walker(Node *node, void *context)
+{
+	RefreshKeyOnlyContext *ctx = (RefreshKeyOnlyContext *) context;
+
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+		int			i;
+
+		/*
+		 * The predicate was analysed against the matview alone, so every Var in
+		 * it is varno 1 at level 0.  Anything else means this walker is looking
+		 * at a tree it does not understand, and the answer has to be no.
+		 */
+		if (var->varlevelsup != 0 || var->varno != 1 || var->varattno <= 0)
+			return true;
+
+		for (i = 0; i < ctx->nkeyatts; i++)
+		{
+			if (ctx->keyattnums[i] == var->varattno)
+				return false;
+		}
+
+		/* A column of the matview that is not part of the arbiter key. */
+		return true;
+	}
+
+	/*
+	 * A sub-SELECT reads relations this walker has not looked at, and one
+	 * correlated on a non-key column would decide the qual from something other
+	 * than the key while showing no Var of its own at this level.  Decline.
+	 */
+	if (IsA(node, SubLink) || IsA(node, SubPlan) || IsA(node, AlternativeSubPlan))
+		return true;
+
+	return expression_tree_walker(node, refresh_qual_key_only_walker, context);
+}
+
+/*
+ * refresh_qual_is_key_only
+ *
+ * True when the predicate reads nothing but the arbiter index's key columns.
+ *
+ * This is the gate on the prune elision in refresh_by_direct_modification(),
+ * and it is the whole of what makes that elision sound.  Without it the
+ * accounting the elision rests on -- every source row is either an existing
+ * matview row the pre-lock counted or one the upsert has just inserted -- has a
+ * hole: a matview row can carry the same key as a source row and not satisfy
+ * the predicate, in which case the upsert matches it (ON CONFLICT arbitrates on
+ * the key, not on the predicate) while the pre-lock never saw it.  The source
+ * row is then neither locked nor inserted, and a genuinely orphaned row
+ * elsewhere in the scope cancels the discrepancy exactly.  SPECIALIZE.md 3b has
+ * the two-row case; it leaves the matview holding a row its own definition does
+ * not produce, and reports success.
+ *
+ * When the qual reads only key columns that cannot happen: two rows with the
+ * same key agree on the qual, so a matview row the upsert can conflict with is
+ * necessarily a matview row the pre-lock locked.
+ *
+ * Volatile functions are rejected far upstream (transformRefreshWhereClause),
+ * which matters here for the same reason: they would let two rows with the same
+ * key disagree.
+ */
+static bool
+refresh_qual_is_key_only(Node *qual, int nkeyatts, const int16 *keyattnums)
+{
+	RefreshKeyOnlyContext ctx;
+
+	ctx.nkeyatts = nkeyatts;
+	ctx.keyattnums = keyattnums;
+
+	return !refresh_qual_key_only_walker(qual, &ctx);
+}
+
+/*
+ * matview_prune_guard_params
+ *
+ * The predicate's parameters, followed by the three the fused statement's
+ * prune guard reads.  Returned as a fresh list rather than by extending the
+ * caller's: `params` is also what the pre-lock and the source query are
+ * executed with, and neither of those declares these three.
+ *
+ * The guard is two sound rules, and the SQL expresses both as one expression
+ * so that which one fires is decided by the values:
+ *
+ *   n_locked == 0            the matview holds nothing in scope, so the prune's
+ *                            DELETE has nothing to match -- the upsert's own
+ *                            inserts are not visible to it.  Needs no counting
+ *                            and no gate, and is passed as the boolean.
+ *
+ *   n_locked + n_inserted    every source row is accounted for by a matview row
+ *     == n_source            that was already in scope or by one just inserted,
+ *                            so nothing in scope is orphaned.  Sound only when
+ *                            the predicate reads key columns alone; when it
+ *                            does not, -1 goes in as n_source, which no
+ *                            non-negative left-hand side can equal.
+ *
+ * The second rule is unsound without that gate, and silently so: see
+ * refresh_qual_is_key_only() and SPECIALIZE.md 3b.
+ */
+static ParamListInfo
+matview_prune_guard_params(ParamListInfo params, bool qual_key_only,
+						   int64 n_locked, int64 n_source)
+{
+	int			npred = params ? params->numParams : 0;
+	ParamListInfo guarded = makeParamList(npred + MATVIEW_PRUNE_GUARD_NARGS);
+	ParamExternData *prm;
+	int			i;
+
+	for (i = 0; i < npred; i++)
+		guarded->params[i] = params->params[i];
+
+	prm = &guarded->params[npred];
+	prm->value = BoolGetDatum(n_locked == 0);
+	prm->isnull = false;
+	prm->pflags = PARAM_FLAG_CONST;
+	prm->ptype = BOOLOID;
+
+	prm = &guarded->params[npred + 1];
+	prm->value = Int64GetDatum(n_locked);
+	prm->isnull = false;
+	prm->pflags = PARAM_FLAG_CONST;
+	prm->ptype = INT8OID;
+
+	prm = &guarded->params[npred + 2];
+	prm->value = Int64GetDatum(qual_key_only ? n_source : -1);
+	prm->isnull = false;
+	prm->pflags = PARAM_FLAG_CONST;
+	prm->ptype = INT8OID;
+
+	return guarded;
+}
+
+/*
  * refresh_by_direct_modification
  *
  * This modifies the materialized view in-place without creating a temporary
@@ -1725,6 +1885,17 @@ matview_materialize_source(CachedPlanSource *plansource, ParamListInfo params,
  * a different naming environment than the one it was written in.  An earlier
  * revision could instead inline the view as a MATERIALIZED CTE, selected by a
  * GUC so the two could be compared at run time; that path is gone.
+ *
+ * The prune carries a guard, so that the scan and the anti-join behind it are
+ * skipped when they provably cannot delete anything -- the DELETE gets a
+ * One-Time Filter and never reads the scope at all.  Two counts decide it, both
+ * of them facts about this refresh rather than promises about the matview: how
+ * many rows the pre-lock matched, and how many rows the source produced.  The
+ * decision has to be made inside the statement, because how many rows the
+ * upsert inserted is not known until it has run and the upsert and the prune
+ * are one statement; a sub-select over the upsert CTE both supplies the count
+ * and, by depending on it, orders the two.  See matview_prune_guard_params()
+ * for the rules and refresh_qual_is_key_only() for what makes the second sound.
  *
  * Both halves of the fused statement then read one physically materialised
  * tuplestore rather than one materialised CTE, so they still cannot disagree
@@ -1761,6 +1932,9 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	int			nkeyatts = 0;
 	int16	   *keyattnums = NULL;
 	Tuplestorestate *sourceStore = NULL;
+	bool		qual_key_only = false;
+	int64		n_locked = 0;
+	int64		n_source = 0;
 
 	matviewRel = table_open(matviewOid, NoLock);
 
@@ -1931,6 +2105,16 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 			keyattnums[i] = indexStruct->indkey.values[i];
 		index_close(indexRel, AccessShareLock);
 
+		/*
+		 * Whether the prune may be elided on a row count alone.  A property of
+		 * the request's shape rather than of the data, so it could be computed
+		 * once on a cache miss and stored -- but it is a walk of a predicate
+		 * that has just been parsed, and it does NOT change the generated SQL
+		 * (the gate rides in the parameter values, see below), so it stays out
+		 * of the cache entry and out of the cache key.
+		 */
+		qual_key_only = refresh_qual_is_key_only(qual, nkeyatts, keyattnums);
+
 		sourceStore = tuplestore_begin_heap(false, false, work_mem);
 
 		enr = (EphemeralNamedRelation) palloc0(sizeof(EphemeralNamedRelationData));
@@ -1952,7 +2136,9 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		char	   *matview_name;
 		const char *matview_alias;
 		Oid		   *argtypes = NULL;
+		Oid		   *dml_argtypes;
 		int			nargs = 0;
+		int			dml_nargs;
 		Relation	indexRel;
 		Form_pg_index indexStruct;
 		TupleDesc	tupdesc = matviewRel->rd_att;
@@ -1979,6 +2165,22 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 			for (i = 0; i < nargs; i++)
 				argtypes[i] = params->params[i].ptype;
 		}
+
+		/*
+		 * The fused statement takes three parameters of its own after the
+		 * predicate's, carrying the prune guard.  They are always declared and
+		 * the guard is always in the SQL: what decides whether the prune runs
+		 * is the values, not the text, so the statement stays one statement
+		 * with one plan under one cache key.  (B31: anything that changes the
+		 * generated SQL has to be part of the key.  This does not.)
+		 */
+		dml_nargs = nargs + MATVIEW_PRUNE_GUARD_NARGS;
+		dml_argtypes = (Oid *) palloc(dml_nargs * sizeof(Oid));
+		for (i = 0; i < nargs; i++)
+			dml_argtypes[i] = argtypes[i];
+		dml_argtypes[nargs + 0] = BOOLOID;	/* skip the prune outright */
+		dml_argtypes[nargs + 1] = INT8OID;	/* rows the pre-lock matched */
+		dml_argtypes[nargs + 2] = INT8OID;	/* rows the source produced, or -1 */
 
 		indexRel = index_open(uniqueIndexOid, AccessShareLock);
 		indexStruct = indexRel->rd_index;
@@ -2178,19 +2380,38 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		else
 			appendStringInfoString(&buf, "NOTHING ");
 
+		/*
+		 * RETURNING says whether each row the upsert touched was an insert,
+		 * which is what the prune guard counts.  OLD is the row ON CONFLICT
+		 * matched and is entirely NULL when there was none, so OLD.ctid is NULL
+		 * exactly for an inserted row -- and a matview cannot have a column
+		 * called ctid ("column name \"ctid\" conflicts with a system column
+		 * name"), so the reference is unambiguous.  A key column would not do:
+		 * under a NULLS NOT DISTINCT arbiter an existing row with a NULL key
+		 * can be updated, and OLD.key IS NULL would call that an insert.
+		 *
+		 * This is also why the count is of inserts rather than of updates.  The
+		 * row comparison (use_optimized) suppresses the write for a row nothing
+		 * changed about, and a suppressed row returns nothing at all -- so the
+		 * updates are not all visible here, while the inserts are: an insert is
+		 * never filtered by a DO UPDATE ... WHERE.
+		 */
 		appendStringInfo(&buf,
-						 "  RETURNING 1 "
+						 "  RETURNING (OLD.ctid IS NULL) AS ins "
 						 "), "
 						 "pruned AS ( "
 						 "  DELETE FROM %s mv WHERE (%s) AND NOT EXISTS ( "
 						 "    SELECT 1 FROM new_data nd WHERE %s"
-						 "  ) RETURNING 1 "
+						 "  ) AND NOT ($%d OR $%d + (SELECT pg_catalog.count(*) "
+						 "    FILTER (WHERE ins) FROM upsert) = $%d) "
+						 "  RETURNING 1 "
 						 ") "
 						 "SELECT (SELECT pg_catalog.count(*) FROM upsert) "
 						 "     + (SELECT pg_catalog.count(*) FROM pruned)",
-						 matview_name, whereClauseStr, join_clause.data);
+						 matview_name, whereClauseStr, join_clause.data,
+						 nargs + 1, nargs + 2, nargs + 3);
 
-		cacheEntry->refreshPlan = SPI_prepare(buf.data, nargs, argtypes);
+		cacheEntry->refreshPlan = SPI_prepare(buf.data, dml_nargs, dml_argtypes);
 		if (cacheEntry->refreshPlan == NULL)
 			elog(ERROR, "SPI_prepare failed for refresh CTE: %s", buf.data);
 		if (use_cache)
@@ -2227,6 +2448,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		pfree(join_clause.data);
 		if (argtypes != NULL)
 			pfree(argtypes);
+		pfree(dml_argtypes);
 	}
 
 
@@ -2234,6 +2456,14 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	if (matview_execute_spi_plan(cacheEntry->lockPlan, params,
 								 InvalidSnapshot, false) < 0)
 		elog(ERROR, "SPI_execute_plan failed during lock acquisition");
+
+	/*
+	 * How many rows the matview holds in scope right now, under a lock that
+	 * stops them changing.  Half of the prune guard's accounting, and the half
+	 * that is matview-side: the source count below says what the view produces,
+	 * which on its own cannot decide whether anything is orphaned.
+	 */
+	n_locked = (int64) SPI_processed;
 
 	/*
 	 * The two statements take separate snapshots, so a base-table change that
@@ -2295,8 +2525,9 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 				SaveCachedPlan(cacheEntry->sourcePlan);
 		}
 
-		matview_materialize_source(cacheEntry->sourcePlan, params, snapshot,
-								   sourceStore);
+		n_source = (int64) matview_materialize_source(cacheEntry->sourcePlan,
+													  params, snapshot,
+													  sourceStore);
 
 		/*
 		 * The rows are computed; the statement that compares the matview
@@ -2306,7 +2537,11 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		 */
 		INJECTION_POINT("matview-where-source-materialized", NULL);
 
-		if (matview_execute_spi_plan(cacheEntry->refreshPlan, params,
+		if (matview_execute_spi_plan(cacheEntry->refreshPlan,
+									 matview_prune_guard_params(params,
+																qual_key_only,
+																n_locked,
+																n_source),
 									 snapshot, false) < 0)
 			elog(ERROR, "SPI_execute_plan failed during refresh");
 
