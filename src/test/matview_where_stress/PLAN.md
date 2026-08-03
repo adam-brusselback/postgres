@@ -1025,12 +1025,31 @@ would not have shown.  And `timerange` read four cells negative at `--repeat 4`
 and all five positive at `--repeat 8`, its own literal arm having drifted 8–22%
 between the two runs on one build and one boot.
 
-**Still open**, and both tracked rather than assumed away: a caller who repeats
-the *same* literal used to get `params == NULL` and therefore one specialised
-plan forever, and now goes through the custom-versus-generic comparison like
-anyone else; and every workload here has uniformly distributed keys, so nothing
-yet measures a skewed column where a generic plan is genuinely wrong.
-`bench/predskew.sh` exists for the second.
+Two risks were raised against it and both are now measured rather than argued.
+
+**The constant-literal caller does not regress (R40).**  Before the change
+`params == NULL`, so `choose_custom_plan()` short-circuits and that caller gets
+one specialised plan forever with no comparison; after it, plancache runs its
+usual custom-versus-generic dance.  Measured: **155.0 µs before against 163.0
+after, with identical minima of 144 and 146 µs.**  The dance costs five plan
+builds once and settles on the same plan.
+
+**The skew hazard does not materialise (R41).**  Every workload here has
+uniformly distributed keys, which is the case parameterisation cannot lose, so
+this needed its own fixture: one key holding 10,000 rows and another holding
+10.  A session that refreshes the common key first and then the rare one reads
+**1.09×** the cost of one that refreshes the rare key alone — and **under C5,
+where the two predicates cannot share a plan at all, the same ratio is 1.17×**.
+The ratio is the harness evicting the rare key's pages, not a plan being
+reused.  `PARAM_FLAG_CONST` is why: it lets `eval_const_expressions()` fold the
+value back in, so a custom plan is exactly the plan the literal got.
+
+And one thing that is closed by being measured rather than fixed: **the
+`--predmode` axis is now meaningless on a patched build.**  `param` reads
+slower than `lit` there, because the `EXECUTE`-in-a-`DO`-block wrapper is pure
+overhead once the server parameterises for you.  The axis only means anything
+against the unpatched code — which is why R37 had to be run before this landed
+and cannot be re-run after.
 
 **3.3 Revisit the rowcount wrapper.** 4% for reporting, and B8 is being changed
 anyway to unify the count across both forms. Worth doing at the same time.

@@ -39,6 +39,16 @@
 # lives in the session, so warm and cold have to be different backends or the
 # second inherits the first's decision.
 #
+# Timing is psql's own \timing, summed over the rare-key statements only, and
+# that is not a detail.  The first version of this script wall-clocked the whole
+# warm arm and subtracted a separately measured warm-up block -- 374 ms of
+# common-key refreshes against 28 ms of rare-key ones.  A ten percent swing in
+# the block it subtracted landed as ~370 us per rare refresh, which is larger
+# than the entire effect, and the warm arm duly read 160, 206, 407 and 796 us
+# across four rounds with its minimum BELOW the cold arm's.  It reported 1.40x
+# and meant nothing.  Timing the statements themselves removes the subtraction
+# and the variance with it.
+#
 # The row comparison is ON throughout, so a common-key refresh reads 10,000 rows
 # and writes none of them.  Without it the warm-up rewrites the scope on every
 # pass and the timed phase measures the bloat that left rather than the plan.
@@ -91,40 +101,44 @@ NCOMMON=$($PSQL -Atc "SELECT count(*) FROM skew_base WHERE tenant = 1")
 NRARE=$($PSQL -Atc "SELECT count(*) FROM skew_base WHERE tenant = $RARE")
 echo "  common key tenant=1 -> $NCOMMON rows;  rare key tenant=$RARE -> $NRARE rows"
 
-# Timed phase: N refreshes of the rare key, nothing else.
-{ echo "SET matview_partial_refresh_optimized = on;"
-  i=0; while [ $i -lt "$N" ]; do
-    echo "REFRESH MATERIALIZED VIEW CONCURRENTLY skew_mv WHERE tenant = $RARE;"
-    i=$((i+1)); done; } > "$T/rare.sql"
+# Both arms are one psql script each, with \timing on and a marker before the
+# rare-key block.  Only the statements after the marker are summed, so the
+# warm-up costs whatever it costs and never enters the number.
+#
+# printf rather than echo, and it is not style: /bin/sh here is dash, whose echo
+# expands backslash escapes with no -e asked for.  "echo '\timing on'" emitted a
+# TAB followed by "iming on", psql reported a syntax error on line 1, and every
+# arm came back "MISMATCH 0 of 100" -- which reads as an instrument that ran and
+# found nothing rather than one that never started.  Same shape as the psql:FILE:
+# prefix that made the fuzzer's wrong-plan counter unable to match (RESULTS.md
+# X12).
+mkscript() {
+  out=$1; warm=$2
+  { printf '%s\n' '\timing on'
+    printf '%s\n' "SET matview_partial_refresh_optimized = on;"
+    if [ "$warm" = yes ]; then
+      i=0; while [ $i -lt "$WARM" ]; do
+        printf '%s\n' "REFRESH MATERIALIZED VIEW CONCURRENTLY skew_mv WHERE tenant = 1;"
+        i=$((i+1)); done
+    fi
+    printf '%s\n' '\echo RARE_BEGIN'
+    i=0; while [ $i -lt "$N" ]; do
+      printf '%s\n' "REFRESH MATERIALIZED VIEW CONCURRENTLY skew_mv WHERE tenant = $RARE;"
+      i=$((i+1)); done
+  } > "$out"
+}
+mkscript "$T/cold.sql" no
+mkscript "$T/warm.sql" yes
 
-# Warm phase, prepended: the common key first, so plancache settles on the shape
-# that key deserves before the rare one is ever asked for.
-{ echo "SET matview_partial_refresh_optimized = on;"
-  i=0; while [ $i -lt "$WARM" ]; do
-    echo "REFRESH MATERIALIZED VIEW CONCURRENTLY skew_mv WHERE tenant = 1;"
-    i=$((i+1)); done; } > "$T/warmup.sql"
-cat "$T/warmup.sql" "$T/rare.sql" > "$T/warm.sql"
-
-echo "SELECT 1;" > "$T/empty.sql"
-ms() { date +%s%N; }
-
-SETUP=0
-i=0; while [ $i -lt 5 ]; do
-  s=$(ms); $PSQL -f "$T/empty.sql" >/dev/null; e=$(ms)
-  d=$(( (e - s) / 1000 )); [ "$SETUP" = 0 ] && SETUP=$d
-  [ "$d" -lt "$SETUP" ] && SETUP=$d; i=$((i+1)); done
-
-# The warm arm's own warm-up has to come off its clock, so time it separately
-# in a session that then exits -- and measure the cost of WARM common-key
-# refreshes on their own, to subtract.
-WARMCOST=0
-i=0; while [ $i -lt 3 ]; do
-  s=$(ms); $PSQL -f "$T/warmup.sql" >/dev/null; e=$(ms)
-  d=$(( (e - s) / 1000 - SETUP ))
-  [ "$WARMCOST" = 0 ] && WARMCOST=$d
-  [ "$d" -lt "$WARMCOST" ] && WARMCOST=$d
-  i=$((i+1)); done
-echo "  session setup ${SETUP} us;  warm-up block ${WARMCOST} us (min of 3), both subtracted"
+# Sum the "Time: N ms" lines after the marker.  psql prints one per statement.
+timed() {
+  $PSQL -f "$1" 2>&1 |
+    awk -v n="$N" '
+      /^RARE_BEGIN$/ { on = 1; next }
+      on && /^Time: / { gsub(/[^0-9.]/, "", $2); t += $2; c++ }
+      END { if (c != n) { printf "MISMATCH %d of %d\n", c, n > "/dev/stderr"; exit 1 }
+            printf "%d\n", (t * 1000) / n }'
+}
 
 : > "$T/results"
 r=1
@@ -132,12 +146,7 @@ while [ $r -le "$ROUNDS" ]; do
   # Alternate which arm goes first so position is not confounded with the arm.
   if [ $((r % 2)) -eq 1 ]; then ORDER="cold warm"; else ORDER="warm cold"; fi
   for arm in $ORDER; do
-    case "$arm" in
-      cold) f="$T/rare.sql"; sub=$SETUP ;;
-      warm) f="$T/warm.sql"; sub=$((SETUP + WARMCOST)) ;;
-    esac
-    s=$(ms); $PSQL -f "$f" >/dev/null; e=$(ms)
-    us=$(( ((e - s) / 1000 - sub) / N ))
+    us=$(timed "$T/$arm.sql") || { echo "  round $r $arm: timing lines did not match" >&2; continue; }
     printf '%s %s %s\n' "$r" "$arm" "$us" >> "$T/results"
     printf '  round %s  %-4s %7s us per rare-key refresh\n' "$r" "$arm" "$us"
   done
@@ -145,12 +154,19 @@ while [ $r -le "$ROUNDS" ]; do
 done
 
 echo
-awk '$1 > 1 { s[$2] += $3; n[$2]++ }
+awk '$1 > 1 { s[$2] += $3; n[$2]++;
+              if (!($2 in lo) || $3 < lo[$2]) lo[$2] = $3;
+              if ($3 > hi[$2]) hi[$2] = $3 }
      END {
        for (a in s) m[a] = s[a]/n[a];
-       printf "  rare key alone   %8.1f us\n", m["cold"];
-       printf "  rare key after the common key %8.1f us\n", m["warm"];
+       printf "  %-34s %8s %8s %8s %5s\n", "", "mean", "min", "max", "n";
+       printf "  %-34s %8.1f %8d %8d %5d\n", "rare key alone", m["cold"], lo["cold"], hi["cold"], n["cold"];
+       printf "  %-34s %8.1f %8d %8d %5d\n", "rare key after the common key", m["warm"], lo["warm"], hi["warm"], n["warm"];
        if (m["cold"] > 0)
-         printf "  warm/cold = %.2fx   (>1 means the common key%s plan is being reused)\n",
-                m["warm"] / m["cold"], "'"'"'s";
+         printf "\n  warm/cold = %.2fx\n", m["warm"] / m["cold"];
+       print "";
+       print "  >1 means a plan chosen for the common key is being reused for the";
+       print "  rare one.  Read it against the min/max spread, and against the same";
+       print "  script run under mutations.py C5, where the two predicates cannot";
+       print "  share a plan at all and the ratio must be 1.";
      }' "$T/results"
