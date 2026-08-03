@@ -472,12 +472,17 @@ MUTATIONS = {
                 '\tswitch (nodeTag(node))\n\t{\n\t\t/*\n\t\t * These cannot call a function or read a relation themselves, though\n\t\t * something below them might, so keep walking.\n\t\t */'),
            ]),
 
+    # Re-anchored when the clause became conditional on the lock level: it is
+    # now emitted for CONCURRENTLY and not for the bare form, so "drop it" is
+    # "drop it for CONCURRENTLY too" rather than an edit to the statement text.
+    # The bare form's arm is O3's business, and the two are worth keeping apart:
+    # this is A5 as it was reported, and O3 is A5 arriving through the cache.
     'M1': ('A5', 'concur',
            'drop ORDER BY from the row-locking SELECT (deadlock)', [
-               ('"SELECT 1 FROM %s mv WHERE (%s) ORDER BY %s "\n'
-                '\t\t\t\t\t\t "FOR NO KEY UPDATE"',
-                '"SELECT 1 FROM %s mv WHERE (%s) /*%s*/ "\n'
-                '\t\t\t\t\t\t "FOR NO KEY UPDATE"', 1),
+               ('\t\tif (!serialized)\n'
+                '\t\t\tappendStringInfo(&buf, "ORDER BY %s ", conflict_cols.data);',
+                '\t\tif (false)\n'
+                '\t\t\tappendStringInfo(&buf, "ORDER BY %s ", conflict_cols.data);', 1),
            ]),
 
     # The pre-lock weakened to a mode that does not conflict with itself.
@@ -527,12 +532,13 @@ MUTATIONS = {
                 '\tsourceQuery->sortClause = NIL;\t/* M2 */'),
            ]),
 
+    # Re-anchored with M1, and on the WHERE rather than on the FOR clause, so
+    # that the two edits cannot collide: this one makes the statement match no
+    # rows, which takes no locks at all whether or not the ORDER BY is emitted.
     'M3': ('A3', 'concur',
            'remove the row-locking statement entirely (serialization)', [
-               ('"SELECT 1 FROM %s mv WHERE (%s) ORDER BY %s "\n'
-                '\t\t\t\t\t\t "FOR NO KEY UPDATE"',
-                '"SELECT 1 FROM %s mv WHERE (%s) AND false /*%s*/"\n'
-                '\t\t\t\t\t\t ""', 1),
+               ('appendStringInfo(&buf, "SELECT 1 FROM %s mv WHERE (%s) ",',
+                'appendStringInfo(&buf, "SELECT 1 FROM %s mv WHERE false AND (%s) ",', 1),
            ]),
 
     # Kept for the record: verified behaviourally benign.  The planner does not
