@@ -1353,12 +1353,25 @@ predicate selects, and the prune's anti-join reads them all again.  At scope
 Whether the second can reuse the first is a real question; P2 constrains the
 first, not the second.
 
-**4.5 `FOR NO KEY UPDATE` for rows that will only be updated.**  The pre-lock
-takes `FOR UPDATE` over the whole scope because some of those rows will be
-deleted.  Rows that will only be upserted need the weaker mode, which does not
-conflict with foreign-key checks.  A concurrency optimisation, not a latency
-one -- measure it with `--clients 4,16 --overlap hot`, where the current sweep
-has nothing to say.
+**Half of it is closed by 4.6**, and only half: on the bare form, with a
+key-only predicate and nothing orphaned, the second scan does not happen at all
+-- which is where R42's 10.9-13.7% comes from.  What is left is the case 4.6
+cannot reach: `CONCURRENTLY`, a non-key predicate, or a refresh where something
+really did leave the scope.  So the question is now "can the second scan reuse
+the first *when it has to happen*", which is a narrower and harder one.
+
+**4.5 `FOR NO KEY UPDATE` for rows that will only be updated.**  **DONE, and
+more simply than this entry proposed.**  The pre-lock takes `FOR NO KEY UPDATE`
+over the *whole* scope rather than choosing per row: the upsert's `DO UPDATE`
+sets non-key columns only, because the key columns are what it matched on, so
+every row it writes is by construction a no-key update.  The prune may still
+`DELETE` a row this locked, which needs the stronger lock -- but that upgrade
+cannot block or deadlock, since this transaction already holds a conflicting
+lock on the row and no other transaction can be holding one to wait for.  So
+there is no per-row decision to make and nothing left of this item.  Acquisition
+cost is identical (R17's neighbour: 6.45 against 6.47 ms at scope 10,000), which
+is why it will never show up in a single-client sweep and should not be sold as
+if it would.
 
 **4.6 Skip the prune when it provably cannot delete anything.**  **DONE**, and
 this entry's last sentence was the whole of it: *"the derivation is the hard
