@@ -539,10 +539,9 @@ matters, what its numbers are still worth — is below.
 
 ## 6. State at time of writing
 
-**Implemented and verified** — the row comparison
-(`matview_partial_refresh_optimized`): oracle 22 shapes / 1636 mutations / 0
-divergences, five `matview_where` suites green -- **and since R45 it is the
-default rather than something to force on**. Routing of the
+**Implemented and verified** — the row comparison: oracle 22 shapes / 1636
+mutations / 0 divergences, five `matview_where` suites green -- **and since
+R45 it is unconditional, the GUC that selected it having gone in `f93e664`**. Routing of the
 bare `WHERE` form onto the general algorithm, with `ExclusiveLock` chosen
 deliberately (§4). `FOR NO KEY UPDATE` on the pre-lock.
 
@@ -568,7 +567,7 @@ includes `matview_where_source_plan`, the probe that the plan is *reused*, and
 so is the check that keying on the tree did not turn every refresh into a miss
 — the differential oracle's vector **identical to `calibrate.baseline`** (46
 cells, 0 errors), `fuzz.sh` **PASS** on all four modes, `mutations.py --check`
-**33/33**, `profile.py --check` **15/15** and seen to emit samples rather than
+**32/32**, `profile.py --check` **15/15** and seen to emit samples rather than
 only to match, `leakcheck.sh` **+0 on all four modes** in all three columns,
 `pg_stat_statements` **15/16** with the failure confirmed as B25's exact
 one-line diff, and all five `matview_where*` files green under

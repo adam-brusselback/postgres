@@ -24,7 +24,7 @@ tail:
 | **1** | **this file** — cache the source plan | **DONE** — R34 |
 | 2 | flip `matview_partial_refresh_querytree` on, re-measure | **DONE** — R35 |
 | 3 | B2 / the invalidation restructure | **STILL OPEN**, its own item — §4 |
-| 4 | delete the text path, the two GUCs, and the oracle's A/B axis | **DONE**, `82f71d8`.  Only `matview_partial_refresh_optimized` is left, defaulting ON since R45 and due out with the rest of the scaffolding |
+| 4 | delete the text path, the two GUCs, and the oracle's A/B axis | **DONE**.  `82f71d8` for the text path and the `querytree` GUC, `f93e664` for `matview_partial_refresh_optimized` |
 | 5 | B15 — warn, error, or document the blast radius | independent, needs a decision |
 | 6 | B25, derived `no_delete` | `no_delete` **done** (RESULTS.md R42, R43); B25 independent and open |
 

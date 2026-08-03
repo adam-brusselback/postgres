@@ -30,7 +30,7 @@ other and the order is the reason they landed at all:
 | 1 | **3.7 — cache the source plan** | **DONE.**  Subplan CACHE.md, result **R34**: the Query-tree deficit goes 54.25 us to 0.38 us, and the source line 44.88 us to 0.07 |
 | 2 | flip the `querytree` default, re-run the differential harness and the sweep (2.1b) | **DONE.**  **R35**: about +6% end to end, flat across predicate shape |
 | 3 | B2 / the invalidation restructure | **STILL OPEN, and still its own item.**  Pulling it into 1 was justified by an argument the project's own measurements refute (3.1), and it reopens B7 — CACHE.md §4.  Whether it is reachable at all now that the text path is gone has not been established |
-| 4 | delete the text path, the two GUCs, and the oracle's A/B axis | **DONE**, `82f71d8`.  One implementation, `matview_partial_refresh_optimized` the only remaining GUC |
+| 4 | delete the text path, the two GUCs, and the oracle's A/B axis | **DONE**.  `82f71d8` took the text path and the `querytree` GUC; `f93e664` took `matview_partial_refresh_optimized` and the cache-key term that tracked it.  One implementation, no GUCs |
 | 5 | B15 — warn, error, or document the blast radius | **DONE — the decision was DOCUMENT.**  `refresh_materialized_view.sgml` gains a `<warning>` on the `WHERE` parameter, plus paragraphs on scope drift and non-determinism.  Not *error*: the check SAFETY.md designs is sound but **incomplete** — it refuses `except_key`, exhaustively safe at 0/64 — and a restriction is far harder to withdraw than to add.  Not *warn*: it would fire on the safe-but-unprovable cases too and teach people to filter it.  Decisive: **no `REFRESH`-time check can see a coverage failure**, which is the one that actually bites, because the command is not told what changed.  Cost is explicitly not the objection.  The check goes on-list as a follow-on — ISSUES.md B15, SAFETY.md |
 | 6 | B25, and derived `no_delete` | **derived `no_delete` DONE**, **R42** (10.9% at scope 1000, 13.7% at 10000, bare form only) and **R43** (the concurrency condition, found by building its detector).  **B25 still open** |
 
@@ -1555,23 +1555,25 @@ static suite it produced, against whatever implementation actually landed.
   | A5 · `run.sh`, "delete with this directory" | Phase 4 | fires here |
   | B1/B2 · cache tests, "delete if the plan cache goes away" | Phase 2.1 removes most of the cache's reason to exist | **read at Phase 2 exit**, not before |
   | B9 · Test 13 search_path half | settled: the restriction stays | **resolved** — keep, add an `errhint` |
-  | Test 16 · ctid order, "keep until the property-level version exists" | `matview-where-insertorder.spec` landed in Phase 1 | **fired** — delete here |
+  | Test 16 · ctid order, "keep until the property-level version exists" | `matview-where-insertorder.spec` landed in Phase 1 | **FIRED — DELETED** in `b27ae64`; Tests 17–20 renumber to 16–19 |
   | `pg_stat_statements` structural block, "delete at the start of Phase 2" | Phase 2 opening | **fired** — deleted before the first line of the rewrite, not after |
   | `matview-where-snapshot`, "delete when the premise goes" | the rewrite fusing the lock into one plan | **read at Phase 2 exit** |
   | `matview_where_privs` Test 1, "rewrite if the predicate runs as the invoker" | Phase 2's privilege model | **read at Phase 2 exit** — it inverts rather than lapsing, so it must be rewritten, not regenerated |
-  | `matview_partial_refresh_querytree` and `matview_partial_refresh_optimized` GUCs + the paths they select | the fuzzer's exit criterion, not "the new path looks finished" | **half fired already** — the `querytree` GUC and the text branch went in `82f71d8`, and Tests 17 and 18 lost their `SET`/`RESET` pairs when the row comparison became the default (R45).  What is left is `matview_partial_refresh_optimized` (`guc_parameters.dat`, the `commands/matview.h` declaration), the `SET`s in `matview_where_cache` Tests 5 and 6, and every use in `matview_where_stress` — which is most of the measurement suite, so it goes last. Losing the querytree GUC also loses `rundiff.sh`'s old-vs-new mode, which is why it is the last thing to go |
-  | `matview_where` Tests 17 and 18, added for B27 and B30 | the optimisation stops being optional | **fired early, and partly** — the comparison is now ON by default (R45), so both `SET` lines are gone already and the tests are what goes red if the default is flipped back.  Calibrated: Test 17 red under B7, Test 18 red under O1.  The GUC itself survives to Phase 4 as the off-switch every measurement instrument here uses. Both properties outlive the flag: a comparison that is not NULL-safe corrupts the matview, and not rewriting a row nothing changed about is the promise that makes re-refreshing an already-current scope cheap |
-  | `matview_where_cache` Test 6, added for B31 | the GUC going away | **fires with it** — `matview_partial_refresh_optimized` is now the ONLY input to the cache key that changes the generated SQL, the `querytree` half having gone in `82f71d8`. Delete it *unless* the key has by then gained another such input, in which case rewrite it around that: the rule it asserts outlives the flags illustrating it |
+  | `matview_partial_refresh_querytree` and `matview_partial_refresh_optimized` GUCs + the paths they select | the fuzzer's exit criterion, not "the new path looks finished" | **FIRED, both halves.**  The `querytree` GUC and the text branch went in `82f71d8`; `matview_partial_refresh_optimized` went in `f93e664`, taking with it the `optimized` term in the plan-cache key, `matview_where_cache` Test 6, and mutation `O2`.  Done while the corpus, the oracle, the fuzzer and the leak check could still gate it — that was the whole reason it went before the directory rather than with it |
+  | `matview_where` Tests 17 and 18, added for B27 and B30 | the optimisation stops being optional | **FIRED, and both tests stay** — now numbered 16 and 17 after the ctid case was deleted.  Calibrated: 16 red under `B7`, 17 red under `O1`, both re-verified after the GUC went.  Both properties outlive the flag: a comparison that is not NULL-safe corrupts the matview, and not rewriting a row nothing changed about is the promise that makes re-refreshing an already-current scope cheap |
+  | `matview_where_cache` Test 6, added for B31 | the GUC going away | **FIRED — DELETED** in `f93e664`.  The escape clause did not apply: the key has gained another input (the predicate), but the case that covers it — Test 7, now renumbered 6 — already exists and is a better instrument, because a confused predicate refreshes the wrong rows outright where the flag's effect could only be seen in the heap.  The rule outlived the flag by moving to the case that illustrates it more plainly |
   | `matview-where-prune-gap.spec`, "delete if the seam closes" | an implementation with no separate evaluation step | **read at Phase 2 exit** — the *property* is data loss and is not scaffolding; the injection point and the GUC are. If the seam closes, delete it and say why |
 
   A conditional disposition nobody re-reads is how Test 14 came to sit in the
   tree for a dozen commits announcing that a swap which had already landed was
   "not in the tree".
-- **Both build systems.** `parallel_schedule` and `isolation_schedule` are read
-  by autoconf *and* meson, so regress and isolation tests need registering once.
-  Module specs are not — `src/test/modules/injection_points/meson.build` lists
-  them individually and has to be edited alongside the `Makefile`. This was
-  missed once already for `matview-where-snapshot`.
+- **Both build systems.** **DONE, verified rather than assumed.**
+  `parallel_schedule` and `isolation_schedule` are read by autoconf *and* meson
+  (each `meson.build` names the schedule file), so registering once covers both;
+  all five regress files and all four isolation specs are in them.  Module specs
+  are listed individually, and `matview_where_source_plan` plus the three
+  `matview-where-*` specs appear in `injection_points/meson.build` **and** its
+  `Makefile`.  This was missed once already for `matview-where-snapshot`.
 - Delete `src/test/matview_where_stress/` — the whole directory, including the
   fuzzer, the benchmark suite and these notes.
 

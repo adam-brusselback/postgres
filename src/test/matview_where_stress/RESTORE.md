@@ -153,6 +153,41 @@ files green under `debug_discard_caches = 1`.
 
 ---
 
+## the last state that has this directory in it
+
+The tip of `claude/postgres-incremental-materialized-views-8gedzo-research`,
+which exists for exactly one reason: the commit after it on the main branch
+deletes everything under `src/test/matview_where_stress/`.  Nothing else
+distinguishes the two branches at that point.
+
+| commit | what |
+|---|---|
+| `f93e664` | the row comparison becomes unconditional; the last developer GUC, its cache-key term, `matview_where_cache` Test 6 and mutation `O2` all go |
+| `b27ae64` | the shipped tests stop citing these notes, and the ctid insert-order case is deleted |
+
+Build, as reported by the running server:
+
+    ./configure --prefix=/home/user/pgsql-opt --without-icu \
+                --enable-cassert --enable-injection-points CFLAGS=-O2
+    debug_assertions = on
+
+Gates at this point, all pristine: regress **250/250**, isolation **135/135**,
+injection_points **5 regress + 13 specs**, the differential oracle's vector
+identical to `calibrate.baseline` (46 cells), `fuzz.sh` PASS on all four modes,
+`mutations.py --check` **32/32**, `profile.py --check` **15/15**,
+`leakcheck.sh` +0 on all four modes in all three columns.
+
+To get the directory back:
+
+    git checkout claude/postgres-incremental-materialized-views-8gedzo-research \
+                 -- src/test/matview_where_stress
+
+That restores it onto whatever is checked out.  The instruments will then need
+re-anchoring against however `matview.c` has moved — `mutations.py --check` and
+`profile.py --check` report every stale anchor, which is what they are for.
+
+---
+
 ## `c8beb05` — the patch as posted to -hackers
 
 Not a restore point so much as the reference: the original implementation,
