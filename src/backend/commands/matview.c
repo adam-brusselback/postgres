@@ -24,6 +24,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_opclass.h"
+#include "catalog/pg_type.h"
 #include "commands/matview.h"
 #include "commands/repack.h"
 #include "commands/tablecmds.h"
