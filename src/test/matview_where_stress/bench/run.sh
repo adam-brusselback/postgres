@@ -28,6 +28,26 @@
 #   --clients    1,4,16                     concurrent sessions
 #   --overlap    disjoint,hot               disjoint scopes, or all fighting
 #   --mutate     on|off                     change the base data first
+#   --predmode   literal|param  default literal
+#                                            How the key reaches the server.
+#                                            literal: pgbench substitutes it into
+#                                            the SQL, so every distinct key
+#                                            deparses to a different plan-cache
+#                                            key and MISSES.  param: it is bound,
+#                                            the deparse renders $1, and the key
+#                                            is stable so it HITS.
+#                                            PLAN.md 3.2 measures these 8x apart
+#                                            (546 us against 67) and both are
+#                                            real -- a driver that builds SQL per
+#                                            row gets the first, one that binds
+#                                            gets the second.  Every measurement
+#                                            recorded before this option existed
+#                                            was literal, which is why nothing
+#                                            else in Phase 3 could be evaluated:
+#                                            a candidate that only helps the miss
+#                                            path looks like a triumph and one
+#                                            that only helps the hit path looks
+#                                            like noise.
 #   --maxscope   90                         skip any combination whose scope is
 #                                           this percent of the matview or more.
 #                                           90 is right for measuring PARTIAL
@@ -77,6 +97,7 @@
 set -e
 
 WORKLOADS=; SCALES=100000; GROUPS=1000; SPANS=1,10,100
+PREDMODE=literal
 FORMS=conc,bare; SHAPES=key; CLIENTS=1; OVERLAP=disjoint; MUTATE=off
 SYNC=off
 MAXSCOPE=90; PERXACT=1
@@ -91,6 +112,7 @@ while [ $# -gt 0 ]; do
     --forms)     FORMS=$2;     shift 2;;  --shapes)  SHAPES=$2;  shift 2;;
     --clients)   CLIENTS=$2;   shift 2;;  --overlap) OVERLAP=$2; shift 2;;
     --mutate)    MUTATE=$2;    shift 2;;  --time)    TIME=$2;    shift 2;;
+    --predmode)  PREDMODE=$2;  shift 2;;
     --sync)      SYNC=$2;      shift 2;;
     --maxscope)  MAXSCOPE=$2;  shift 2;;  --perxact) PERXACT=$2; shift 2;;
     --mintxn)    MINTXN=$2;    shift 2;;  --maxtime) MAXTIME=$2; shift 2;;
@@ -101,6 +123,10 @@ while [ $# -gt 0 ]; do
     *) echo "unknown option: $1" >&2; exit 2;;
   esac
 done
+
+case "$PREDMODE" in literal|param) ;; *)
+  echo "--predmode must be literal or param, not '$PREDMODE'" >&2; exit 2 ;;
+esac
 
 DIR=$(dirname "$0")
 PSQL="$BINDIR/psql -p $PORT -d $DB -q -X"
@@ -130,7 +156,7 @@ $PSQL -f "$DIR/harness.sql"
 
 VER=$($PSQL -Atc 'SELECT version()')
 ASSERT=$($PSQL -Atc 'SHOW debug_assertions')
-echo "run '$LABEL' :: assertions=$ASSERT  synchronous_commit=$SYNC"
+echo "run '$LABEL' :: assertions=$ASSERT  synchronous_commit=$SYNC  predmode=$PREDMODE"
 [ "$ASSERT" = off ] || echo "  WARNING: assertions are ON; these numbers are not comparable with a -O2 run" >&2
 
 for w in $(list "$WORKLOADS"); do
@@ -220,15 +246,32 @@ for w in $(list "$WORKLOADS"); do
          # at --perxact 1 every refresh carries a commit.  Above 1 the commit is
          # shared, and the difference between the two is the commit's share of
          # what every measurement in this suite has been reporting.
+         # literal: pgbench substitutes :k into the SQL text, so the server sees
+         # a different statement per key and the plan cache misses every time.
+         #
+         # param: :k is bound instead.  REFRESH takes no parameters directly, so
+         # the statement goes through EXECUTE ... USING in a DO block -- the same
+         # route matview_where_cache Test 4 uses.  The :k after USING is outside
+         # the quoted SQL, so pgbench replaces it and $1 inside survives verbatim;
+         # pg_get_expr then renders that Param as "$1" and the cache key is the
+         # same for every key value.  A predicate naming :k more than once (range,
+         # and array once per element) reuses the one parameter, which is what a
+         # caller binding it would write too.
+         if [ "$PREDMODE" = param ]; then
+           PRED_EXEC=$(echo "$PREDT" | sed 's/:k/$1/g')
+           REFRESH_STMT="DO \$pb\$ BEGIN EXECUTE 'REFRESH MATERIALIZED VIEW ${CONC}bench.mv WHERE ${PRED_EXEC}' USING :k; END \$pb\$;"
+         else
+           REFRESH_STMT="REFRESH MATERIALIZED VIEW ${CONC}bench.mv WHERE $PREDT;"
+         fi
          if [ "$PERXACT" -gt 1 ] 2>/dev/null; then
            echo "BEGIN;"
            j=0; while [ $j -lt "$PERXACT" ]; do
-             echo "REFRESH MATERIALIZED VIEW ${CONC}bench.mv WHERE $PREDT;"
+             echo "$REFRESH_STMT"
              j=$((j+1))
            done
            echo "END;"
          else
-           echo "REFRESH MATERIALIZED VIEW ${CONC}bench.mv WHERE $PREDT;"
+           echo "$REFRESH_STMT"
          fi
        } | sed "s/:span/$span/g; s/:arraylit/$ARRLIT/g" > "$S"
 
@@ -291,12 +334,12 @@ for w in $(list "$WORKLOADS"); do
 
        $PSQL -c "INSERT INTO bench_result(run_label,pg_version,assertions,workload,isolates,
                    scale,groups,mv_rows,form,predshape,span,scope_rows,clients,overlap,mutate,sync,
-                   perxact,tps,latency_ms,txns,failed_txns,deadlocks,ser_failures,
+                   predmode,perxact,tps,latency_ms,txns,failed_txns,deadlocks,ser_failures,
                    full_ms,us_per_scope_row,vs_full_per_row)
                  SELECT '$LABEL','$VER','$ASSERT','$w',\$\$$ISO\$\$,
                    $scale,$GROUPS,$MVROWS,'$form','$shape',$span,
                    NULLIF($SCOPE,0),$nc,'$ov',$([ "$MUTATE" = on ] && echo true || echo false),'$SYNC',
-                   $PERXACT, $BEST_TPS, $BEST_LAT, $BEST_TXN,
+                   '$PREDMODE', $PERXACT, $BEST_TPS, $BEST_LAT, $BEST_TXN,
                    $TOT_F, $TOT_DL, $TOT_SF, $FULL,
                    round(($BEST_LAT * 1000.0) / NULLIF($SCOPE,0), 3),
                    round((($BEST_LAT * 1000.0) / NULLIF($SCOPE,0))

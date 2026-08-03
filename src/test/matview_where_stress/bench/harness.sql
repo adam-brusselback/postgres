@@ -40,6 +40,20 @@ ALTER TABLE bench_result ADD COLUMN IF NOT EXISTS perxact int DEFAULT 1;
 ALTER TABLE bench_result ADD COLUMN IF NOT EXISTS failed_txns int DEFAULT 0;
 ALTER TABLE bench_result ADD COLUMN IF NOT EXISTS deadlocks int DEFAULT 0;
 ALTER TABLE bench_result ADD COLUMN IF NOT EXISTS ser_failures int DEFAULT 0;
+-- How the predicate's key value reached the server.  'literal' means pgbench
+-- substituted it into the SQL text, so every distinct key deparses to a
+-- different cache key and misses; 'param' means it was bound, so the deparse
+-- renders $1 and the key is stable.  PLAN.md 3.2 measures the two 8x apart and
+-- both are real: a per-row driver that builds SQL writes the first, one that
+-- binds writes the second.
+--
+-- The default is 'literal' because that is what every row recorded before this
+-- column existed was, whether or not anyone knew it.  PLAN.md 3.2 puts it
+-- plainly: 'every measurement in every run recorded so far is on the miss
+-- path'.  Defaulting to NULL would have been more honest about the ones we did
+-- not label, but it would also make them incomparable with everything after,
+-- and the mode is not in doubt -- run.sh could only produce literals.
+ALTER TABLE bench_result ADD COLUMN IF NOT EXISTS predmode text DEFAULT 'literal';
 
 -- How each workload's base data is mutated, when --mutate is on.  Uses :k.
 DROP TABLE IF EXISTS bench_mutation;
