@@ -1203,14 +1203,41 @@ plans (B14). Narrowing the sweep to the caller's own key — the shape
 `ri_FetchPreparedPlan()` uses — would address both the cost and half the
 correctness problem in one change.
 
-**3.11 The ENR claims the whole matview's row count.**
-`enr->md.enrtuples = matviewRel->rd_rel->reltuples` tells the planner that
-`new_data` holds every row of the matview when it holds only the scope — for a
-scope-1 refresh of a 100,000-row matview that is a hundred-thousand-fold
-overestimate, feeding the join and upsert plan choice. The true count is known
-after `matview_materialize_source()` returns, and the statement is prepared
-before that, so this is not a one-line fix — but it is a plan-quality defect
-and not merely a constant factor.
+**3.11 The ENR claims the whole matview's row count.  CLOSED, negative, and the
+entry below was wrong to call it a defect.**  It is a deliberate estimate, it is
+the one `costsize.c` asks for by name, and nothing tested beats it — including
+the exactly correct value.
+
+`addRangeTableEntryForENR()` copies `enrtuples` into the range table entry
+during **parse analysis**, so `SPI_prepare` captures it and it then travels
+inside the cached plan.  Updating the ENR afterwards changes nothing the planner
+reads, and the plan is reused across refreshes whose scopes differ by orders of
+magnitude, so no single true count would be true twice.  `costsize.c` states the
+case: *"in others the same plan will be re-used, so a 'typical' value might be
+estimated and used."*
+
+So the question is which wrong value is least wrong.  Measured in the cells
+where the anti-join actually runs:
+
+| estimate | scope 10000 | scope 1000 | non-key, 1000 |
+|---|---|---|---|
+| `reltuples` — what the code does | **23.610** | 2.770 | 2.910 |
+| the exact scope | 24.849 | 2.954 | — |
+| 1 | 25.898 | — | 3.355 |
+
+An overestimate biases the anti-join towards a hash join, which is what a large
+scope wants; an underestimate invites a nested loop over rows that turn out to
+be plentiful.  **The exactly correct estimate is slower than the current one in
+both cells where it is exact.**  The reasoning is now in the code comment, where
+a reviewer asking this question will find it, rather than only here.
+
+Two method notes, because both were mistakes made while closing this:
+
+- **The first experiment measured a cell where the code path under test does not
+  execute.**  It used a bare, key-range refresh — where R42's elision skips the
+  prune entirely, so the anti-join the estimate feeds never ran.
+- The original entry's "hundred-thousand-fold overestimate" is only true at
+  scope 1, which is precisely where the prune is elided or trivial.
 
 **3.12 Fold the locking `SELECT` into the fused statement.** Two SPI executions
 per refresh; the lock is 6.5 µs of the 33 µs the SQL costs on a warm cache.
@@ -1458,7 +1485,7 @@ and what produced it.  **No row is left as "listed".**
 | 3.8 stop deparsing for the key | **DONE** | R48, R49 |
 | 3.9 arbiter index re-derived per refresh | **CLOSED, negative** | still per refresh, and profiled at **0.03 µs**.  Nothing to win |
 | 3.10 cache sweep walks every entry | **CLOSED as a cost, negative** | profiled at **0.00 µs**.  Its *correctness* half was closed differently — B14's depth guard, not by narrowing the sweep — and narrowing it now would reopen B7, which is the only thing reclaiming a dropped matview's plans (CACHE.md §4) |
-| 3.11 ENR claims the whole matview's row count | **CLOSED, negative, and the error's direction is protective** | tested by making the estimate wrong the *other* way (`enrtuples = 1`) in the cells where the anti-join actually runs — `CONCURRENTLY` at scope 1000 and 10000, and a non-key predicate.  All three got **worse**: 23.878 → 25.898, 2.632 → 2.766, 2.910 → 3.355 ms.  An overestimate biases toward a hash anti-join, which is right at the scales where the prune costs anything; the "hundred-thousand-fold" framing only holds at scope 1, where the prune is elided or trivial.  Correcting it would be neutral at best.  **First attempt at this experiment measured a bare key-range refresh, where R42's elision means the anti-join never runs at all** — the estimate could not have mattered in the cell chosen to test it |
+| 3.11 ENR claims the whole matview's row count | **CLOSED, negative — and it is a deliberate estimate, not a defect** | the value is captured into the RTE at *parse analysis* and travels inside the cached plan, so it cannot be corrected later, and the plan serves scopes orders of magnitude apart.  `costsize.c` asks for a "typical" value for exactly this case.  Measured where the anti-join runs: `reltuples` **23.610** ms at scope 10000 against **24.849** for the *exact* scope and **25.898** for 1.  Nothing beats it, including the truth.  Reasoning moved into the code comment |
 | 3.12 fold the locking `SELECT` in | **CLOSED, negative** | guarded by A3, P1 and P2, and the prize is 6.5 µs of 33.  Recommended against when written and nothing since changes that |
 | 4.1 fused statement re-plans under a bound parameter | **CLOSED, rejected** | R1: forcing generic is 21.7% slower net.  The narrow-range re-plan is core plancache behaviour, ~0.25 ms fixed, and needs a fix narrower than anything one-line (R51) |
 | 4.2 suppress the write when nothing changed | **DONE, on by default** | R45, R46, R47 |

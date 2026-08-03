@@ -2218,6 +2218,37 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		enr->md.reliddesc = InvalidOid;
 		enr->md.tupdesc = CreateTupleDescCopy(RelationGetDescr(matviewRel));
 		enr->md.enrtype = ENR_NAMED_TUPLESTORE;
+
+		/*
+		 * A row estimate for new_data, which at this moment is empty: the
+		 * tuplestore is not filled until after the pre-lock, further down.
+		 *
+		 * The true count cannot be supplied here and this is not an oversight
+		 * that a later assignment could correct.  addRangeTableEntryForENR()
+		 * copies this value into the range table entry during PARSE ANALYSIS,
+		 * so it is captured by SPI_prepare() below and then travels inside the
+		 * cached plan; updating the ENR afterwards changes nothing the planner
+		 * reads.  And the plan is reused across refreshes whose scopes differ by
+		 * orders of magnitude, so no single true count would be true twice.
+		 * costsize.c asks for exactly this case by name: "in others the same
+		 * plan will be re-used, so a 'typical' value might be estimated and
+		 * used."
+		 *
+		 * So the question is which wrong value is least wrong, and the matview's
+		 * own row count answers it two ways.  It is the right order of magnitude
+		 * -- the source is the view's output for the scope, and the matview is
+		 * the view's output for everything -- and it errs high, which is the
+		 * safe direction: an overestimate biases the prune's anti-join towards a
+		 * hash join, which is what a large scope wants, while an underestimate
+		 * invites a nested loop over rows that turn out to be plentiful.
+		 *
+		 * Measured rather than argued, in the cells where the anti-join actually
+		 * runs.  Against this: enrtuples = 1 costs 23.878 -> 25.898 ms at scope
+		 * 10000 and 2.910 -> 3.355 on a non-key predicate.  And a *perfect*
+		 * estimate is no better -- supplying the exact scope reads 24.849 at
+		 * scope 10000 against this line's 23.610, and 2.954 at scope 1000
+		 * against 2.770.  Nothing tested beats it, including the truth.
+		 */
 		enr->md.enrtuples = Max(matviewRel->rd_rel->reltuples, 0);
 		enr->reldata = sourceStore;
 
