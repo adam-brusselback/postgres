@@ -190,6 +190,7 @@ static bool refresh_where_clause_is_leakproof(Node *qual);
 static bool refresh_qual_is_key_only(Node *qual, int nkeyatts,
 									 const int16 *keyattnums);
 static ParamListInfo matview_prune_guard_params(ParamListInfo params,
+												bool serialized,
 												bool qual_key_only,
 												int64 n_locked,
 												int64 n_source);
@@ -1813,8 +1814,8 @@ refresh_qual_is_key_only(Node *qual, int nkeyatts, const int16 *keyattnums)
  *
  *   n_locked == 0            the matview holds nothing in scope, so the prune's
  *                            DELETE has nothing to match -- the upsert's own
- *                            inserts are not visible to it.  Needs no counting
- *                            and no gate, and is passed as the boolean.
+ *                            inserts are not visible to it.  Passed as the
+ *                            boolean.
  *
  *   n_locked + n_inserted    every source row is accounted for by a matview row
  *     == n_source            that was already in scope or by one just inserted,
@@ -1825,10 +1826,33 @@ refresh_qual_is_key_only(Node *qual, int nkeyatts, const int16 *keyattnums)
  *
  * The second rule is unsound without that gate, and silently so: see
  * refresh_qual_is_key_only() and SPECIALIZE.md 3b.
+ *
+ * BOTH rules additionally need `serialized`, and that one is not about the
+ * predicate at all.  n_locked is measured by the pre-lock, under an earlier
+ * snapshot than the DELETE it stands in for -- the snapshot has to be taken
+ * after the lock, or a refresh that queued behind another would evaluate its
+ * source from before that one committed and write the stale values back over it
+ * (SPECIALIZE.md 3e; fuzz.sh serial mode catches it as M3 and M6).  The lock
+ * stops the rows it matched from changing; it does not stop new ones appearing.
+ * A refresh over a key the matview does not hold yet locks nothing, so it does
+ * not queue behind us and can commit a row into our scope inside that window --
+ * a row neither count has seen, and the accounting then balances while that row
+ * is orphaned.  Demonstrated, not argued: matview-where-prune-elide.spec leaves
+ * a stale row without this condition and is green with it.
+ *
+ * ExclusiveLock is what closes it, because it is the level at which no other
+ * session can write this matview at all: it conflicts with the
+ * RowExclusiveLock a CONCURRENTLY partial refresh takes and with another bare
+ * refresh's ExclusiveLock, while still admitting readers.  So the saving is
+ * available exactly where the lock makes it safe -- which is SPECIALIZE.md 4's
+ * argument for choosing that level deliberately, cashed in a second time.
+ * Asked of the lock manager rather than derived from the statement's spelling:
+ * the precondition is "nobody else can write this", and that is a fact about
+ * the lock actually held.
  */
 static ParamListInfo
-matview_prune_guard_params(ParamListInfo params, bool qual_key_only,
-						   int64 n_locked, int64 n_source)
+matview_prune_guard_params(ParamListInfo params, bool serialized,
+						   bool qual_key_only, int64 n_locked, int64 n_source)
 {
 	int			npred = params ? params->numParams : 0;
 	ParamListInfo guarded = makeParamList(npred + MATVIEW_PRUNE_GUARD_NARGS);
@@ -1839,7 +1863,7 @@ matview_prune_guard_params(ParamListInfo params, bool qual_key_only,
 		guarded->params[i] = params->params[i];
 
 	prm = &guarded->params[npred];
-	prm->value = BoolGetDatum(n_locked == 0);
+	prm->value = BoolGetDatum(serialized && n_locked == 0);
 	prm->isnull = false;
 	prm->pflags = PARAM_FLAG_CONST;
 	prm->ptype = BOOLOID;
@@ -1851,7 +1875,7 @@ matview_prune_guard_params(ParamListInfo params, bool qual_key_only,
 	prm->ptype = INT8OID;
 
 	prm = &guarded->params[npred + 2];
-	prm->value = Int64GetDatum(qual_key_only ? n_source : -1);
+	prm->value = Int64GetDatum((serialized && qual_key_only) ? n_source : -1);
 	prm->isnull = false;
 	prm->pflags = PARAM_FLAG_CONST;
 	prm->ptype = INT8OID;
@@ -1933,10 +1957,20 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	int16	   *keyattnums = NULL;
 	Tuplestorestate *sourceStore = NULL;
 	bool		qual_key_only = false;
+	bool		serialized;
 	int64		n_locked = 0;
 	int64		n_source = 0;
 
 	matviewRel = table_open(matviewOid, NoLock);
+
+	/*
+	 * Can any other session write this matview while we refresh it?  Only the
+	 * prune guard cares, and it cares a great deal -- see
+	 * matview_prune_guard_params().  Asked of the lock manager rather than
+	 * derived from whether CONCURRENTLY was written, because what the guard
+	 * needs is the fact rather than the spelling that chose it.
+	 */
+	serialized = CheckRelationLockedByMe(matviewRel, ExclusiveLock, true);
 
 	/*
 	 * Find the usable unique index.  There is at most one, so there is nothing
@@ -2539,6 +2573,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 
 		if (matview_execute_spi_plan(cacheEntry->refreshPlan,
 									 matview_prune_guard_params(params,
+																serialized,
 																qual_key_only,
 																n_locked,
 																n_source),

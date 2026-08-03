@@ -378,8 +378,8 @@ MUTATIONS = {
     'N1': ('-', 'data',
            'the prune elision drops its key-only gate '
            '(scope drift survives the refresh)', [
-               ('\tprm->value = Int64GetDatum(qual_key_only ? n_source : -1);',
-                '\tprm->value = Int64GetDatum(n_source);', 1),
+               ('\tprm->value = Int64GetDatum((serialized && qual_key_only) ? n_source : -1);',
+                '\tprm->value = Int64GetDatum(serialized ? n_source : -1);', 1),
            ]),
 
     # N2 is the same optimisation failing the other way: the prune is skipped
@@ -393,7 +393,7 @@ MUTATIONS = {
     # leaves the scope is deleted) as well as Test 20.
     'N2': ('-', 'data',
            'the prune is skipped unconditionally (nothing is ever deleted)', [
-               ('\tprm->value = BoolGetDatum(n_locked == 0);',
+               ('\tprm->value = BoolGetDatum(serialized && n_locked == 0);',
                 '\tprm->value = BoolGetDatum(true);', 1),
            ]),
 
@@ -404,11 +404,34 @@ MUTATIONS = {
     # count to -1, which no non-negative left-hand side can equal -- so the
     # statement, its plan and its cache key are untouched and only the DELETE's
     # One-Time Filter changes.
+    # N4 is the concurrency half of the guard, and it is the one that was found
+    # by building the detector rather than by reading the design.  n_locked is
+    # measured by the pre-lock, under an earlier snapshot than the DELETE it
+    # stands in for -- and the snapshot has to be taken in that order, or a
+    # refresh that queued behind another evaluates its source from before that
+    # one committed (M3's lost update).  So a refresh over a key the matview
+    # does not hold yet locks nothing, does not queue, and can commit a row into
+    # our scope inside the window.  Neither count has seen it.
+    #
+    # Removing the lock-level condition leaves both count rules intact and every
+    # single-session test green: matview_where Test 20 passes, the contract file
+    # passes, the oracle passes.  Only matview-where-prune-elide's first
+    # permutation goes red, and it needs an injection point to be reached at
+    # all.
+    'N4': ('-', 'concur',
+           'the prune elision ignores the lock level '
+           '(a row committed into the scope mid-refresh survives)', [
+               ('\tprm->value = BoolGetDatum(serialized && n_locked == 0);',
+                '\tprm->value = BoolGetDatum(n_locked == 0);', 1),
+               ('\tprm->value = Int64GetDatum((serialized && qual_key_only) ? n_source : -1);',
+                '\tprm->value = Int64GetDatum(qual_key_only ? n_source : -1);', 1),
+           ]),
+
     'N3': ('-', 'perf',
            'the prune runs on every refresh (the 3b elision silently off)', [
-               ('\tprm->value = BoolGetDatum(n_locked == 0);',
+               ('\tprm->value = BoolGetDatum(serialized && n_locked == 0);',
                 '\tprm->value = BoolGetDatum(false);', 1),
-               ('\tprm->value = Int64GetDatum(qual_key_only ? n_source : -1);',
+               ('\tprm->value = Int64GetDatum((serialized && qual_key_only) ? n_source : -1);',
                 '\tprm->value = Int64GetDatum(-1);', 1),
            ]),
 
