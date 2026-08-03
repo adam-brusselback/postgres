@@ -80,9 +80,21 @@ EDITS = [
 										   save_userid);
 		MVP_STOP(MVP_TRANSFORM);"""),
 
-    ("""		qual_str = deparseRefreshWhereClause(matviewOid, qual);""",
+    # The deparse moved inside the cache-miss branch, so this timer now reads
+    # 0.0 on a warm refresh -- which is the whole of what the change did and is
+    # what the profile has to be able to show.  Two consequences worth knowing
+    # before reading a profile taken with it:
+    #
+    #   * DEPARSE is now NESTED INSIDE PREPARE, where it used to sit beside it.
+    #     A cold band therefore counts those microseconds twice, once in each,
+    #     and the phases no longer sum to the total on a miss.  They still do on
+    #     a hit, where both read 0.
+    #   * The match/merge path deparses too, and is deliberately NOT timed: it
+    #     caches nothing, so it has no warm case to report and the timer would
+    #     only muddle a profile of the path that does.
+    ("""		whereClauseStr = deparseRefreshWhereClause(matviewOid, qual);""",
      """		MVP_START(MVP_DEPARSE);
-		qual_str = deparseRefreshWhereClause(matviewOid, qual);
+		whereClauseStr = deparseRefreshWhereClause(matviewOid, qual);
 		MVP_STOP(MVP_DEPARSE);"""),
 
     # The anchor used to be the one-line comment "preferring the primary key",

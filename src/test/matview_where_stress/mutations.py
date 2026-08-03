@@ -316,10 +316,22 @@ MUTATIONS = {
     'C7': ('-', 'data',
            'the plan cache key ignores the predicate '
            '(a second, different predicate reuses the first one\'s plans)', [
-               ('\t\tcacheEntry->whereClauseStr != NULL &&\n'
-                '\t\twhereClauseStr != NULL &&\n'
-                '\t\tstrcmp(cacheEntry->whereClauseStr, whereClauseStr) == 0 &&\n',
-                '', 1),
+               ('\t\tcacheEntry->qual != NULL &&\n'
+                '\t\tequal(cacheEntry->qual, qual) &&\n', '', 1),
+           ]),
+
+    # C8 is C7's near miss rather than its whole-term removal, and it exists
+    # because the two fail differently.  Comparing only the top node accepts any
+    # two predicates with the same shape at the root -- "id = $1" against
+    # "grp = $1" is one OpExpr against another, equal in everything _equalOpExpr
+    # looks at except the args it is no longer told to descend into.  A
+    # comparison that walked no deeper would pass every gate C7 fails and still
+    # refresh the wrong rows, so the detector has to be shown to catch it too.
+    'C8': ('-', 'data',
+           'the cache key compares only the predicate\'s top node '
+           '(same-shaped predicates on different columns share plans)', [
+               ('\t\tequal(cacheEntry->qual, qual) &&\n',
+                '\t\tnodeTag(cacheEntry->qual) == nodeTag(qual) &&\n', 1),
            ]),
 
     # The leak, as distinct from C3's crash.  C3 keeps the old plansource *and*

@@ -133,13 +133,23 @@ typedef struct MatViewPartialRefreshCache
 	/* Validation fields */
 	Oid			uniqueIndexOid; /* The unique index used for conflict
 								 * resolution */
-	char	   *whereClauseStr; /* The WHERE clause string used to build the
-								 * plans */
+	Node	   *qual;			/* the predicate these plans were built from,
+								 * compared with equal().  The tree rather than
+								 * its deparsed text: deparsing costs 4.5-5.3 us
+								 * (RESULTS.md R14) and the text was only ever
+								 * read by the comparison, so keying on the tree
+								 * removes it from every refresh that hits.
+								 * equal() ignores parse locations, so the same
+								 * predicate written at a different offset in the
+								 * command still matches */
 	int			nargs;			/* number of external parameters */
-	Oid		   *argtypes;		/* their types; the deparsed clause renders a
-								 * parameter as "$n" with no type, so two
-								 * clauses can be textually identical and still
-								 * need different plans */
+	Oid		   *argtypes;		/* their types.  Not implied by the qual: a
+								 * caller may bind a parameter the predicate
+								 * never names, and the generated statement
+								 * declares every one of them */
+
+	MemoryContext metacxt;		/* holds qual and argtypes, so the two are freed
+								 * together and a node tree can be freed at all */
 
 	bool		optimized;		/* was matview_partial_refresh_optimized set
 								 * when these plans were built?  It changes the
@@ -187,7 +197,6 @@ static uint64 refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 static uint64 refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 											 int save_sec_context,
 											 Query *dataQuery, Node *qual,
-											 char *whereClauseStr,
 											 ParamListInfo params);
 static void refresh_by_heap_swap(Oid matviewOid, Oid OIDNewHeap, char relpersistence);
 static bool is_usable_unique_index(Relation indexRel);
@@ -926,15 +935,23 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 										   save_userid);
 
 		/*
-		 * Before the deparse, because the deparsed text is the plan cache's
-		 * key and the tree is what the source query executes: rewriting one
-		 * and not the other would leave the two disagreeing about which rows
-		 * the predicate selects.
+		 * Every consumer of the predicate reads it from here down, so this is
+		 * the one place the substitution has to happen: the source query
+		 * executes this tree, the plan cache keys on it, and both generated
+		 * statements are deparsed from it.  Rewriting it for one and not the
+		 * others would leave them disagreeing about which rows are selected.
 		 */
 		qual = parameterizeRefreshWhereClause(qual, &params);
-
-		qual_str = deparseRefreshWhereClause(matviewOid, qual);
 	}
+
+	/*
+	 * The deparse is deliberately NOT done here.  It costs 4.5-5.3 us
+	 * (RESULTS.md R14) and only two consumers need it: the match/merge branch
+	 * below, which interpolates it into three statements, and
+	 * refresh_by_direct_modification(), which needs it only when it is building
+	 * plans.  Doing it up front charged every refresh for something a warm one
+	 * throws away, so each branch does its own.
+	 */
 
 	/*
 	 * Check that there is a unique index with no WHERE clause on one or more
@@ -1041,7 +1058,7 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	{
 		processed = refresh_by_direct_modification(matviewOid, relowner,
 												   save_sec_context, dataQuery,
-												   qual, qual_str, params);
+												   qual, params);
 	}
 
 	/*
@@ -1058,6 +1075,13 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 
 		tableSpace = GetDefaultTablespace(RELPERSISTENCE_TEMP, false);
 		relpersistence = RELPERSISTENCE_TEMP;
+
+		/*
+		 * This path builds three statements by interpolation and caches
+		 * nothing, so it needs the predicate as text every time it runs.
+		 */
+		if (qual)
+			qual_str = deparseRefreshWhereClause(matviewOid, qual);
 
 		/*
 		 * Create the transient table that will receive the regenerated data.
@@ -1463,10 +1487,8 @@ matview_cache_sweep(void)
 			SPI_freeplan(entry->refreshPlan);
 		if (entry->sourcePlan)
 			DropCachedPlan(entry->sourcePlan);
-		if (entry->whereClauseStr)
-			pfree(entry->whereClauseStr);
-		if (entry->argtypes)
-			pfree(entry->argtypes);
+		if (entry->metacxt)
+			MemoryContextDelete(entry->metacxt);
 
 		/* dynahash permits removing the just-returned element mid-scan */
 		if (hash_search(MatViewRefreshCache, &entry->matviewOid,
@@ -1959,8 +1981,7 @@ matview_prune_guard_params(ParamListInfo params, bool serialized,
 static uint64
 refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 							   int save_sec_context, Query *dataQuery,
-							   Node *qual, char *whereClauseStr,
-							   ParamListInfo params)
+							   Node *qual, ParamListInfo params)
 {
 	Relation	matviewRel;
 	Oid			uniqueIndexOid = InvalidOid;
@@ -2076,6 +2097,16 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 
 		cacheEntry = (MatViewPartialRefreshCache *)
 			hash_search(MatViewRefreshCache, &matviewOid, HASH_ENTER, &found);
+
+		/*
+		 * HASH_ENTER fills in the key and leaves the rest of the element
+		 * holding whatever dynahash last had there.  The mismatch branch below
+		 * initialises every other field, but it does so after testing metacxt,
+		 * so that one has to be cleared here or a new entry would reset a
+		 * garbage context.
+		 */
+		if (!found)
+			cacheEntry->metacxt = NULL;
 	}
 	else
 	{
@@ -2087,9 +2118,22 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 
 	/*
 	 * We have a cache hit ONLY if the entry exists, the unique index matches,
-	 * and the WHERE clause string perfectly matches.  We also ensure
-	 * whereClauseStr is not NULL to prevent a strcmp segfault if a previous
-	 * compilation failed midway.
+	 * and the predicate is the same predicate.  Same predicate means an equal()
+	 * tree: the plans were built by deparsing this tree, so two trees that
+	 * compare equal deparse to the same statement, and a difference anywhere in
+	 * the tree is a difference in the rows selected.  The entry's qual is also
+	 * checked non-NULL, which is not redundant -- equal() would answer this
+	 * correctly, but an entry whose plan build threw partway is worth refusing
+	 * explicitly rather than by implication.
+	 *
+	 * The tree is compared rather than its deparsed text because the text was
+	 * this comparison's only reader, and producing it costs 4.5-5.3 us on every
+	 * refresh including one that goes on to hit (RESULTS.md R14).  It is also
+	 * the stronger key: pg_get_expr renders a Param as "$n" with no type, which
+	 * is B3, while the tree carries paramtype and paramtypmod on the node.
+	 * argtypes stays anyway -- it covers a parameter the predicate never names,
+	 * which cannot appear in the tree and which the generated statement still
+	 * has to declare.
 	 *
 	 * The plans are also specific to which implementation built them, and that
 	 * can change between two refreshes of the same matview in one session
@@ -2098,9 +2142,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	if (found &&
 		cacheEntry->uniqueIndexOid == uniqueIndexOid &&
 		cacheEntry->optimized == use_optimized &&
-		cacheEntry->whereClauseStr != NULL &&
-		whereClauseStr != NULL &&
-		strcmp(cacheEntry->whereClauseStr, whereClauseStr) == 0 &&
+		cacheEntry->qual != NULL &&
+		equal(cacheEntry->qual, qual) &&
 		cacheEntry->nargs == (params ? params->numParams : 0) &&
 		matview_argtypes_match(cacheEntry, params))
 	{
@@ -2117,16 +2160,14 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 				SPI_freeplan(cacheEntry->refreshPlan);
 			if (cacheEntry->sourcePlan)
 				DropCachedPlan(cacheEntry->sourcePlan);
-			if (cacheEntry->whereClauseStr)
-				pfree(cacheEntry->whereClauseStr);
-			if (cacheEntry->argtypes)
-				pfree(cacheEntry->argtypes);
+			if (cacheEntry->metacxt)
+				MemoryContextReset(cacheEntry->metacxt);
 		}
 
 		cacheEntry->lockPlan = NULL;
 		cacheEntry->refreshPlan = NULL;
 		cacheEntry->sourcePlan = NULL;
-		cacheEntry->whereClauseStr = NULL;
+		cacheEntry->qual = NULL;
 		cacheEntry->nargs = 0;
 		cacheEntry->argtypes = NULL;
 		cacheEntry->optimized = use_optimized;
@@ -2190,6 +2231,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		StringInfoData buf;
 		char	   *matview_name;
 		const char *matview_alias;
+		char	   *whereClauseStr;
 		Oid		   *argtypes = NULL;
 		Oid		   *dml_argtypes;
 		int			nargs = 0;
@@ -2212,6 +2254,13 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		matview_name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
 												  RelationGetRelationName(matviewRel));
 		matview_alias = quote_identifier(RelationGetRelationName(matviewRel));
+
+		/*
+		 * The one place the predicate still has to be text: SPI takes a string.
+		 * Inside the miss branch rather than above it, because a hit has no use
+		 * for it -- the cache is keyed on the tree this was deparsed from.
+		 */
+		whereClauseStr = deparseRefreshWhereClause(matviewOid, qual);
 
 		if (params && params->numParams > 0)
 		{
@@ -2492,9 +2541,22 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		 */
 		if (use_cache)
 		{
-			oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
+			/*
+			 * The qual is a node tree, and a node tree cannot be pfree'd: it is
+			 * many allocations reachable only from each other.  So the entry's
+			 * metadata gets a context of its own, reset when the key changes and
+			 * deleted when the entry goes.  argtypes rides along in it so that
+			 * one reset covers both and neither can outlive the other.
+			 */
+			if (cacheEntry->metacxt == NULL)
+				cacheEntry->metacxt =
+					AllocSetContextCreate(CacheMemoryContext,
+										  "MatView Partial Refresh Cache Key",
+										  ALLOCSET_SMALL_SIZES);
+
+			oldcxt = MemoryContextSwitchTo(cacheEntry->metacxt);
 			cacheEntry->uniqueIndexOid = uniqueIndexOid;
-			cacheEntry->whereClauseStr = pstrdup(whereClauseStr);
+			cacheEntry->qual = copyObject(qual);
 			cacheEntry->nargs = nargs;
 			if (nargs > 0)
 			{
@@ -2506,6 +2568,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 			MemoryContextSwitchTo(oldcxt);
 		}
 
+		pfree(whereClauseStr);
 		pfree(matview_name);
 		pfree(buf.data);
 		pfree(conflict_cols.data);
