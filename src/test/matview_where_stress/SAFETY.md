@@ -287,6 +287,32 @@ heuristic. Conjunctive queries with `min`/`max`/`count`/`sum` are also decidable
 this — for those the harness is exactly what it looks like, bounded testing
 under the small-scope hypothesis.
 
+### The check is designed and NOT shipped, deliberately — B15's decision
+
+What follows is a design, not a description of the code.  The v1 patch
+**documents** the hazard instead of refusing it: `refresh_materialized_view.sgml`
+now carries a `<warning>` on the `WHERE` parameter covering blast radius, plus
+paragraphs on scope drift and on non-determinism.
+
+Three reasons, and the third is the one that decides it:
+
+1. The check below is **sound but incomplete**.  It refuses `except_key`, which
+   is exhaustively safe at 0/64.  A restriction is far harder to withdraw than
+   to add, so an incomplete refusal in v1 forecloses valid use permanently.
+2. A `WARNING` is worse than either: it fires on the safe-but-unprovable cases
+   as well, which teaches people to filter it, and in a row-trigger loop it is
+   per-refresh noise.
+3. **No `REFRESH`-time check can see the failure that actually bites.**
+   Coverage (§5) is the driver naming the wrong rows, and the command is not
+   told what changed.  Two of the four "pushed but unsafe" cases in the table
+   above are coverage failures, and both become safe with a corrected
+   predicate — which no check at this end could have supplied.
+
+Note that **cost is not the objection** and must not be offered as one: the
+measurement below shows conditions 1-3 are functions of the cache key and free
+on a hit.  The check is affordable; it is just not complete, and not aimed at
+the common failure.
+
 ### "Is there a sound check cheap enough to run on every refresh?"
 
 Close to it, and mostly out of parts that already exist. Four conditions:
