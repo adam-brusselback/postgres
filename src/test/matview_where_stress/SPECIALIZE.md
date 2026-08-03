@@ -151,7 +151,9 @@ sceptically too:
   has no overlapping refreshes needs the lock exactly as much as one that knows
   it does. See §3e.
 - **`no_delete`** — need not be declared, because the algorithm already computes
-  it. The fused statement knows how many source rows it saw, how many it
+  it, **though not as simply as this paragraph once said — see §3b, which
+  refutes the rule below with a case that leaves the matview holding a row its
+  own definition does not produce.** The fused statement knows how many source rows it saw, how many it
   inserted, and how many matview rows the pre-lock matched. If
   `n_locked + n_inserted == n_source`, every row in scope is accounted for and
   the prune has nothing to delete. That is Tier 2 evidence about *this* refresh,
@@ -194,8 +196,81 @@ is better everywhere in it, and a *slower* entry is spelled out as such.
 | **parameterise predicate `Const`s** — *implemented*; each Const becomes a `Param` of the same type, typmod and collation before the deparse, and the values ride the `ParamListInfo` the path already carried | — | **8× in-backend** (R15), **0.3-45.3% end to end across 40 paired cells, none slower** (R37).  It turns refreshes that would miss the plan cache into hits | oracle, plus `matview_where` Test 19 for the values reaching the right rows and `matview_where_source_plan` part 3 for the plan actually being reused.  Changes what the cache key *is*, so it lands first or last, never in the middle |
 | **skip the prune** when the source is **empty** — the non-empty case is now covered by derived `no_delete` below, which needs no at-most-one-row proof | 1 + 2 | unmeasured. It is the mirror of the row above — the row-trigger delete path — and it applies at *any* scope | **none yet** — see 3c |
 | **drop the pre-lock's `ORDER BY`** — *not* the source's, and gated on the **lock level**, not on index alignment | 1 | **Measured directly on the pre-lock: 20–69% of it** when misaligned, growing with scope, and 4–26% when aligned. The pre-lock is 12–15% of a refresh, so the implied whole-refresh saving is **~3–10% — implied, not measured.** Direct whole-refresh measurement cannot resolve it at scope 1000, where the effect is smaller than the harness's own ±11% wobble; only `nonkey`/scope 10000 (+4.8 to +9.4%) is plausibly resolved. Do **not** bundle the source `ORDER BY` in — see below | oracle, plus an isolation permutation showing two refreshes deadlocking if it is dropped under `RowExclusiveLock` |
-| **drop the prune** — `no_delete`, now **derived** rather than declared: `n_locked + n_inserted == n_source` means nothing in scope is orphaned | **2**, not 4 | **13–19% faster** at scope ≥1000, measured *on top of* the row comparison rather than instead of it; only **1.1% faster** on `expensive`, where GIN maintenance dominates | oracle, plus the `mutations.py` entry that forces the elision when the counts do *not* agree |
+| **drop the prune** — `no_delete`, **derived** rather than declared, but **not by the rule this row used to state**: `n_locked + n_inserted == n_source` is unsound on its own and §3b has the counterexample and the correction | **2**, not 4 | **13–19% faster** at scope ≥1000, measured *on top of* the row comparison rather than instead of it; only **1.1% faster** on `expensive`, where GIN maintenance dominates | oracle, plus the `mutations.py` entry that forces the elision when the counts do *not* agree |
 | **`DO NOTHING`** (`append_only`) — the half that cannot be derived, because no count taken during a refresh proves existing rows never need rewriting | 4 | a further **10–22 points** on top of `no_delete`, taking the pair to **26–39% faster** at scope ≥1000 | sampling verifier, plus a `mutations.py` entry declaring `append_only` on a view that updates |
+
+### 3b. `n_locked + n_inserted == n_source` is UNSOUND, and here is the case
+
+The derivation above is wrong as written, and the failure is silent corruption
+rather than a slow refresh. **Do not implement it in that form.**
+
+It assumes every source row that conflicts with an existing matview row
+conflicts with one *in scope*. A predicate on a non-key column breaks that: a
+matview row can carry the same key as a source row and not satisfy the
+predicate, so the conflict is invisible to `n_locked` and the two errors
+cancel.
+
+Reduced, and **run rather than reasoned** — the counters below are the real
+ones, measured on the shipped code:
+
+```sql
+CREATE TABLE nd_base(k int primary key, status text);
+INSERT INTO nd_base VALUES (1,'A'), (2,'B');
+CREATE MATERIALIZED VIEW nd_mv AS SELECT k, status FROM nd_base;
+CREATE UNIQUE INDEX ON nd_mv(k);
+
+UPDATE nd_base SET status='B' WHERE k=1;   -- leaves the scope
+UPDATE nd_base SET status='A' WHERE k=2;   -- enters it
+
+REFRESH MATERIALIZED VIEW nd_mv WHERE status = 'A';
+```
+
+    n_locked = 1     the matview's (1,'A')
+    n_source = 1     the base's  (2,'A')
+    n_inserted = 0   k=2 conflicts with the matview's (2,'B')
+
+`1 + 0 == 1`, so the derivation says nothing is orphaned. The refresh in fact
+**deletes k=1**, correctly, because the source no longer produces it. Under the
+elision the matview would keep `(1,'A')` — a row its own definition does not
+produce — and report success.
+
+**What is sound instead**, and the shape is verified against the executor:
+
+- **`n_locked == 0`** — no matview row is in scope, so the prune cannot delete
+  anything. Unconditional; needs no gate and no counting.
+- **`n_locked + n_inserted == n_source`, gated on the qual referencing only the
+  arbiter index's key columns.** That gate is what makes drift impossible: two
+  rows with the same key then agree on the qual, so every conflicting matview
+  row is necessarily in scope. §3c's at-most-one-row proof is the special case
+  of this where the qual is equality on every key column.
+
+`n_inserted` is not known until the upsert has run, and the upsert and the
+prune are one statement — so the decision has to be made *inside* it:
+
+```sql
+WITH upsert AS (INSERT ... ON CONFLICT ... RETURNING (OLD.k IS NULL) AS ins),
+     pruned AS (DELETE FROM mv WHERE (qual) AND NOT EXISTS (...)
+                  AND NOT ($force_skip
+                           OR $n_locked + (SELECT count(*) FILTER (WHERE ins)
+                                             FROM upsert) = $n_source)
+                RETURNING 1)
+```
+
+Two things make that work rather than merely look right, both checked on this
+build:
+
+- the `DELETE` gets a **`One-Time Filter`**, so a false guard skips the scan
+  entirely rather than scanning and matching nothing — which is where the
+  saving comes from;
+- its `InitPlan` reads the upsert CTE, and that **data dependency is what
+  orders them**. `WITH` sub-statements are otherwise executed in no defined
+  order relative to each other, so a guard that did not read the upsert would
+  be reading a count that may not exist yet.
+
+The gate then lives in the *values*, not in the SQL: pass the real `n_source`
+when the qual is key-only and `-1` when it is not, since the left-hand side is
+never negative. One statement, one plan, one cache key — which also keeps B31's
+rule, that anything changing the generated SQL has to be in the key.
 
 ### 3c. The at-most-one-row proof, and why it needs a new detector
 
