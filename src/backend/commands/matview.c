@@ -62,16 +62,6 @@
 #include "utils/syscache.h"
 #include "utils/tuplestore.h"
 
-
-/*
- * Does the upsert compare a matched row against its replacement before
- * rewriting it?  On by default: the comparison is far cheaper than the row
- * version it avoids writing, so it pays at every scope, and even a scope in
- * which every row changed only pays for the comparison itself.
- *
- * Development off-switch, to be removed along with the rest of the
- * branch-local scaffolding.
- */
 bool		matview_partial_refresh_optimized = true;
 
 /*
@@ -96,7 +86,6 @@ bool		matview_partial_refresh_optimized = true;
  */
 #define MATVIEW_PRUNE_GUARD_NARGS	3
 
-
 typedef struct
 {
 	DestReceiver pub;			/* publicly-known function pointers */
@@ -108,52 +97,32 @@ typedef struct
 	BulkInsertState bistate;	/* bulk insert state */
 } DR_transientrel;
 
-/*
- * Session-level cache for Partial Refresh plans.
- * We cache the prepared SPI plans for both the row-locking and refresh steps
- * avoiding expensive calls (pg_get_viewdef) and parsing on every execution.
- */
 typedef struct MatViewPartialRefreshCache
 {
-	Oid			matviewOid;		/* Hash Key */
+	Oid			matviewOid;		/* hash key */
 
-	/* Validation fields */
-	Oid			uniqueIndexOid; /* The unique index used for conflict
-								 * resolution */
-	Node	   *qual;			/* the predicate these plans were built from,
-								 * compared with equal().  The tree rather than
-								 * its deparsed text, so a cache hit costs no
-								 * deparse; equal() ignores parse locations, so
-								 * the same predicate written at a different
-								 * offset still matches */
+	/* what these plans were built for; all of it must match to reuse them */
+	Oid			uniqueIndexOid; /* the index the upsert arbitrates on */
+	Node	   *qual;			/* the predicate, compared with equal().  The
+								 * tree rather than its deparsed text, so a hit
+								 * costs no deparse */
 	int			nargs;			/* number of external parameters */
 	Oid		   *argtypes;		/* their types.  Not implied by qual: a caller
 								 * may bind a parameter the predicate never
-								 * names, and the statement declares them all */
-
+								 * names, and the statements declare them all */
 	MemoryContext metacxt;		/* holds qual and argtypes; a node tree cannot
 								 * be freed piecemeal */
+	bool		optimized;		/* matview_partial_refresh_optimized as it was
+								 * when these plans were built; it changes the
+								 * generated SQL */
 
-	bool		optimized;		/* was matview_partial_refresh_optimized set
-								 * when these plans were built?  It changes the
-								 * generated SQL, so a plan built one way is
-								 * wrong for the other */
-
-	/* The cached plans */
 	SPIPlanPtr	lockPlan;		/* SELECT ... FOR NO KEY UPDATE */
-	SPIPlanPtr	refreshPlan;	/* Fused CTE: Evaluate -> Upsert -> Delete */
-	CachedPlanSource *sourcePlan;	/* the view's own query, on the Query-tree
-									 * path only.  Rewriting and planning it is
-									 * 16.2% of a warm scope-1 refresh; keeping
-									 * it saved is what removes that.  NULL on
-									 * the text path, where the source is
-									 * spliced into the fused statement and
-									 * planned as part of it */
+	SPIPlanPtr	refreshPlan;	/* the fused upsert and prune */
+	CachedPlanSource *sourcePlan;	/* the matview's own query */
 
 	bool		invalid;		/* set by the relcache callback; the entry is
-								 * dropped at the next partial refresh, not by
-								 * the callback itself -- see
-								 * InvalidateMatViewCache */
+								 * dropped at the next refresh, not here */
+
 }			MatViewPartialRefreshCache;
 
 static HTAB *MatViewRefreshCache = NULL;
@@ -261,10 +230,11 @@ SetMatViewPopulatedState(Relation relation, bool newstate)
 	 */
 	CommandCounterIncrement();
 }
-
 /*
- * Hook to allow parameters (e.g. $1) in the WHERE clause.
+ * Resolve a $n in a partial refresh's WHERE clause against the parameters the
+ * caller supplied, so that "REFRESH ... WHERE id = $1" can be prepared.
  */
+
 static Node *
 refresh_paramref_hook(ParseState *pstate, ParamRef *pref)
 {
@@ -294,40 +264,21 @@ refresh_paramref_hook(ParseState *pstate, ParamRef *pref)
  * Transform the WHERE clause for REFRESH MATERIALIZED VIEW.
  */
 /*
- * check_functions_in_node callback: is this function leakproof?
+ * check_functions_in_node callback: true if this function is not leakproof.
  */
+
 static bool
 non_leakproof_checker(Oid func_id, void *context)
 {
 	return !get_func_leakproof(func_id);
 }
-
 /*
- * Is this node something a non-owner may have evaluated with the matview
- * owner's privileges?
+ * Does this expression call anything that is not leakproof?
  *
- * This is an allowlist, and it has to be.  The previous version of this walker
- * flagged known-bad functions and let through every node type it did not
- * recognise, which meant a caller holding only MAINTAIN could read any table
- * the owner could:
- *
- *   REFRESH MATERIALIZED VIEW CONCURRENTLY mv WHERE id = (SELECT val FROM secret)
- *
- * The subquery runs as the owner, and the caller then reads back which row the
- * refresh touched -- an oracle that yields the value a row at a time.  Every
- * sublink spelling reached it (scalar, EXISTS, ANY, one buried in a CASE), and
- * so did a cast to a domain whose CHECK constraint calls a non-leakproof
- * function, because that function is not in the expression tree at all.
- *
- * Leakproofness is the wrong question for those nodes rather than a question
- * answered wrongly: it constrains what a FUNCTION may reveal about its
- * arguments, and says nothing about which RELATIONS an expression may read.  So
- * anything that can reach a relation, or reach a function that is not visible
- * here, is refused outright and the caller must own the matview.
- *
- * Modelled on contain_leaked_vars_walker() in clauses.c, which solves the same
- * problem for row-level security and defaults to unsafe for the same reason.
+ * Only node types that cannot reach a relation are accepted; anything able to
+ * read one is treated as non-leakproof whether or not its functions are.
  */
+
 static bool
 contain_non_leakproof_walker(Node *node, void *context)
 {
@@ -360,7 +311,7 @@ contain_non_leakproof_walker(Node *node, void *context)
 		case T_List:
 			break;
 
-		/* These call functions; every one of them must be leakproof. */
+		
 		case T_FuncExpr:
 		case T_OpExpr:
 		case T_DistinctExpr:
@@ -373,25 +324,25 @@ contain_non_leakproof_walker(Node *node, void *context)
 				return true;
 			break;
 
-		/*
-		 * Everything else -- notably T_SubLink, which reads relations, and
-		 * T_CoerceToDomain, whose CHECK constraints are not part of this tree.
-		 */
 		default:
 			return true;
 	}
 
 	return expression_tree_walker(node, contain_non_leakproof_walker, context);
 }
-
 /*
- * True if the expression is one a non-owner may have evaluated as the owner.
+ * May a caller who is not the matview's owner use this predicate?
  */
+
 static bool
 refresh_where_clause_is_leakproof(Node *qual)
 {
 	return !contain_non_leakproof_walker(qual, NULL);
 }
+/*
+ * Parse-analyse a partial refresh's WHERE clause against the matview, and
+ * reject the expressions that cannot be allowed there.
+ */
 
 static Node *
 transformRefreshWhereClause(Oid relid, Node *whereClause, ParamListInfo params,
@@ -411,24 +362,8 @@ transformRefreshWhereClause(Oid relid, Node *whereClause, ParamListInfo params,
 	result = transformExpr(pstate, whereClause, EXPR_KIND_WHERE);
 	result = coerce_to_boolean(pstate, result, "WHERE");
 
-	/*
-	 * Finish the expression off the way transformStmt() would.  For a long
-	 * time the only thing done with this tree was to deparse it, and a deparse
-	 * does not look at collations, so an unresolved one was invisible: the
-	 * text went back through the parser, which assigned them properly the
-	 * second time round.  Anything that executes the tree directly needs them
-	 * assigned here, or a predicate as ordinary as "tag = 'hot'" fails with
-	 * "could not determine which collation to use".
-	 */
 	assign_expr_collations(pstate, result);
 
-	/*
-	 * The predicate is evaluated with the matview owner's privileges, so a
-	 * caller who merely holds MAINTAIN could otherwise reach objects it has no
-	 * rights on.  A leakproof predicate cannot leak the owner's data nor do
-	 * anything the caller could not, so allow that for anyone who may refresh;
-	 * anything else requires ownership.
-	 */
 	if (!refresh_where_clause_is_leakproof(result) &&
 		!object_ownercheck(RelationRelationId, relid, callerId))
 		ereport(ERROR,
@@ -453,6 +388,9 @@ transformRefreshWhereClause(Oid relid, Node *whereClause, ParamListInfo params,
 
 	return result;
 }
+/*
+ * Render an analysed WHERE clause back to text, for the statements SPI builds.
+ */
 
 static char *
 deparseRefreshWhereClause(Oid relid, Node *whereClause)
@@ -470,33 +408,29 @@ typedef struct RefreshParamizeContext
 	int			nextparam;		/* paramid last handed out */
 	List	   *consts;			/* the Consts replaced, in paramid order */
 } RefreshParamizeContext;
-
 /*
  * May this Const become a Param?
  *
  * The deparsed clause renders a Param as "$n" with no type information, so the
  * type must travel beside it in the argtypes array given to SPI_prepare.  A
- * constant with no type to declare cannot make the trip and stays a literal.
+ * constant with no type to declare cannot make that trip.
  */
+
 static bool
 refresh_const_is_paramizable(Const *con)
 {
-	/*
-	 * UNKNOWNOID is the case this exists for: to SPI_prepare an unspecified
-	 * type means "resolve it from context", and the context would be the
-	 * generated statement rather than the predicate the caller wrote.  Parse
-	 * analysis resolves almost everything, and a missed cache hit is a better
-	 * outcome than a parameter binding to a different type than the literal.
-	 */
 	if (!OidIsValid(con->consttype) || con->consttype == UNKNOWNOID)
 		return false;
 
-	/* A pseudo-type cannot be the declared type of a parameter either. */
+	
 	if (get_typtype(con->consttype) == TYPTYPE_PSEUDO)
 		return false;
 
 	return true;
 }
+/*
+ * Mutator for parameterizeRefreshWhereClause().
+ */
 
 static Node *
 paramize_refresh_consts_mutator(Node *node, void *context)
@@ -527,51 +461,9 @@ paramize_refresh_consts_mutator(Node *node, void *context)
 		return (Node *) param;
 	}
 
-	/*
-	 * expression_tree_mutator() hands back a sub-Query untouched, so the
-	 * subselect of a SubLink keeps its constants and a predicate written as a
-	 * subquery still misses the cache when they vary.  That is a missed
-	 * optimisation and not a wrong answer: only the matview's owner may write
-	 * such a predicate at all (the leakproof check above), and reaching into a
-	 * Query needs query_tree_mutator and a decision about what to do with the
-	 * range table, neither of which this is the place for.
-	 */
 	return expression_tree_mutator(node, paramize_refresh_consts_mutator, context);
 }
 
-/*
- * Turn the predicate's constants into parameters, and extend the caller's
- * ParamListInfo with their values.
- *
- * Plans are cached per predicate, so "WHERE id = 1" and "WHERE id = 2" would
- * otherwise be two statements and a caller refreshing one row at a time would
- * miss the cache on every call.  A caller who binds the value instead hits,
- * since a Param deparses to "$1" whatever it holds; both are ordinary things
- * to write, and the difference is large.
- *
- * So write the second on the first's behalf: replace each Const with a Param of
- * the same type, typmod and collation and hand the value over in `params`.  The
- * predicate then deparses to a shape rather than a value, and everything
- * downstream takes the values through the parameter list the path already
- * carried for a caller who bound them.
- *
- * PARAM_FLAG_CONST is what keeps a custom plan as good as the literal plan it
- * replaces: it is the flag eval_const_expressions() looks for before folding
- * an external parameter back into the constant it came from.  Without it a
- * custom plan would be planned as blind as a generic one, which is the whole
- * cost and none of the benefit.  SPI sets the same flag on the parameters it
- * builds (_SPI_convert_params), so this matches what the path already did for
- * a caller-supplied parameter.
- *
- * Which plan is then used stays plancache's decision, and should not be forced
- * either way: forcing a generic plan measured substantially slower overall, and
- * the cases where a generic plan is wrong -- an array whose selectivity cannot
- * be estimated without seeing it -- are the ones choose_custom_plan() already
- * gets right.
- *
- * Returns the rewritten clause, and replaces *params.  Both are unchanged when
- * there was nothing to do.
- */
 static Node *
 parameterizeRefreshWhereClause(Node *qual, ParamListInfo *params)
 {
@@ -582,15 +474,6 @@ parameterizeRefreshWhereClause(Node *qual, ParamListInfo *params)
 	ListCell   *lc;
 	int			i;
 
-	/*
-	 * A ParamListInfo that supplies its values through hooks may leave the
-	 * array unpopulated, and its hooks would not survive being copied into a
-	 * longer list of a different shape.  Nothing in the tree reaches REFRESH
-	 * that way -- the extended protocol and SPI both hand over a plain, filled
-	 * array -- but a wrong guess about a rare path is how a rare path becomes a
-	 * wrong answer, so decline it and leave the constants alone.  The refresh
-	 * is then exactly as fast as it was before, which is the right way to fail.
-	 */
 	if (base != NULL && (base->paramFetch != NULL || base->paramCompile != NULL))
 		return qual;
 
@@ -599,16 +482,12 @@ parameterizeRefreshWhereClause(Node *qual, ParamListInfo *params)
 
 	newqual = paramize_refresh_consts_mutator(qual, &ctx);
 
-	/* A predicate with no constants -- "WHERE id = $1" already, say. */
+	
 	if (ctx.consts == NIL)
 		return qual;
 
 	newparams = makeParamList(ctx.nextparam);
 
-	/*
-	 * The caller's parameters keep their numbers: the predicate the caller
-	 * wrote may name any of them, and the new ones are appended after.
-	 */
 	i = 0;
 	if (base != NULL)
 	{
@@ -623,6 +502,10 @@ parameterizeRefreshWhereClause(Node *qual, ParamListInfo *params)
 
 		prm->value = con->constvalue;
 		prm->isnull = con->constisnull;
+		/*
+		 * PARAM_FLAG_CONST is what keeps a custom plan as good as the literal plan
+		 * it replaces: eval_const_expressions() folds the value back in.
+		 */
 		prm->pflags = PARAM_FLAG_CONST;
 		prm->ptype = con->consttype;
 	}
@@ -631,10 +514,10 @@ parameterizeRefreshWhereClause(Node *qual, ParamListInfo *params)
 	*params = newparams;
 	return newqual;
 }
-
 /*
- * Helper to execute SPI commands with optional parameters.
+ * Execute a one-off SPI command, binding the caller's parameters if any.
  */
+
 static int
 matview_execute_spi(const char *command, ParamListInfo params, bool read_only)
 {
@@ -673,15 +556,10 @@ matview_execute_spi(const char *command, ParamListInfo params, bool read_only)
 		return SPI_exec(command, 0);
 	}
 }
-
 /*
- * Helper to execute Prepared SPI Plans with optional parameters.
- *
- * Pass InvalidSnapshot to let SPI take its own snapshot, which is what a
- * statement standing on its own wants.  Pass one to run the statement under a
- * snapshot the caller has already used for something else that has to agree
- * with it.
+ * Execute a prepared SPI plan, optionally under a caller-supplied snapshot.
  */
+
 static int
 matview_execute_spi_plan(SPIPlanPtr plan, ParamListInfo params,
 						 Snapshot snapshot, bool read_only)
@@ -1380,10 +1258,10 @@ get_matview_view_query(Oid matviewOid)
 	}
 	return view_sql;
 }
-
 /*
- * Do the cached plans' argument types still match what the caller is passing?
+ * Were these plans prepared for the same parameter types the caller now has?
  */
+
 static bool
 matview_argtypes_match(MatViewPartialRefreshCache *entry, ParamListInfo params)
 {
@@ -1400,25 +1278,6 @@ matview_argtypes_match(MatViewPartialRefreshCache *entry, ParamListInfo params)
 	return true;
 }
 
-/*
- * Relcache invalidation callback.
- *
- * The cached SQL names its relations, and a saved plan is re-analyzed from its
- * raw parse tree when invalidated -- so after a rename the text resolves to
- * whatever now holds that name.  Mark cached plans stale whenever anything they
- * could refer to changes.  relid == InvalidOid means "everything".
- *
- * Marking is all this may do.  Invalidation callbacks run at arbitrary points:
- * inside CommandCounterIncrement(), while acquiring a lock, and during
- * transaction abort -- including from within the very refresh that is executing
- * these plans, because that refresh writes to the matview and takes locks.
- * Freeing a plan there would pull a CachedPlan out from under the executor, and
- * removing the entry would leave refresh_by_direct_modification() holding a
- * pointer to memory dynahash has already put back on its freelist.  Throwing an
- * error is not allowed here either, since abort processing has nowhere to put
- * it.  matview_cache_sweep() does the freeing instead, at a point where nothing
- * can be using the plans.
- */
 static void
 InvalidateMatViewCache(Datum arg, Oid relid)
 {
@@ -1433,14 +1292,6 @@ InvalidateMatViewCache(Datum arg, Oid relid)
 		entry->invalid = true;
 }
 
-/*
- * Free the plans of every entry the callback marked stale, and drop the entries.
- *
- * Called at the start of a partial refresh, before any plan is taken or
- * executed, which is the property that makes the frees safe.  Sweeping every
- * entry rather than just this refresh's own is what reclaims the plans of
- * matviews that have since been dropped.
- */
 static void
 matview_cache_sweep(void)
 {
@@ -1465,7 +1316,7 @@ matview_cache_sweep(void)
 		if (entry->metacxt)
 			MemoryContextDelete(entry->metacxt);
 
-		/* dynahash permits removing the just-returned element mid-scan */
+		
 		if (hash_search(MatViewRefreshCache, &entry->matviewOid,
 						HASH_REMOVE, NULL) == NULL)
 			elog(ERROR, "hash table corrupted");
@@ -1489,31 +1340,12 @@ InitMatViewCache(void)
 
 	CacheRegisterRelcacheCallback(InvalidateMatViewCache, (Datum) 0);
 }
-
 /*
- * matview_build_source_query
- *
- * Build the Query producing the rows the matview should hold inside the scope
- * of the predicate: the view's own query, filtered by the predicate, ordered
- * by the arbiter index's key columns.
- *
- * The predicate filters the OUTPUT of the view query, so the view query goes
- * into a subquery RTE and the predicate becomes the outer WHERE.  Attaching it
- * to dataQuery with AddQual() instead -- which is the obvious thing to reach
- * for, since the rewriter pushes quals into views that way -- would put it in
- * the view's own WHERE clause, evaluated before grouping, windowing and
- * DISTINCT.  That is a different answer for every matview that aggregates, and
- * for one over a window function it is not even a well-formed question.  The
- * text implementation wrapped the view in a subselect for the same reason.
- *
- * The predicate's Vars were resolved against the matview relation, so they
- * carry matview attribute numbers.  A matview's columns are its view query's
- * non-junk target entries in order, and a matview cannot have a dropped column
- * (ALTER MATERIALIZED VIEW ... DROP COLUMN is rejected), so those attribute
- * numbers already address the subquery's output columns.  Only the RTE they
- * point at has to be the right one, which is why the subquery is placed at
- * varno 1 like the matview it replaces.
+ * Build the query that produces a partial refresh's source rows: the matview's
+ * own defining query, wrapped in a subquery so the predicate filters its
+ * output, ordered by the arbiter key.
  */
+
 static Query *
 matview_build_source_query(Relation matviewRel, Query *dataQuery, Node *qual,
 						   int nkeyatts, const int16 *keyattnums)
@@ -1529,26 +1361,19 @@ matview_build_source_query(Relation matviewRel, Query *dataQuery, Node *qual,
 										   copyObject(dataQuery),
 										   makeAlias(RelationGetRelationName(matviewRel),
 													 NIL),
-										   false,	/* not LATERAL */
-										   true);	/* in FROM clause */
+										   false,	
+										   true);	
 	addNSItemToQuery(pstate, nsitem, true, false, true);
 
-	/* The predicate's Vars say varno 1; this has to be what they mean. */
+	
 	Assert(nsitem->p_rtindex == 1);
 
 	sourceQuery->commandType = CMD_SELECT;
 	sourceQuery->canSetTag = true;
 
-	/* SELECT *, which for this RTE is exactly the matview's columns. */
+	
 	sourceQuery->targetList = expandNSItemAttrs(pstate, nsitem, 0, false, -1);
 
-	/*
-	 * Order by the arbiter key.  Two overlapping refreshes have to insert the
-	 * rows they both produce in the same order or they deadlock on each
-	 * other's speculative insertions (A5/P3); the rows leave here in that
-	 * order and stay in it, because what reads them back is a plain scan of
-	 * the tuplestore they were written to.
-	 */
 	for (i = 0; i < nkeyatts; i++)
 	{
 		int			attnum = keyattnums[i];
@@ -1556,7 +1381,7 @@ matview_build_source_query(Relation matviewRel, Query *dataQuery, Node *qual,
 										 attnum - 1);
 		SortBy	   *sortby = makeNode(SortBy);
 
-		/* is_usable_unique_index() rejects expression and system columns */
+		
 		Assert(attnum > 0 && tle->resno == attnum);
 
 		sortby->node = (Node *) tle->expr;
@@ -1574,13 +1399,6 @@ matview_build_source_query(Relation matviewRel, Query *dataQuery, Node *qual,
 	sourceQuery->jointree = makeFromExpr(pstate->p_joinlist, sourceQual);
 	sourceQuery->sortClause = sortlist;
 
-	/*
-	 * The predicate was analysed against a different ParseState, so this one
-	 * has not seen whatever is in it.  Aggregates and window functions are
-	 * rejected outright by transformRefreshWhereClause() and by
-	 * EXPR_KIND_WHERE respectively, but a sub-SELECT is allowed and the
-	 * rewriter must be told it is there.
-	 */
 	sourceQuery->hasSubLinks = checkExprHasSubLink(sourceQual);
 
 	free_parsestate(pstate);
@@ -1598,25 +1416,10 @@ matview_build_source_query(Relation matviewRel, Query *dataQuery, Node *qual,
  * refresh_matview_datafill(); the difference is only where the rows go.
  */
 /*
- * matview_build_source_plansource
- *
- * Wrap the source query in a CachedPlanSource, rewritten and completed but not
- * yet planned and not yet saved.  The caller owns it.
- *
- * CreateCachedPlanForQuery() is the entry point for a query that has already
- * been through parse analysis -- "used only for new-style SQL functions, where
- * we have a Query from the function's prosqlbody, but no source text".  That is
- * this case exactly, and functions.c is the pattern followed here.  Going
- * through plancache rather than stashing a PlannedStmt is what makes the plan
- * self-validating: plancache already registers eight callbacks, one relcache
- * and seven syscache, and decides staleness itself.
- *
- * It copies the tree into its own context first, so what it holds is the
- * *unrewritten* query -- which is what plancache wants, because on revalidation
- * it re-acquires the rewrite locks and re-rewrites from that copy itself.  So
- * the rewrite below must come after this call, and scribbles only on the
- * caller's tree, which is rebuilt on every cache miss anyway.
+ * Wrap the source query in a CachedPlanSource, so that plancache revalidates
+ * it and it survives across refreshes.
  */
+
 static CachedPlanSource *
 matview_build_source_plansource(Query *sourceQuery)
 {
@@ -1629,27 +1432,15 @@ matview_build_source_plansource(Query *sourceQuery)
 
 	AcquireRewriteLocks(sourceQuery, true, false);
 
-	/*
-	 * pg_rewrite_query() rather than QueryRewrite(): the same rewrite with the
-	 * standard debug/stats wrapper around it, which is what plancache's own
-	 * revalidation path calls.  Named because it is not quite a no-op -- it
-	 * adds log_parser_stats reporting and the DEBUG dump of the result.
-	 */
 	querytree_list = pg_rewrite_query(sourceQuery);
 
-	/* A SELECT should never rewrite to more or less than one SELECT. */
+	
 	if (list_length(querytree_list) != 1)
 		elog(ERROR, "unexpected rewrite result for REFRESH MATERIALIZED VIEW");
 
-	/*
-	 * CURSOR_OPT_PARALLEL_OK has to reach the planner through here now, since
-	 * this is what CompleteCachedPlan hands to pg_plan_queries.  Dropping it
-	 * would silently disable parallel source evaluation: invisible at scope 1,
-	 * material where the source scan is large.
-	 */
 	CompleteCachedPlan(plansource,
 					   querytree_list,
-					   NULL,	/* copy into the plansource's own context */
+					   NULL,	
 					   NULL,
 					   0,
 					   NULL,
@@ -1659,6 +1450,10 @@ matview_build_source_plansource(Query *sourceQuery)
 
 	return plansource;
 }
+/*
+ * Run the source query into the tuplestore the fused statement reads, and
+ * return how many rows it produced.
+ */
 
 static double
 matview_materialize_source(CachedPlanSource *plansource, ParamListInfo params,
@@ -1675,14 +1470,6 @@ matview_materialize_source(CachedPlanSource *plansource, ParamListInfo params,
 
 	CHECK_FOR_INTERRUPTS();
 
-	/*
-	 * A saved plansource can and should be handed a ResourceOwner: it is what
-	 * releases the plan's refcount if the executor throws between here and the
-	 * ReleaseCachedPlan below.  An unsaved one cannot -- GetCachedPlan()
-	 * rejects it outright -- so a nested refresh, whose plansource is private
-	 * and dropped when it returns, passes NULL and accepts that its refcount
-	 * dies with the plansource.
-	 */
 	owner = plansource->is_saved ? CurrentResourceOwner : NULL;
 
 	generic_before = plansource->gplan;
@@ -1690,20 +1477,6 @@ matview_materialize_source(CachedPlanSource *plansource, ParamListInfo params,
 
 	cplan = GetCachedPlan(plansource, params, owner, NULL);
 
-	/*
-	 * Did plancache have to *build* a plan, or hand back one it already had?
-	 *
-	 * Not num_generic_plans, which is the obvious choice and is wrong: it is
-	 * incremented in the `else` arm of GetCachedPlan's custom-or-not branch, so
-	 * it counts every call that *returns* a generic plan, reused or freshly
-	 * built.  A probe reading it can never see a hit -- the mirror image of a
-	 * test that cannot fail.
-	 *
-	 * A new generic plan replaces plansource->gplan, so the pointer moving is
-	 * the build.  num_custom_plans is a genuine build counter -- a custom plan
-	 * is built every time by definition -- and covers the bound-parameter cell,
-	 * where the first five plans are custom.
-	 */
 	if (plansource->gplan != generic_before ||
 		plansource->num_custom_plans > custom_before)
 		INJECTION_POINT("matview-where-source-planned", NULL);
@@ -1740,6 +1513,9 @@ typedef struct RefreshKeyOnlyContext
 	int			nkeyatts;
 	const int16 *keyattnums;
 } RefreshKeyOnlyContext;
+/*
+ * Walker for refresh_qual_is_key_only().
+ */
 
 static bool
 refresh_qual_key_only_walker(Node *node, void *context)
@@ -1754,11 +1530,6 @@ refresh_qual_key_only_walker(Node *node, void *context)
 		Var		   *var = (Var *) node;
 		int			i;
 
-		/*
-		 * The predicate was analysed against the matview alone, so every Var in
-		 * it is varno 1 at level 0.  Anything else means this walker is looking
-		 * at a tree it does not understand, and the answer has to be no.
-		 */
 		if (var->varlevelsup != 0 || var->varno != 1 || var->varattno <= 0)
 			return true;
 
@@ -1768,46 +1539,19 @@ refresh_qual_key_only_walker(Node *node, void *context)
 				return false;
 		}
 
-		/* A column of the matview that is not part of the arbiter key. */
+		
 		return true;
 	}
 
-	/*
-	 * A sub-SELECT reads relations this walker has not looked at, and one
-	 * correlated on a non-key column would decide the qual from something other
-	 * than the key while showing no Var of its own at this level.  Decline.
-	 */
 	if (IsA(node, SubLink) || IsA(node, SubPlan) || IsA(node, AlternativeSubPlan))
 		return true;
 
 	return expression_tree_walker(node, refresh_qual_key_only_walker, context);
 }
-
 /*
- * refresh_qual_is_key_only
- *
- * True when the predicate reads nothing but the arbiter index's key columns.
- *
- * This is the gate on the prune elision in refresh_by_direct_modification(),
- * and it is the whole of what makes that elision sound.  Without it the
- * accounting the elision rests on -- every source row is either an existing
- * matview row the pre-lock counted or one the upsert has just inserted -- has a
- * hole: a matview row can carry the same key as a source row and not satisfy
- * the predicate, in which case the upsert matches it (ON CONFLICT arbitrates on
- * the key, not on the predicate) while the pre-lock never saw it.  The source
- * row is then neither locked nor inserted, and a genuinely orphaned row
- * elsewhere in the scope cancels the discrepancy exactly.  The result is a
- * matview holding a row its own definition does not produce, reported as a
- * successful refresh.
- *
- * When the qual reads only key columns that cannot happen: two rows with the
- * same key agree on the qual, so a matview row the upsert can conflict with is
- * necessarily a matview row the pre-lock locked.
- *
- * Volatile functions are rejected far upstream (transformRefreshWhereClause),
- * which matters here for the same reason: they would let two rows with the same
- * key disagree.
+ * Does this predicate read only the arbiter index's key columns?
  */
+
 static bool
 refresh_qual_is_key_only(Node *qual, int nkeyatts, const int16 *keyattnums)
 {
@@ -1818,56 +1562,34 @@ refresh_qual_is_key_only(Node *qual, int nkeyatts, const int16 *keyattnums)
 
 	return !refresh_qual_key_only_walker(qual, &ctx);
 }
-
 /*
- * matview_prune_guard_params
+ * Extend the caller's parameter list with the three values that decide whether
+ * the fused statement's prune runs.
  *
- * The predicate's parameters, followed by the three the fused statement's
- * prune guard reads.  Returned as a fresh list rather than by extending the
- * caller's: `params` is also what the pre-lock and the source query are
- * executed with, and neither of those declares these three.
+ * The prune can be skipped when every row the source produced is accounted for
+ * by a matview row that already existed or one the upsert just inserted, since
+ * nothing in scope is then orphaned.  Two conditions make that sound, and
+ * getting either wrong is a silently missing DELETE rather than a slow refresh:
  *
- * The guard is two sound rules, and the SQL expresses both as one expression
- * so that which one fires is decided by the values:
+ * The predicate must read only the arbiter key columns.  Otherwise a matview
+ * row can carry a source row's key and still fail the predicate, so the upsert
+ * matches a row the pre-lock never counted -- and a genuinely orphaned row
+ * elsewhere in the scope cancels the discrepancy exactly.
  *
- *   n_locked == 0            the matview holds nothing in scope, so the prune's
- *                            DELETE has nothing to match -- the upsert's own
- *                            inserts are not visible to it.  Passed as the
- *                            boolean.
+ * The matview must be held at ExclusiveLock.  n_locked is measured by the
+ * pre-lock under an earlier snapshot than the DELETE it stands in for, and
+ * while the lock stops the rows it matched from changing, it does not stop new
+ * ones appearing: a concurrent refresh over a key the matview does not hold yet
+ * locks nothing, so it does not queue behind us and can commit a row into our
+ * scope that neither count has seen.  At ExclusiveLock no other session can
+ * write the matview at all.
  *
- *   n_locked + n_inserted    every source row is accounted for by a matview row
- *     == n_source            that was already in scope or by one just inserted,
- *                            so nothing in scope is orphaned.  Sound only when
- *                            the predicate reads key columns alone; when it
- *                            does not, -1 goes in as n_source, which no
- *                            non-negative left-hand side can equal.
- *
- * The second rule is unsound without that gate, and silently so: see
- * refresh_qual_is_key_only().
- *
- * BOTH rules additionally need `serialized`, and that one is not about the
- * predicate at all.  n_locked is measured by the pre-lock, under an earlier
- * snapshot than the DELETE it stands in for -- the snapshot has to be taken
- * after the lock, or a refresh that queued behind another would evaluate its
- * source from before that one committed and write the stale values back over
- * it.  The lock stops the rows it matched from changing; it does not stop new
- * ones appearing.
- * A refresh over a key the matview does not hold yet locks nothing, so it does
- * not queue behind us and can commit a row into our scope inside that window --
- * a row neither count has seen, and the accounting then balances while that row
- * is orphaned.  Demonstrated, not argued: matview-where-prune-elide.spec leaves
- * a stale row without this condition and is green with it.
- *
- * ExclusiveLock is what closes it, because it is the level at which no other
- * session can write this matview at all: it conflicts with the
- * RowExclusiveLock a CONCURRENTLY partial refresh takes and with another bare
- * refresh's ExclusiveLock, while still admitting readers.  So the saving is
- * available exactly where the lock makes it safe -- which is the
- * argument for choosing that level deliberately, cashed in a second time.
- * Asked of the lock manager rather than derived from the statement's spelling:
- * the precondition is "nobody else can write this", and that is a fact about
- * the lock actually held.
+ * The decision therefore rides in these values rather than in the generated
+ * SQL, so the statement keeps one plan under one cache key however it is
+ * called.  Passing -1 for n_source disables the comparison, since the left-hand
+ * side of it is never negative.
  */
+
 static ParamListInfo
 matview_prune_guard_params(ParamListInfo params, bool serialized,
 						   bool qual_key_only, int64 n_locked, int64 n_source)
@@ -1901,58 +1623,6 @@ matview_prune_guard_params(ParamListInfo params, bool serialized,
 	return guarded;
 }
 
-/*
- * refresh_by_direct_modification
- *
- * This modifies the materialized view in-place without creating a temporary
- * heap or swapping relfilenumbers.  It requires a usable unique index on the
- * matview for conflict resolution.
- *
- * Concurrency is handled in two steps, each executed as a separate SPI
- * statement:
- *
- * 1. Lock existing rows matching the WHERE clause via SELECT ... FOR NO KEY
- * UPDATE.
- *    This serializes concurrent partial refreshes that touch overlapping
- *    rows while allowing non-overlapping refreshes to proceed in parallel.
- *
- * 2. Execute a single CTE that evaluates the underlying query, upserts
- *    the results into the matview, and deletes rows that no longer match
- *    the predicate (via anti-join against the fresh query output).
- *
- * Step 2's source rows are the view evaluated from its Query tree into a
- * tuplestore, registered as an ephemeral named relation and read by the fused
- * statement.  The view's SQL text does not appear in the generated statement at
- * all, and with it goes every hazard that came from re-parsing deparsed SQL in
- * a different naming environment than the one it was written in.  An earlier
- * revision could instead inline the view as a MATERIALIZED CTE, selected by a
- * GUC so the two could be compared at run time; that path is gone.
- *
- * The prune carries a guard, so that the scan and the anti-join behind it are
- * skipped when they provably cannot delete anything -- the DELETE gets a
- * One-Time Filter and never reads the scope at all.  Two counts decide it, both
- * of them facts about this refresh rather than promises about the matview: how
- * many rows the pre-lock matched, and how many rows the source produced.  The
- * decision has to be made inside the statement, because how many rows the
- * upsert inserted is not known until it has run and the upsert and the prune
- * are one statement; a sub-select over the upsert CTE both supplies the count
- * and, by depending on it, orders the two.  See matview_prune_guard_params()
- * for the rules and refresh_qual_is_key_only() for what makes the second sound.
- *
- * Both halves of the fused statement then read one physically materialised
- * tuplestore rather than one materialised CTE, so they still cannot disagree
- * about which rows the view produces (A3).  The whole of step 2, evaluation
- * and DML alike, runs under one snapshot -- taken here rather than by SPI --
- * because otherwise the view would be evaluated at one point in time and the
- * rows it is compared against read at a later one, and a key inserted in
- * between by an overlapping refresh would be pruned as though the view had
- * stopped producing it.
- *
- * To avoid rebuilding the SQL and re-preparing the SPI plans on every call,
- * we cache both plans in a session-level hash table keyed by matview OID.
- *
- * Returns the number of rows processed by the refresh CTE.
- */
 static uint64
 refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 							   int save_sec_context, Query *dataQuery,
@@ -1980,24 +1650,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 
 	matviewRel = table_open(matviewOid, NoLock);
 
-	/*
-	 * Can any other session write this matview while we refresh it?  Only the
-	 * prune guard cares, and it cares a great deal -- see
-	 * matview_prune_guard_params().  Asked of the lock manager rather than
-	 * derived from whether CONCURRENTLY was written, because what the guard
-	 * needs is the fact rather than the spelling that chose it.
-	 */
 	serialized = CheckRelationLockedByMe(matviewRel, ExclusiveLock, true);
 
-	/*
-	 * Find the usable unique index.  There is at most one, so there is nothing
-	 * to choose between: this function is reached only when the caller has
-	 * established that the matview has no more than one index satisfying
-	 * indisunique && indisvalid && indimmediate, and is_usable_unique_index()
-	 * demands all three of those plus non-partial, indnatts > 0 and no
-	 * expression or system columns.  Anything usable is therefore also
-	 * counted, and at most one thing was counted.
-	 */
 	indexoidlist = RelationGetIndexList(matviewRel);
 	foreach(lc, indexoidlist)
 	{
@@ -2025,33 +1679,11 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 				 errdetail("Partial refresh requires a usable unique index to perform an UPSERT operation.")));
 
 	/*
-	 * Look up or create a plan cache entry for this matview -- but only the
-	 * outermost partial refresh uses the session cache at all.
-	 *
-	 * A nested one is reachable: the predicate and the view definition are both
-	 * evaluated inside the maintenance window, so a function in either can
-	 * issue REFRESH MATERIALIZED VIEW ... WHERE.  If such a call reached the
-	 * code below, matview_cache_sweep() would free and remove the entry the
-	 * enclosing refresh is still executing from.  The sweep's frees were
-	 * deferred to here on the belief that "nothing removes entries until the
-	 * next refresh" -- but a nested refresh IS the next refresh, and it sweeps
-	 * every entry the callback marked, which is all of them.  Neither the
-	 * CachedPlan refcount nor anything else protects against that:
-	 * SPI_freeplan() deletes the _SPI_plan's own context, which holds the
-	 * plancache_list that _SPI_execute_plan is iterating.  Reproduced on an
-	 * assertions build as a refresh executing a different matview's plan, as a
-	 * freed query_string printed by the error context, and as a SIGSEGV.
-	 *
-	 * The nested refresh must be of a different matview: CheckTableNotInUse()
-	 * rejects one of the same matview well before this point, which is also why
-	 * the mismatch branch below cannot reach an enclosing refresh's entry -- it
-	 * only ever frees plans under the OID its own caller passed.
-	 *
-	 * So a nested refresh prepares private plans and touches neither the hash
-	 * table nor the entries in it.  They are not SPI_keepplan'd, so SPI_finish()
-	 * below reclaims them; nesting is rare enough that losing the cache there
-	 * costs nothing, and the alternative -- sharing an entry with a caller that
-	 * is mid-execution -- is what this is fixing.
+	 * Only the outermost refresh uses the session cache.  A predicate function
+	 * or the view definition may issue another partial refresh, and that nested
+	 * call would sweep the entry this one is still executing from.  Nested
+	 * refreshes therefore prepare private plans and touch neither the hash table
+	 * nor its entries.
 	 */
 	use_cache = (matview_maintenance_depth == 0);
 
@@ -2060,26 +1692,11 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		if (!MatViewRefreshCache)
 			InitMatViewCache();
 
-		/*
-		 * Discard anything the relcache callback marked stale.  Do this before
-		 * taking our own entry: the sweep removes entries, so a pointer taken
-		 * first would not survive it.  Afterwards nothing removes entries --
-		 * the callback only marks, and a nested refresh no longer sweeps -- so
-		 * cacheEntry stays valid for the whole maintenance window even though
-		 * invalidations keep arriving during it.
-		 */
 		matview_cache_sweep();
 
 		cacheEntry = (MatViewPartialRefreshCache *)
 			hash_search(MatViewRefreshCache, &matviewOid, HASH_ENTER, &found);
 
-		/*
-		 * HASH_ENTER fills in the key and leaves the rest of the element
-		 * holding whatever dynahash last had there.  The mismatch branch below
-		 * initialises every other field, but it does so after testing metacxt,
-		 * so that one has to be cleared here or a new entry would reset a
-		 * garbage context.
-		 */
 		if (!found)
 			cacheEntry->metacxt = NULL;
 	}
@@ -2091,44 +1708,25 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		found = false;
 	}
 
-	/*
-	 * We have a cache hit ONLY if the entry exists, the unique index matches,
-	 * and the predicate is the same predicate.  Same predicate means an equal()
-	 * tree: the plans were built by deparsing this tree, so two trees that
-	 * compare equal deparse to the same statement, and a difference anywhere in
-	 * the tree is a difference in the rows selected.  The entry's qual is also
-	 * checked non-NULL, which is not redundant -- equal() would answer this
-	 * correctly, but an entry whose plan build threw partway is worth refusing
-	 * explicitly rather than by implication.
-	 *
-	 * The tree is compared rather than its deparsed text because the text was
-	 * this comparison's only reader, and producing it costs 4.5-5.3 us on every
-	 * refresh including one that goes on to hit.  It is also
-	 * the stronger key: pg_get_expr renders a Param as "$n" with no type, which
-	 * is B3, while the tree carries paramtype and paramtypmod on the node.
-	 * argtypes stays anyway -- it covers a parameter the predicate never names,
-	 * which cannot appear in the tree and which the generated statement still
-	 * has to declare.
-	 *
-	 * The plans are also specific to which implementation built them, and that
-	 * can change between two refreshes of the same matview in one session
-	 * while the two are being compared against each other.
-	 */
 	if (found &&
 		cacheEntry->uniqueIndexOid == uniqueIndexOid &&
 		cacheEntry->optimized == use_optimized &&
+		/*
+		 * Same predicate means an equal() tree: the plans were built by deparsing
+		 * this tree, so two trees that compare equal deparse to the same statement.
+		 * argtypes is still checked, since a caller may bind a parameter the
+		 * predicate never names.
+		 */
 		cacheEntry->qual != NULL &&
 		equal(cacheEntry->qual, qual) &&
 		cacheEntry->nargs == (params ? params->numParams : 0) &&
 		matview_argtypes_match(cacheEntry, params))
 	{
-		/* Cache is valid.  Do nothing. */
 	}
 	else
 	{
 		if (found)
 		{
-			/* Index or WHERE clause changed; discard stale plans. */
 			if (cacheEntry->lockPlan)
 				SPI_freeplan(cacheEntry->lockPlan);
 			if (cacheEntry->refreshPlan)
@@ -2157,13 +1755,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	{
 	SPI_connect();
 
-	/*
-	 * Register the relation the fused statement will read its source rows
-	 * from.  It has to exist before the statement is parsed, and the rows have
-	 * to be collected after the locking step rather than before it, so the
-	 * tuplestore is registered empty here and filled further down.  Nothing
-	 * reads it in between.
-	 */
 	{
 		Relation	indexRel = index_open(uniqueIndexOid, AccessShareLock);
 		Form_pg_index indexStruct = indexRel->rd_index;
@@ -2176,14 +1767,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 			keyattnums[i] = indexStruct->indkey.values[i];
 		index_close(indexRel, AccessShareLock);
 
-		/*
-		 * Whether the prune may be elided on a row count alone.  A property of
-		 * the request's shape rather than of the data, so it could be computed
-		 * once on a cache miss and stored -- but it is a walk of a predicate
-		 * that has just been parsed, and it does NOT change the generated SQL
-		 * (the gate rides in the parameter values, see below), so it stays out
-		 * of the cache entry and out of the cache key.
-		 */
 		qual_key_only = refresh_qual_is_key_only(qual, nkeyatts, keyattnums);
 
 		sourceStore = tuplestore_begin_heap(false, false, work_mem);
@@ -2195,34 +1778,14 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		enr->md.enrtype = ENR_NAMED_TUPLESTORE;
 
 		/*
-		 * A row estimate for new_data, which at this moment is empty: the
-		 * tuplestore is not filled until after the pre-lock, further down.
-		 *
-		 * The true count cannot be supplied here and this is not an oversight
-		 * that a later assignment could correct.  addRangeTableEntryForENR()
-		 * copies this value into the range table entry during PARSE ANALYSIS,
-		 * so it is captured by SPI_prepare() below and then travels inside the
-		 * cached plan; updating the ENR afterwards changes nothing the planner
-		 * reads.  And the plan is reused across refreshes whose scopes differ by
-		 * orders of magnitude, so no single true count would be true twice.
-		 * costsize.c asks for exactly this case by name: "in others the same
-		 * plan will be re-used, so a 'typical' value might be estimated and
-		 * used."
-		 *
-		 * So the question is which wrong value is least wrong, and the matview's
-		 * own row count answers it two ways.  It is the right order of magnitude
-		 * -- the source is the view's output for the scope, and the matview is
-		 * the view's output for everything -- and it errs high, which is the
-		 * safe direction: an overestimate biases the prune's anti-join towards a
-		 * hash join, which is what a large scope wants, while an underestimate
-		 * invites a nested loop over rows that turn out to be plentiful.
-		 *
-		 * Measured rather than argued, in the cells where the anti-join actually
-		 * runs.  Against this: enrtuples = 1 costs 23.878 -> 25.898 ms at scope
-		 * 10000 and 2.910 -> 3.355 on a non-key predicate.  And a *perfect*
-		 * estimate is no better -- supplying the exact scope reads 24.849 at
-		 * scope 10000 against this line's 23.610, and 2.954 at scope 1000
-		 * against 2.770.  Nothing tested beats it, including the truth.
+		 * A row estimate for new_data, which is empty at this point: the
+		 * tuplestore is filled after the pre-lock, below.  The true count cannot
+		 * be supplied and this cannot be corrected later -- parse analysis copies
+		 * the value into the range table entry, so SPI_prepare captures it and it
+		 * travels inside the cached plan, which then serves refreshes whose scopes
+		 * differ by orders of magnitude.  The matview's own row count is the right
+		 * order of magnitude and errs high, which is the safe direction: an
+		 * overestimate biases the prune's anti-join towards a hash join.
 		 */
 		enr->md.enrtuples = Max(matviewRel->rd_rel->reltuples, 0);
 		enr->reldata = sourceStore;
@@ -2261,11 +1824,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 												  RelationGetRelationName(matviewRel));
 		matview_alias = quote_identifier(RelationGetRelationName(matviewRel));
 
-		/*
-		 * The one place the predicate still has to be text: SPI takes a string.
-		 * Inside the miss branch rather than above it, because a hit has no use
-		 * for it -- the cache is keyed on the tree this was deparsed from.
-		 */
 		whereClauseStr = deparseRefreshWhereClause(matviewOid, qual);
 
 		if (params && params->numParams > 0)
@@ -2276,35 +1834,22 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 				argtypes[i] = params->params[i].ptype;
 		}
 
-		/*
-		 * The fused statement takes three parameters of its own after the
-		 * predicate's, carrying the prune guard.  They are always declared and
-		 * the guard is always in the SQL: what decides whether the prune runs
-		 * is the values, not the text, so the statement stays one statement
-		 * with one plan under one cache key.  (B31: anything that changes the
-		 * generated SQL has to be part of the key.  This does not.)
-		 */
 		dml_nargs = nargs + MATVIEW_PRUNE_GUARD_NARGS;
 		dml_argtypes = (Oid *) palloc(dml_nargs * sizeof(Oid));
 		for (i = 0; i < nargs; i++)
 			dml_argtypes[i] = argtypes[i];
-		dml_argtypes[nargs + 0] = BOOLOID;	/* skip the prune outright */
-		dml_argtypes[nargs + 1] = INT8OID;	/* rows the pre-lock matched */
-		dml_argtypes[nargs + 2] = INT8OID;	/* rows the source produced, or -1 */
+		dml_argtypes[nargs + 0] = BOOLOID;	
+		dml_argtypes[nargs + 1] = INT8OID;	
+		dml_argtypes[nargs + 2] = INT8OID;	
 
 		indexRel = index_open(uniqueIndexOid, AccessShareLock);
 		indexStruct = indexRel->rd_index;
 
 		/*
-		 * The anti-join decides which matview rows are still produced by the
-		 * query, and ON CONFLICT decides which ones the upsert can match.  The
-		 * two must agree about NULLs, or a row can be "still present" to one
-		 * and "brand new" to the other, which duplicates it.  Follow whatever
-		 * the arbiter index does.
-		 *
-		 * Preferring plain equality where we can also matters for speed: it is
-		 * hashable and mergeable, where IS NOT DISTINCT FROM is neither and
-		 * forces a nested loop over the whole candidate set.
+		 * The anti-join decides which matview rows the query still produces and
+		 * ON CONFLICT decides which ones the upsert can match; the two must agree
+		 * about NULLs, or a row is "still present" to one and "brand new" to the
+		 * other, which duplicates it.  Follow the arbiter index.
 		 */
 		anti_join_op = indexStruct->indnullsnotdistinct ?
 			"IS NOT DISTINCT FROM" : "=";
@@ -2315,7 +1860,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		initStringInfo(&set_clause);
 		initStringInfo(&join_clause);
 
-		/* Build the ON CONFLICT column list and anti-join condition. */
+		
 		first = true;
 		for (i = 0; i < indexStruct->indnkeyatts; i++)
 		{
@@ -2337,7 +1882,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 							 quoted, anti_join_op, quoted);
 		}
 
-		/* Build the DO UPDATE SET clause for non-key columns. */
+		
 		first = true;
 		for (i = 0; i < tupdesc->natts; i++)
 		{
@@ -2369,17 +1914,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 			quoted = quote_identifier(NameStr(attr->attname));
 			appendStringInfo(&set_clause, "%s = EXCLUDED.%s", quoted, quoted);
 
-			/*
-			 * The same columns again, as a row comparison, so the upsert can
-			 * skip a row whose values did not change.  ON CONFLICT DO UPDATE
-			 * writes a new row version whether or not anything differs, and
-			 * a partial refresh re-reads scopes that are mostly unchanged --
-			 * a drain re-refreshing a key it already caught up on writes the
-			 * whole scope again for nothing.
-			 *
-			 * Non-key columns only: the key columns are what the row was
-			 * matched on, so they are equal by construction.
-			 */
 			if (!first_distinct)
 			{
 				appendStringInfoString(&mv_cols, ", ");
@@ -2392,78 +1926,17 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 
 		index_close(indexRel, AccessShareLock);
 
-		/*
-		 * Preconditions for the guarantees this function has to deliver.
-		 *
-		 * Two overlapping refreshes must take the rows they share in the same
-		 * order, both for rows the matview already holds and for rows they
-		 * each insert; otherwise they deadlock.  That was reported on -hackers
-		 * (A5) and both halves are gated by isolation specs -- see
-		 * matview-where-lockorder and matview-where-insertorder.
-		 *
-		 * Whatever produces the ordering, it needs an order to produce.  Both
-		 * take it from the arbiter index's key columns, so an empty
-		 * conflict_cols means no deterministic order exists to impose, and the
-		 * ON CONFLICT target is empty as well.  Assert the precondition rather
-		 * than the SQL: a check that the generated text contains "ORDER BY"
-		 * would pin one way of ordering and go red against any other, which is
-		 * the defect that made the pg_stat_statements block unkeepable.
-		 *
-		 * The anti-join condition is the prune's half of the same contract --
-		 * it decides which rows the view no longer produces, and an empty one
-		 * would delete the whole scope.
-		 *
-		 * Note what is deliberately NOT asserted here: that the upsert and the
-		 * prune see a single evaluation of the view query (A3).  That is a
-		 * property of how the statement executes, not of anything visible at
-		 * build time, and a correct implementation has no window in which the
-		 * difference can be observed.  Its gates are the differential oracle
-		 * and by concurrent testing.
-		 */
 		Assert(conflict_cols.len > 0);
 		Assert(join_clause.len > 0);
 
-		/*
-		 * Prepare the row-locking statement.  This acquires row locks on the
-		 * matview rows matching the WHERE clause to serialize concurrent
-		 * partial refreshes on overlapping rows.
-		 *
-		 * FOR NO KEY UPDATE rather than FOR UPDATE.  The two are equally good
-		 * at the job this statement exists for -- FOR NO KEY UPDATE conflicts
-		 * with itself, so two refreshes over overlapping scopes still order
-		 * against each other, which is the property that stops the second one
-		 * evaluating its source from a snapshot taken before the first commits
-		 * and then writing a stale value over it.  What FOR UPDATE adds is a
-		 * conflict with FOR KEY SHARE, and it takes the key-exclusive tuple
-		 * lock rather than the weaker one the following update actually needs:
-		 * the upsert's DO UPDATE sets non-key columns only, because the key
-		 * columns are what it matched on, so it is by construction a no-key
-		 * update.  Taking the stronger lock first only escalates what has to be
-		 * recorded in xmax.
-		 *
-		 * The prune may still DELETE a row this locked, which needs the
-		 * stronger lock.  That upgrade cannot block or deadlock: this
-		 * transaction already holds a conflicting lock on the row, so no other
-		 * transaction can be holding one to wait for.
-		 *
-		 * Lock in a fixed order so that two refreshes whose predicates overlap
-		 * cannot take the same rows in opposite orders and deadlock.  When the
-		 * predicate is on the key columns the index already returns rows in
-		 * this order, so the ORDER BY adds no sort.
-		 *
-		 * It is emitted unconditionally, and the bare form's ExclusiveLock is
-		 * NOT an excuse to drop it even though nothing else can write the
-		 * matview at that level.  That was implemented and measured and it does
-		 * not pay: the clause is nearly free where the arbiter index already
-		 * yields key order, and where it is not -- a matview whose physical
-		 * order has drifted from its key, which is what repeated refreshing
-		 * produces -- removing it makes the statement cheap enough that
-		 * plancache stops settling on a generic plan and re-plans it on every
-		 * call.  On a range predicate that cost 613 us against the 137 us the
-		 * ordering itself was worth.  See the note on plan caching for the
-		 * plancache behaviour it runs into.
-		 */
 		initStringInfo(&buf);
+		/*
+		 * A fixed lock order, so two refreshes whose predicates overlap cannot
+		 * take the same rows in opposite orders and deadlock.  Emitted
+		 * unconditionally: dropping it for the serialized form was tried and
+		 * reverted, because the cheaper statement stops the plan cache settling
+		 * and is re-planned on every call, which costs more than the clause did.
+		 */
 		appendStringInfo(&buf,
 						 "SELECT 1 FROM %s mv WHERE (%s) ORDER BY %s "
 						 "FOR NO KEY UPDATE",
@@ -2477,13 +1950,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 
 		resetStringInfo(&buf);
 
-		/*
-		 * The source rows are the registered tuplestore, materialised before
-		 * this statement started, which the upsert and the prune each read and
-		 * both see identically.  An earlier revision could instead inline the
-		 * view as a MATERIALIZED CTE; that path is gone, and with it the only
-		 * caller that needed the view deparsed to text.
-		 */
 		appendStringInfoString(&buf, "WITH ");
 
 		appendStringInfo(&buf,
@@ -2503,20 +1969,11 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 			appendStringInfoString(&buf, "NOTHING ");
 
 		/*
-		 * RETURNING says whether each row the upsert touched was an insert,
-		 * which is what the prune guard counts.  OLD is the row ON CONFLICT
-		 * matched and is entirely NULL when there was none, so OLD.ctid is NULL
-		 * exactly for an inserted row -- and a matview cannot have a column
-		 * called ctid ("column name \"ctid\" conflicts with a system column
-		 * name"), so the reference is unambiguous.  A key column would not do:
-		 * under a NULLS NOT DISTINCT arbiter an existing row with a NULL key
-		 * can be updated, and OLD.key IS NULL would call that an insert.
-		 *
-		 * This is also why the count is of inserts rather than of updates.  The
-		 * row comparison (use_optimized) suppresses the write for a row nothing
-		 * changed about, and a suppressed row returns nothing at all -- so the
-		 * updates are not all visible here, while the inserts are: an insert is
-		 * never filtered by a DO UPDATE ... WHERE.
+		 * RETURNING says whether each row the upsert touched was an insert, which
+		 * is what the prune guard counts.  OLD is entirely NULL when ON CONFLICT
+		 * matched nothing, so OLD.ctid IS NULL identifies an insert; a key column
+		 * would not do, because under a NULLS NOT DISTINCT arbiter an existing row
+		 * with a NULL key can be updated.
 		 */
 		appendStringInfo(&buf,
 						 "  RETURNING (OLD.ctid IS NULL) AS ins "
@@ -2539,21 +1996,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		if (use_cache)
 			SPI_keepplan(cacheEntry->refreshPlan);
 
-		/*
-		 * Save cache metadata in a long-lived context.  Only for a real entry:
-		 * the metadata exists to be compared on a LATER call, and a nested
-		 * refresh's entry is gone when this one returns, so writing it into
-		 * CacheMemoryContext would be a leak with no reader.
-		 */
 		if (use_cache)
 		{
-			/*
-			 * The qual is a node tree, and a node tree cannot be pfree'd: it is
-			 * many allocations reachable only from each other.  So the entry's
-			 * metadata gets a context of its own, reset when the key changes and
-			 * deleted when the entry goes.  argtypes rides along in it so that
-			 * one reset covers both and neither can outlive the other.
-			 */
 			if (cacheEntry->metacxt == NULL)
 				cacheEntry->metacxt =
 					AllocSetContextCreate(CacheMemoryContext,
@@ -2587,69 +2031,29 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		pfree(dml_argtypes);
 	}
 
-
-	/* Execute: lock matching rows, then run the refresh CTE. */
+	
+	/*
+	 * Lock the matview rows in scope before evaluating the source, and take the
+	 * snapshot the source runs under only afterwards.  The order matters: a
+	 * refresh that queued behind another must not evaluate its source from
+	 * before that one committed, or it writes stale values back over it.
+	 */
 	if (matview_execute_spi_plan(cacheEntry->lockPlan, params,
 								 InvalidSnapshot, false) < 0)
 		elog(ERROR, "SPI_execute_plan failed during lock acquisition");
 
-	/*
-	 * How many rows the matview holds in scope right now, under a lock that
-	 * stops them changing.  Half of the prune guard's accounting, and the half
-	 * that is matview-side: the source count below says what the view produces,
-	 * which on its own cannot decide whether anything is orphaned.
-	 */
 	n_locked = (int64) SPI_processed;
 
-	/*
-	 * The two statements take separate snapshots, so a base-table change that
-	 * commits here is invisible to the locking step above and visible to the
-	 * refreshing step below.  The window is microseconds wide in practice; the
-	 * injection point lets a test land inside it deterministically.  See
-	 * src/test/modules/injection_points/specs/matview-where-snapshot.spec.
-	 */
 	INJECTION_POINT("matview-where-locked", NULL);
 
 	{
 		Query	   *sourceQuery;
 		Snapshot	snapshot;
 
-		/*
-		 * One snapshot for the whole of step 2.  SPI would otherwise take its
-		 * own for the DML, leaving the view evaluated as of one moment and the
-		 * rows it is compared against read as of a later one; a key another
-		 * refresh inserted in the gap would then be pruned as though the view
-		 * no longer produced it.  The fused CTE never had that gap because
-		 * evaluation and DML were one statement, and this keeps it that way.
-		 */
 		CommandCounterIncrement();
 		PushCopiedSnapshot(GetTransactionSnapshot());
 		snapshot = GetActiveSnapshot();
 
-		/*
-		 * Build the source plansource on the first refresh through this entry
-		 * and keep it.  On the ones after, plancache hands back the plan it
-		 * already has -- that is 3.7.
-		 *
-		 * The query itself is only built on a miss, which is a second saving
-		 * on top of the plan: the entry is keyed on the arbiter index, the
-		 * deparsed predicate and the argument types, and those are exactly the
-		 * inputs matview_build_source_query() reads besides the matview OID.
-		 * A hit therefore means it would build the same tree again.  Values
-		 * that vary between refreshes arrive through `params`, not through the
-		 * tree, which is what plancache exists to handle.
-		 *
-		 * SaveCachedPlan() only under use_cache, matching what SPI_keepplan()
-		 * does for the other two plans.  This is B14's guard: a nested refresh
-		 * at maintenance depth > 0 holds a stack entry that is gone when it
-		 * returns, so saving its plansource would leak it into
-		 * CacheMemoryContext with nothing left to read it.  It is dropped
-		 * below instead.
-		 *
-		 * It must be saved *before* the first GetCachedPlan(): SaveCachedPlan()
-		 * asserts the plansource is not already saved and discards any plan it
-		 * is holding.
-		 */
 		if (cacheEntry->sourcePlan == NULL)
 		{
 			sourceQuery = matview_build_source_query(matviewRel, dataQuery,
@@ -2665,12 +2069,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 													  params, snapshot,
 													  sourceStore);
 
-		/*
-		 * The rows are computed; the statement that compares the matview
-		 * against them has not run yet.  Whether anything can be observed in
-		 * between is the whole question this path has to answer, so give a
-		 * test somewhere deterministic to stand.
-		 */
 		INJECTION_POINT("matview-where-source-materialized", NULL);
 
 		if (matview_execute_spi_plan(cacheEntry->refreshPlan,
@@ -2685,11 +2083,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		PopActiveSnapshot();
 	}
 
-	/*
-	 * The statement returns one row holding the number of rows upserted plus
-	 * the number pruned.  SPI_processed would only count the rows the top-level
-	 * statement returned, which is always one.
-	 */
 	if (SPI_processed == 1 && SPI_tuptable != NULL &&
 		SPI_tuptable->numvals == 1)
 	{
@@ -2704,14 +2097,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	if (sourceStore != NULL)
 		tuplestore_end(sourceStore);
 
-	/*
-	 * A nested refresh's plansource was never saved, so nothing else will ever
-	 * free it -- SPI_finish() reclaims its two SPI plans but knows nothing
-	 * about this one, and the stack entry holding the pointer is about to go
-	 * out of scope.  Drop it here.  The saved one is left alone: it belongs to
-	 * the hash entry and is freed by matview_cache_sweep() or by the mismatch
-	 * branch that rebuilds the entry.
-	 */
 	if (!use_cache && cacheEntry->sourcePlan != NULL)
 	{
 		DropCachedPlan(cacheEntry->sourcePlan);
@@ -2722,14 +2107,10 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	}
 	PG_CATCH();
 	{
-		/*
-		 * Restore the maintenance flag.  Leaving it raised would disable the
-		 * "cannot change materialized view" check for the rest of the session.
-		 */
 		matview_maintenance_depth = old_depth;
 		matview_maintenance_relid = old_relid;
 
-		/* Same reasoning as the success path; see above. */
+		
 		if (!use_cache && cacheEntry->sourcePlan != NULL)
 		{
 			DropCachedPlan(cacheEntry->sourcePlan);
@@ -2745,16 +2126,10 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 
 	return result_processed;
 }
-
 /*
- * Choose the unique index to use as the ON CONFLICT arbiter.  Returns
- * InvalidOid if the matview has none that is usable.
- *
- * This used to prefer indisprimary, which can never be set here: a
- * materialized view cannot have a primary key at all, because ALTER ... ADD
- * CONSTRAINT rejects matviews outright.  Any index it has arrived via CREATE
- * INDEX, so the first usable one is the answer.
+ * Choose the unique index the upsert will arbitrate on.
  */
+
 static Oid
 matview_pick_arbiter_index(Relation matviewRel)
 {
@@ -2781,12 +2156,11 @@ matview_pick_arbiter_index(Relation matviewRel)
 	list_free(indexoidlist);
 	return result;
 }
-
 /*
- * Build the pieces of an ON CONFLICT clause for the given arbiter index: the
- * conflict target column list, the DO UPDATE SET list covering every non-key
- * column, and the equality operator whose NULL handling matches the index.
+ * Build the ON CONFLICT column list, the DO UPDATE SET list and the prune's
+ * join condition for the fused statement.
  */
+
 static void
 matview_build_upsert_clause(Relation matviewRel, Oid arbiterOid,
 							StringInfo conflict_cols, StringInfo set_clause,
@@ -3314,7 +2688,6 @@ is_usable_unique_index(Relation indexRel)
 	}
 	return false;
 }
-
 
 /*
  * This should be used to test whether the backend is in a context where it is
