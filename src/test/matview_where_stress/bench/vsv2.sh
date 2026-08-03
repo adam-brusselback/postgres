@@ -48,10 +48,23 @@
 #      BETWEEN, cur forced generic           cur 0.146    the re-plan is 2.7x
 #
 #    So "current is 3.3x slower at scope 1" is a statement about plancache's
-#    handling of one predicate shape, not about the cost of the guarantees, and
-#    reporting the range sweep alone would have said the opposite of the truth.
-#    Run both shapes.  Note also that a range sweep makes every CURRENT figure
-#    pessimistic at every scope, so the large-scope wins below are lower bounds.
+#    handling of one predicate shape, not about the cost of the guarantees.
+#
+#    AND THE SHAPE HAS A SECOND HALF THAT MATTERS MORE.  A range predicate whose
+#    bounds never change is v2's BEST case: its cache is keyed on the predicate
+#    TEXT, so a constant window hits every call, and with `params` NULL
+#    choose_custom_plan() short-circuits to a generic plan forever and it never
+#    re-plans.  It is simultaneously current's WORST case, for the reason above.
+#    A real range window moves.  Measured, 10-row window, bare, median of 40:
+#
+#      constant window   v2 0.153   cur 0.422    cur 2.8x slower
+#      moving window     v2 0.499   cur 0.425    cur 1.2x FASTER
+#
+#    Current is flat across the two because it parameterises and hits either
+#    way; v2 triples because each distinct literal is a fresh key and a fresh
+#    plan.  So PRED defaults to `move`, and `const` is kept and labelled as the
+#    adversarial cell rather than quietly used as the headline -- which is what
+#    the first two runs of this script did.
 set -eu
 
 DIR=$(cd "$(dirname "$0")/.." && pwd)
@@ -63,8 +76,14 @@ DB=${DB:-postgres}
 RUNAS=${RUNAS:-pgtest}
 ROUNDS=${ROUNDS:-5}
 SCALE=${SCALE:-100000}
-# eq | range.  This is an AXIS, not a detail -- see the note below.
-PRED=${PRED:-range}
+# move | const | arr.  This is an AXIS, not a detail -- see note 4 below.
+#   move   id BETWEEN k AND k+scope-1, k ADVANCING per refresh.  The default,
+#          because a range window that never moves is not a workload.
+#   const  id BETWEEN 1 AND scope, fixed.  The adversarial cell: it is v2's most
+#          favourable configuration and current's least, at the same time.
+#   arr    id = ANY(ARRAY[k..]), k advancing.  What the D1/D2 drivers in
+#          USE-CASES.md actually issue.
+PRED=${PRED:-move}
 
 mode=${1:-}
 [ -n "$mode" ] || { sed -n '2,7p' "$0"; exit 2; }
@@ -113,18 +132,31 @@ timed() {  # timed <arm> <form> <scope> <n>
     arm=$1; form=$2; scope=$3; n=$4
     conc=""
     [ "$form" = conc ] && conc="CONCURRENTLY"
-    lo=1; hi=$scope
-    if [ "$PRED" = eq ] && [ "$scope" = 1 ]; then
-        where="id = 1"
-    else
-        where="id BETWEEN $lo AND $hi"
-    fi
+    # Emitted per iteration, because a moving window is a different statement
+    # every time -- which is the entire point of the axis.
+    # The window must stay INSIDE the fixture.  nwin is how many disjoint
+    # windows of this scope fit in SCALE rows; without it a moving window at
+    # scope 10000 walks off the end of a 100000-row table after ten steps and
+    # every later refresh selects nothing -- which is very fast and measures
+    # nothing.  That is the shape of mistake this script has already made twice.
+    nwin=$(( SCALE / scope )); [ "$nwin" -lt 1 ] && nwin=1
+    emit_pred() {  # emit_pred <iteration>
+        case "$PRED" in
+        const) printf 'id BETWEEN 1 AND %s' "$scope" ;;
+        move)  k=$(( ($1 % nwin) * scope + 1 ))
+               printf 'id BETWEEN %s AND %s' "$k" "$((k + scope - 1))" ;;
+        arr)   k=$(( ($1 % nwin) * scope + 1 ))
+               printf 'id = ANY(ARRAY[%s' "$k"
+               j=1; while [ $j -lt "$scope" ]; do printf ',%s' "$((k+j))"; j=$((j+1)); done
+               printf '])' ;;
+        esac
+    }
     {
         fixture
         echo "SET synchronous_commit = off;"
         # Warm the plan cache / any per-session state before the clock starts.
         i=0; while [ $i -lt 3 ]; do
-            echo "REFRESH MATERIALIZED VIEW $conc vv_mv WHERE $where;"
+            echo "REFRESH MATERIALIZED VIEW $conc vv_mv WHERE $(emit_pred $i);"
             i=$((i+1)); done
         # printf, not echo: this script is #!/bin/sh, and dash's echo
         # interprets backslash escapes, so `echo "\\timing on"` sends a TAB
@@ -133,7 +165,7 @@ timed() {  # timed <arm> <form> <scope> <n>
         # happened on the first run of this script.
         printf '%s\n' '\timing on' 
         i=0; while [ $i -lt "$n" ]; do
-            echo "REFRESH MATERIALIZED VIEW $conc vv_mv WHERE $where;"
+            echo "REFRESH MATERIALIZED VIEW $conc vv_mv WHERE $(emit_pred $((i+3)));"
             i=$((i+1)); done
     } | feed "$arm" 2>&1 \
       | awk '/^Time:/ { v[n++] = $2 }
