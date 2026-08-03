@@ -61,6 +61,19 @@ SCALE=${SCALE:-100000}
 SPAN=${SPAN:-1000}
 OPT=${OPT:-on}
 LABEL=${LABEL:-pristine}
+# key    -- "id BETWEEN k AND k+SPAN-1", on the arbiter key.  Both elisions fire
+#           for the bare arm: the predicate is key-only, so the prune is skipped,
+#           and the pre-lock's ORDER BY goes with the lock level.  R10 says the
+#           ordering is free here anyway -- the index scan already yields key
+#           order and there is no Sort -- so this cell should read the prune
+#           elision alone (R42) and is the check on that.
+# nonkey -- "cust = k", on an indexed column that is NOT the arbiter key.  The
+#           prune elision is gated on the predicate reading key columns only, so
+#           it does NOT fire, and the difference between the two spellings is the
+#           ORDER BY alone.  This is also R10's misaligned cell, where ordering
+#           by the arbiter key hands LockRows the heap in random order.
+PRED=${PRED:-key}
+GROUPS=${GROUPS:-100}
 
 PSQL="$BINDIR/psql -p $PORT -d $DB -q -X -v ON_ERROR_STOP=1"
 export PGOPTIONS="-c synchronous_commit=$SYNC"
@@ -71,7 +84,7 @@ trap 'rm -rf "$T"' EXIT
 
 run() { su "$RUNAS" -c "PGOPTIONS='$PGOPTIONS' $PSQL $*"; }
 
-echo "pruneelide: label=$LABEL span=$SPAN scale=$SCALE optimized=$OPT"
+echo "pruneelide: label=$LABEL pred=$PRED span=$SPAN groups=$GROUPS scale=$SCALE optimized=$OPT"
 echo "            rounds=$ROUNDS n=$N sync=$SYNC"
 run -Atc "'SELECT setting FROM pg_config() WHERE name = '\''CONFIGURE'\''" 2>/dev/null || true
 run -Atc "'SHOW debug_assertions'" | sed 's/^/  assertions=/'
@@ -83,7 +96,7 @@ DROP MATERIALIZED VIEW IF EXISTS pe_mv;
 DROP TABLE IF EXISTS pe_ord;
 CREATE TABLE pe_ord(id bigint primary key, cust int, status text);
 INSERT INTO pe_ord
-  SELECT g, g % 1000, 'S' || (g % 5) FROM generate_series(1, $SCALE) g;
+  SELECT g, g % $GROUPS, 'S' || (g % 5) FROM generate_series(1, $SCALE) g;
 CREATE MATERIALIZED VIEW pe_mv AS SELECT id, cust, status FROM pe_ord;
 CREATE UNIQUE INDEX ON pe_mv(id);
 CREATE INDEX ON pe_mv(cust);
@@ -94,17 +107,21 @@ SQL
 # One statement file per arm.  Both walk the same keys in the same order, so
 # the comparison carries no data-distribution difference.  The predicate is a
 # range on the arbiter key: key-only, which the count rule is gated on.
-awk -v n="$N" -v span="$SPAN" -v scale="$SCALE" -v opt="$OPT" '
+awk -v n="$N" -v span="$SPAN" -v scale="$SCALE" -v opt="$OPT" \
+    -v pred="$PRED" -v groups="$GROUPS" '
+function predicate(i,   k) {
+  if (pred == "nonkey") return sprintf("cust = %d", i % groups);
+  k = 1 + i * int((scale - span) / n);
+  return sprintf("id BETWEEN %d AND %d", k, k + span - 1);
+}
 BEGIN {
   printf "SET matview_partial_refresh_optimized = %s;\n", opt > "'"$T"'/bare.sql";
   printf "SET matview_partial_refresh_optimized = %s;\n", opt > "'"$T"'/conc.sql";
-  step = int((scale - span) / n); if (step < 1) step = 1;
   for (i = 0; i < n; i++) {
-    k = 1 + i * step;
-    printf "REFRESH MATERIALIZED VIEW pe_mv WHERE id BETWEEN %d AND %d;\n",
-           k, k + span - 1                              > "'"$T"'/bare.sql";
-    printf "REFRESH MATERIALIZED VIEW CONCURRENTLY pe_mv WHERE id BETWEEN %d AND %d;\n",
-           k, k + span - 1                              > "'"$T"'/conc.sql";
+    printf "REFRESH MATERIALIZED VIEW pe_mv WHERE %s;\n",
+           predicate(i)                                 > "'"$T"'/bare.sql";
+    printf "REFRESH MATERIALIZED VIEW CONCURRENTLY pe_mv WHERE %s;\n",
+           predicate(i)                                 > "'"$T"'/conc.sql";
   }
 }'
 echo "SELECT 1;" > "$T/empty.sql"
@@ -143,7 +160,7 @@ done
 
 echo
 echo "per refresh, us -- round 1 discarded"
-awk -v label="$LABEL" -v span="$SPAN" '
+awk -v label="$LABEL" -v span="$SPAN" -v pred="$PRED" '
   $1 > 1 { s[$2] += $3; v[$2, n[$2]++] = $3;
            if (!($2 in lo) || $3 < lo[$2]) lo[$2] = $3;
            if ($3 > hi[$2]) hi[$2] = $3 }
@@ -162,7 +179,7 @@ awk -v label="$LABEL" -v span="$SPAN" '
              a, md[a], s[a]/n[a], lo[a], hi[a], n[a];
       m[a] = s[a]/n[a] }
     if (("conc" in m) && ("bare" in m)) {
-      printf "\n  %s span=%s -- bare against conc, three statistics:\n", label, span;
+      printf "\n  %s %s/span=%s -- bare against conc, three statistics:\n", label, pred, span;
       printf "    median  %+8.1f us  %6.1f%%   <- quote this one\n",
              md["conc"] - md["bare"], 100 * (md["conc"] - md["bare"]) / md["conc"];
       printf "    mean    %+8.1f us  %6.1f%%\n",

@@ -365,6 +365,22 @@ MUTATIONS = {
                 '\t\t\t\t\t\t\t\t\t InvalidSnapshot, false) < 0)', 1),
            ]),
 
+    # O4 is to the pre-lock's ORDER BY what N3 is to the prune elision: it turns
+    # the optimisation off and changes nothing else, so both arms of a
+    # measurement sit inside one build.  The clause goes back to being
+    # unconditional, which is what the code did before and is still correct --
+    # ordering under ExclusiveLock is merely pointless, not wrong.
+    #
+    # Perf-only, and it must be quiet everywhere: M1 is the same line in the
+    # other direction and is a real bug.
+    'O4': ('-', 'perf',
+           'the pre-lock always carries its ORDER BY (the 4/3f elision off)', [
+               ('\t\tif (!serialized)\n'
+                '\t\t\tappendStringInfo(&buf, "ORDER BY %s ", conflict_cols.data);',
+                '\t\tif (true)\n'
+                '\t\t\tappendStringInfo(&buf, "ORDER BY %s ", conflict_cols.data);', 1),
+           ]),
+
     # O3 is B31 again, and a sharper case than the one that rule was written
     # for.  The pre-lock's ORDER BY is emitted for CONCURRENTLY and not for the
     # bare form -- under ExclusiveLock there is no second refresh to order
