@@ -63,8 +63,29 @@
 #include "utils/tuplestore.h"
 
 
-/* See matview.h.  Branch-local scaffolding for the Phase 3 optimisations. */
-bool		matview_partial_refresh_optimized = false;
+/*
+ * Does the upsert compare a matched row against its replacement before
+ * rewriting it?  ON in the code that ships; this is the off-switch, kept only
+ * so the two can still be measured against each other on one binary, and
+ * deleted with the rest of the branch-local scaffolding.
+ *
+ * It defaults ON because it pays from one row upward.  Measured against the
+ * plain upsert at zero churn, per refresh: +2.2% at scope 1, +15.1% at 25,
+ * +29.0% at 100, +44.6% at 1000 and +70.1% at 10,000 (RESULTS.md R45).  Two
+ * things that used to argue against it did not survive being re-measured: it
+ * is not 18.5% slower at scope 1 -- all three statistics read positive over 23
+ * bands -- and it does not need an index over a written column to be worth
+ * having, since most of the saving is not writing a row version at all rather
+ * than the index maintenance that follows one (X17).
+ *
+ * What it costs is a comparison bought for nothing when the row really did
+ * change, which is why the saving shrinks with churn: R4 puts break-even at
+ * 60-70% changed rows, and a scope where nearly everything changed pays a few
+ * percent.  Deciding that per refresh needs churn history the cache does not
+ * keep yet; the trade as it stands is a win from scope 1 in the common case
+ * against a few percent in the least common one.
+ */
+bool		matview_partial_refresh_optimized = true;
 
 /*
  * query_string for the source plansource.  CreateCachedPlan() requires one and

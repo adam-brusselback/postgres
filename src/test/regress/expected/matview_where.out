@@ -812,7 +812,8 @@ CREATE TABLE mv_null_base (id int PRIMARY KEY, v int);
 INSERT INTO mv_null_base VALUES (1, NULL), (2, 20), (3, NULL), (4, 40);
 CREATE MATERIALIZED VIEW mv_null AS SELECT id, v FROM mv_null_base;
 CREATE UNIQUE INDEX ON mv_null(id);
-SET matview_partial_refresh_optimized = on;
+-- No SET.  The comparison is on by default now, and this case is what says so:
+-- flip the default back and it goes red rather than quietly testing nothing.
 -- NULL -> value.  Under `<>` the comparison is NULL, the row is not updated,
 -- and id 1 stays NULL.
 UPDATE mv_null_base SET v = 11 WHERE id = 1;
@@ -853,7 +854,6 @@ SELECT id, v FROM mv_null ORDER BY id;
   4 | 40
 (4 rows)
 
-RESET matview_partial_refresh_optimized;
 DROP MATERIALIZED VIEW mv_null;
 DROP TABLE mv_null_base;
 --
@@ -884,7 +884,7 @@ DROP TABLE mv_null_base;
 -- already-current scope cheap, and it is the reason a drain can be run often.
 -- The promise outlives the flag.
 --
-SET matview_partial_refresh_optimized = on;
+-- No SET here either, for the same reason: this is the default's test.
 CREATE TABLE mv_rowver_base (id int primary key, v int, note text);
 INSERT INTO mv_rowver_base SELECT g, g * 10, 'n' || g FROM generate_series(1, 5) g;
 CREATE MATERIALIZED VIEW mv_rowver AS SELECT id, v, note FROM mv_rowver_base;
@@ -920,7 +920,6 @@ SELECT id, v, note FROM mv_rowver ORDER BY id;
 DROP TABLE mv_rowver_was;
 DROP MATERIALIZED VIEW mv_rowver;
 DROP TABLE mv_rowver_base;
-RESET matview_partial_refresh_optimized;
 --
 -- Test 19: the predicate's constants become parameters, and the values still
 --          reach the right rows
