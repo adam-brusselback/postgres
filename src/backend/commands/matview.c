@@ -65,25 +65,12 @@
 
 /*
  * Does the upsert compare a matched row against its replacement before
- * rewriting it?  ON in the code that ships; this is the off-switch, kept only
- * so the two can still be measured against each other on one binary, and
- * deleted with the rest of the branch-local scaffolding.
+ * rewriting it?  On by default: the comparison is far cheaper than the row
+ * version it avoids writing, so it pays at every scope, and even a scope in
+ * which every row changed only pays for the comparison itself.
  *
- * It defaults ON because it pays from one row upward.  Measured against the
- * plain upsert at zero churn, per refresh: +2.2% at scope 1, +15.1% at 25,
- * +29.0% at 100, +44.6% at 1000 and +70.1% at 10,000 (RESULTS.md R45).  Two
- * things that used to argue against it did not survive being re-measured: it
- * is not 18.5% slower at scope 1 -- all three statistics read positive over 23
- * bands -- and it does not need an index over a written column to be worth
- * having, since most of the saving is not writing a row version at all rather
- * than the index maintenance that follows one (X17).
- *
- * What it costs is a comparison bought for nothing when the row really did
- * change, which is why the saving shrinks with churn: R4 puts break-even at
- * 60-70% changed rows, and a scope where nearly everything changed pays a few
- * percent.  Deciding that per refresh needs churn history the cache does not
- * keep yet; the trade as it stands is a win from scope 1 in the common case
- * against a few percent in the least common one.
+ * Development off-switch, to be removed along with the rest of the
+ * branch-local scaffolding.
  */
 bool		matview_partial_refresh_optimized = true;
 
@@ -135,21 +122,17 @@ typedef struct MatViewPartialRefreshCache
 								 * resolution */
 	Node	   *qual;			/* the predicate these plans were built from,
 								 * compared with equal().  The tree rather than
-								 * its deparsed text: deparsing costs 4.5-5.3 us
-								 * (RESULTS.md R14) and the text was only ever
-								 * read by the comparison, so keying on the tree
-								 * removes it from every refresh that hits.
-								 * equal() ignores parse locations, so the same
-								 * predicate written at a different offset in the
-								 * command still matches */
+								 * its deparsed text, so a cache hit costs no
+								 * deparse; equal() ignores parse locations, so
+								 * the same predicate written at a different
+								 * offset still matches */
 	int			nargs;			/* number of external parameters */
-	Oid		   *argtypes;		/* their types.  Not implied by the qual: a
-								 * caller may bind a parameter the predicate
-								 * never names, and the generated statement
-								 * declares every one of them */
+	Oid		   *argtypes;		/* their types.  Not implied by qual: a caller
+								 * may bind a parameter the predicate never
+								 * names, and the statement declares them all */
 
-	MemoryContext metacxt;		/* holds qual and argtypes, so the two are freed
-								 * together and a node tree can be freed at all */
+	MemoryContext metacxt;		/* holds qual and argtypes; a node tree cannot
+								 * be freed piecemeal */
 
 	bool		optimized;		/* was matview_partial_refresh_optimized set
 								 * when these plans were built?  It changes the
@@ -314,7 +297,7 @@ refresh_paramref_hook(ParseState *pstate, ParamRef *pref)
  * check_functions_in_node callback: is this function leakproof?
  */
 static bool
-leakproof_checker(Oid func_id, void *context)
+non_leakproof_checker(Oid func_id, void *context)
 {
 	return !get_func_leakproof(func_id);
 }
@@ -346,7 +329,7 @@ leakproof_checker(Oid func_id, void *context)
  * problem for row-level security and defaults to unsafe for the same reason.
  */
 static bool
-contains_non_leakproof_walker(Node *node, void *context)
+contain_non_leakproof_walker(Node *node, void *context)
 {
 	if (node == NULL)
 		return false;
@@ -386,7 +369,7 @@ contains_non_leakproof_walker(Node *node, void *context)
 		case T_CoerceViaIO:
 		case T_ArrayCoerceExpr:
 		case T_RowCompareExpr:
-			if (check_functions_in_node(node, leakproof_checker, context))
+			if (check_functions_in_node(node, non_leakproof_checker, context))
 				return true;
 			break;
 
@@ -398,7 +381,7 @@ contains_non_leakproof_walker(Node *node, void *context)
 			return true;
 	}
 
-	return expression_tree_walker(node, contains_non_leakproof_walker, context);
+	return expression_tree_walker(node, contain_non_leakproof_walker, context);
 }
 
 /*
@@ -407,7 +390,7 @@ contains_non_leakproof_walker(Node *node, void *context)
 static bool
 refresh_where_clause_is_leakproof(Node *qual)
 {
-	return !contains_non_leakproof_walker(qual, NULL);
+	return !contain_non_leakproof_walker(qual, NULL);
 }
 
 static Node *
@@ -491,21 +474,19 @@ typedef struct RefreshParamizeContext
 /*
  * May this Const become a Param?
  *
- * The deparsed clause renders a Param as "$n" and nothing else -- no type, no
- * typmod (B3) -- so the type has to travel beside it in the argtypes array
- * SPI_prepare is given.  A constant with no type to declare therefore cannot
- * make the trip, and is left as a literal.
+ * The deparsed clause renders a Param as "$n" with no type information, so the
+ * type must travel beside it in the argtypes array given to SPI_prepare.  A
+ * constant with no type to declare cannot make the trip and stays a literal.
  */
 static bool
 refresh_const_is_paramizable(Const *con)
 {
 	/*
-	 * UNKNOWNOID is the case this exists for.  Handing InvalidOid to
-	 * SPI_prepare does not mean "unknown", it means "resolve it from context",
-	 * and the context is the generated statement rather than the predicate the
-	 * caller wrote.  Rare -- parse analysis resolves almost everything -- and
-	 * one missed cache hit is a far better outcome than a parameter that binds
-	 * to a different type than the literal had.
+	 * UNKNOWNOID is the case this exists for: to SPI_prepare an unspecified
+	 * type means "resolve it from context", and the context would be the
+	 * generated statement rather than the predicate the caller wrote.  Parse
+	 * analysis resolves almost everything, and a missed cache hit is a better
+	 * outcome than a parameter binding to a different type than the literal.
 	 */
 	if (!OidIsValid(con->consttype) || con->consttype == UNKNOWNOID)
 		return false;
@@ -562,20 +543,17 @@ paramize_refresh_consts_mutator(Node *node, void *context)
  * Turn the predicate's constants into parameters, and extend the caller's
  * ParamListInfo with their values.
  *
- * The plan cache is keyed on the deparsed predicate (matview.c's cache entry,
- * and SPI's own plancache entries under it), so "WHERE id = 1" and
- * "WHERE id = 2" are two different statements and a caller refreshing one row
- * at a time misses on every call.  A caller who binds the value instead hits,
- * because pg_get_expr renders a Param as "$1" whatever it holds.  Both are
- * ordinary things to write and they measured 8x apart (RESULTS.md R15).
+ * Plans are cached per predicate, so "WHERE id = 1" and "WHERE id = 2" would
+ * otherwise be two statements and a caller refreshing one row at a time would
+ * miss the cache on every call.  A caller who binds the value instead hits,
+ * since a Param deparses to "$1" whatever it holds; both are ordinary things
+ * to write, and the difference is large.
  *
- * So write the second one on the first one's behalf: replace each Const with a
- * Param of the same type, typmod and collation, and hand the value over in
- * `params`.  The predicate now deparses to a shape rather than a value, the
- * key is stable across values, and everything downstream -- the two SPI plans,
- * the source plansource, and the match/merge path's generated INSERT -- takes
- * the values through the parameter list it already had for a caller who bound
- * them.
+ * So write the second on the first's behalf: replace each Const with a Param of
+ * the same type, typmod and collation and hand the value over in `params`.  The
+ * predicate then deparses to a shape rather than a value, and everything
+ * downstream takes the values through the parameter list the path already
+ * carried for a caller who bound them.
  *
  * PARAM_FLAG_CONST is what keeps a custom plan as good as the literal plan it
  * replaces: it is the flag eval_const_expressions() looks for before folding
@@ -585,12 +563,11 @@ paramize_refresh_consts_mutator(Node *node, void *context)
  * builds (_SPI_convert_params), so this matches what the path already did for
  * a caller-supplied parameter.
  *
- * Which plan gets used is then plancache's usual decision.  It is not this
- * function's to make and should not be forced: forcing generic was measured
- * across 94 comparisons at 21.7% slower net (RESULTS.md R1), and the cases
- * where a generic plan is wrong -- an array whose selectivity cannot be
- * estimated without seeing it -- are exactly the ones choose_custom_plan()
- * already gets right.
+ * Which plan is then used stays plancache's decision, and should not be forced
+ * either way: forcing a generic plan measured substantially slower overall, and
+ * the cases where a generic plan is wrong -- an array whose selectivity cannot
+ * be estimated without seeing it -- are the ones choose_custom_plan() already
+ * gets right.
  *
  * Returns the rewritten clause, and replaces *params.  Both are unchanged when
  * there was nothing to do.
@@ -945,12 +922,10 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	}
 
 	/*
-	 * The deparse is deliberately NOT done here.  It costs 4.5-5.3 us
-	 * (RESULTS.md R14) and only two consumers need it: the match/merge branch
-	 * below, which interpolates it into three statements, and
-	 * refresh_by_direct_modification(), which needs it only when it is building
-	 * plans.  Doing it up front charged every refresh for something a warm one
-	 * throws away, so each branch does its own.
+	 * The predicate is deliberately not deparsed here.  Only two consumers need
+	 * the text: the match/merge branch below, and refresh_by_direct_modification()
+	 * when it is building plans.  Deparsing up front would charge every refresh
+	 * for something a cached one throws away, so each branch does its own.
 	 */
 
 	/*
@@ -1821,9 +1796,9 @@ refresh_qual_key_only_walker(Node *node, void *context)
  * the predicate, in which case the upsert matches it (ON CONFLICT arbitrates on
  * the key, not on the predicate) while the pre-lock never saw it.  The source
  * row is then neither locked nor inserted, and a genuinely orphaned row
- * elsewhere in the scope cancels the discrepancy exactly.  SPECIALIZE.md 3b has
- * the two-row case; it leaves the matview holding a row its own definition does
- * not produce, and reports success.
+ * elsewhere in the scope cancels the discrepancy exactly.  The result is a
+ * matview holding a row its own definition does not produce, reported as a
+ * successful refresh.
  *
  * When the qual reads only key columns that cannot happen: two rows with the
  * same key agree on the qual, so a matview row the upsert can conflict with is
@@ -1868,15 +1843,15 @@ refresh_qual_is_key_only(Node *qual, int nkeyatts, const int16 *keyattnums)
  *                            non-negative left-hand side can equal.
  *
  * The second rule is unsound without that gate, and silently so: see
- * refresh_qual_is_key_only() and SPECIALIZE.md 3b.
+ * refresh_qual_is_key_only().
  *
  * BOTH rules additionally need `serialized`, and that one is not about the
  * predicate at all.  n_locked is measured by the pre-lock, under an earlier
  * snapshot than the DELETE it stands in for -- the snapshot has to be taken
  * after the lock, or a refresh that queued behind another would evaluate its
- * source from before that one committed and write the stale values back over it
- * (SPECIALIZE.md 3e; fuzz.sh serial mode catches it as M3 and M6).  The lock
- * stops the rows it matched from changing; it does not stop new ones appearing.
+ * source from before that one committed and write the stale values back over
+ * it.  The lock stops the rows it matched from changing; it does not stop new
+ * ones appearing.
  * A refresh over a key the matview does not hold yet locks nothing, so it does
  * not queue behind us and can commit a row into our scope inside that window --
  * a row neither count has seen, and the accounting then balances while that row
@@ -1887,7 +1862,7 @@ refresh_qual_is_key_only(Node *qual, int nkeyatts, const int16 *keyattnums)
  * session can write this matview at all: it conflicts with the
  * RowExclusiveLock a CONCURRENTLY partial refresh takes and with another bare
  * refresh's ExclusiveLock, while still admitting readers.  So the saving is
- * available exactly where the lock makes it safe -- which is SPECIALIZE.md 4's
+ * available exactly where the lock makes it safe -- which is the
  * argument for choosing that level deliberately, cashed in a second time.
  * Asked of the lock manager rather than derived from the statement's spelling:
  * the precondition is "nobody else can write this", and that is a fact about
@@ -2128,7 +2103,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	 *
 	 * The tree is compared rather than its deparsed text because the text was
 	 * this comparison's only reader, and producing it costs 4.5-5.3 us on every
-	 * refresh including one that goes on to hit (RESULTS.md R14).  It is also
+	 * refresh including one that goes on to hit.  It is also
 	 * the stronger key: pg_get_expr renders a Param as "$n" with no type, which
 	 * is B3, while the tree carries paramtype and paramtypmod on the node.
 	 * argtypes stays anyway -- it covers a parameter the predicate never names,
@@ -2443,7 +2418,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		 * property of how the statement executes, not of anything visible at
 		 * build time, and a correct implementation has no window in which the
 		 * difference can be observed.  Its gates are the differential oracle
-		 * and fuzz.sh's serial mode; see PLAN.md 1.1b.
+		 * and by concurrent testing.
 		 */
 		Assert(conflict_cols.len > 0);
 		Assert(join_clause.len > 0);
@@ -2485,7 +2460,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		 * produces -- removing it makes the statement cheap enough that
 		 * plancache stops settling on a generic plan and re-plans it on every
 		 * call.  On a range predicate that cost 613 us against the 137 us the
-		 * ordering itself was worth.  RESULTS.md R44, and PLAN.md 4.1 for the
+		 * ordering itself was worth.  See the note on plan caching for the
 		 * plancache behaviour it runs into.
 		 */
 		initStringInfo(&buf);

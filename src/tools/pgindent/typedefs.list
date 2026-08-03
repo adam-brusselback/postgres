@@ -1750,6 +1750,7 @@ MVNDistinct
 MVNDistinctItem
 ManyTestResource
 ManyTestResourceKind
+MatViewPartialRefreshCache
 Material
 MaterialPath
 MaterialState
@@ -2587,6 +2588,7 @@ RecursiveUnionPath
 RecursiveUnionState
 RefetchForeignRow_function
 RefreshMatViewStmt
+RefreshParamizeContext
 RegProcedure
 Regis
 RegisNode
