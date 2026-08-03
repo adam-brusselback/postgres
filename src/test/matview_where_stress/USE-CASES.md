@@ -40,7 +40,13 @@ Derived rules:
 
 - Both forms are **linear** in scope — 10.1 / 11.6 / 15.2 µs/row for
   `CONCURRENTLY` across the three decades, 5.5 / 4.5 / 5.0 for bare. The
-  quadratic behaviour of the v2 patch is gone.
+  superlinear behaviour of the v2 patch is gone — and **that half of this line
+  is now measured rather than taken from the thread** (RESULTS.md **R51**): v2's
+  bare form runs 0.124 → 0.140 → 1.372 → 82.1 → **7539 ms** across scope 1 to
+  10,000 where the current one runs 0.413 → 0.455 → 0.558 → 2.353 → **21.7**,
+  which is **347× at the top**.  Until R51 this claim rested on the current code
+  measuring linear plus an assertion about v2 that nothing in this tree had
+  run.
 - **`CONCURRENTLY` costs ~8× what rebuilding the same rows would**, so it pays
   below ~11% of the matview. **The bare form costs ~3.5×**, so it pays to ~27%.
   The single "10% then rebuild" rule was wrong: it is right for the upsert form

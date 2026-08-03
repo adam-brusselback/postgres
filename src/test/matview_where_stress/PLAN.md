@@ -1063,8 +1063,23 @@ favour the bare form, and not until ~2000–5000 rows. That is an argument that
 the second implementation earns its place in a narrower band than assumed — and
 it is measurable, not a matter of taste.
 
-**3.5 Re-run the on-list benchmark.** The numbers Adam posted describe v1.
-Everything since has moved, in both directions.
+**3.5 Re-run the on-list benchmark.  DONE — RESULTS.md R51**, `bench/vsv2.sh`,
+against `c8beb05` built into its own prefix and cluster.  "Everything since has
+moved, in both directions" turned out to be exactly right, and the direction
+depends on the predicate shape rather than on the scope alone:
+
+- **Correctness first, because it decides what the speed table may contain.**
+  The current regression suite run against the v2 build is red in all four
+  files, on four wrong-answer shapes and two privilege escalations.  Those cells
+  are reported separately and the speed sweep does not touch them.
+- **Large scope: v2 is superlinear and this is the first time that has been
+  measured here** rather than asserted from the thread.  Bare form, 0.124 →
+  0.140 → 1.372 → 82.1 → 7539 ms across the scope decades, against current's
+  0.413 → 0.455 → 0.558 → 2.353 → 21.7.  **347× at scope 10,000.**
+- **Small scope: current loses on a narrow range predicate and wins on an
+  equality one**, and the difference is PLAN.md 4.1's re-plan, not the cost of
+  the guarantees.  See R51 — this is the cell where quoting one predicate shape
+  would have published the opposite of the truth.
 
 ### Tier 1 and 2 sized, and one of them inverts a conclusion
 
