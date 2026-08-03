@@ -21,26 +21,29 @@ happened in.
 
 ### What is next, in order
 
-The decision to ship (b) is **not yet true of the default configuration**: both
-`matview_partial_refresh_*` GUCs boot `false`, so a default build still takes
-the text path. Six steps close that, and the first three are one piece of work:
+The six-step tail this section used to list is **mostly closed**.  Recorded as
+what happened rather than deleted, because three of the six were blocked on each
+other and the order is the reason they landed at all:
 
 | | | state |
 |---|---|---|
-| 1 | **3.7 — cache the source plan** | **in progress**; the subplan is **CACHE.md**, step 0 done.  Scoped to the **constant-literal** cell, where `params` is NULL so plancache serves a generic plan unconditionally.  Planning is **97.3%** of the source line (R27), but it is only **56%** of the deficit (R28) — necessary, not sufficient |
-| 2 | flip the querytree default, re-run the differential harness and the benchmark sweep (2.1b) | blocked on 1 |
-| 3 | B2 / the invalidation restructure | **its own item.**  Pulling it into 1 was justified by an argument the project's own measurements refute (3.1), and it reopens B7 — CACHE.md §4 |
-| 4 | delete the text path, the two GUCs, and the oracle's A/B axis | blocked on 2 |
-| 5 | B15 — warn, error, or document the blast radius | **needs a decision**, independent |
-| 6 | B25, and derived `no_delete` | independent |
+| 1 | **3.7 — cache the source plan** | **DONE.**  Subplan CACHE.md, result **R34**: the Query-tree deficit goes 54.25 us to 0.38 us, and the source line 44.88 us to 0.07 |
+| 2 | flip the `querytree` default, re-run the differential harness and the sweep (2.1b) | **DONE.**  **R35**: about +6% end to end, flat across predicate shape |
+| 3 | B2 / the invalidation restructure | **STILL OPEN, and still its own item.**  Pulling it into 1 was justified by an argument the project's own measurements refute (3.1), and it reopens B7 — CACHE.md §4.  Whether it is reachable at all now that the text path is gone has not been established |
+| 4 | delete the text path, the two GUCs, and the oracle's A/B axis | **DONE**, `82f71d8`.  One implementation, `matview_partial_refresh_optimized` the only remaining GUC |
+| 5 | B15 — warn, error, or document the blast radius | **STILL OPEN, needs a decision**, independent |
+| 6 | B25, and derived `no_delete` | **STILL OPEN**, independent |
 
-Step 1 gates 2 and 4 because the Query-tree path is slower warm at scope 1 until
-the source plan is cached, and scope-1-warm is where D1 and D2 live.  **The
-magnitude is unsettled**: R26 recorded 24%, a re-run on the same protocol gives
-98% (R28), and R26 is now `provisional` — the direction holds, the number does
-not. Step 4 goes last on purpose: `safety/diff_driver.sql` compares the `text`,
-`qt` and `qtopt` arms, so deleting the GUCs deletes the oracle's comparison axis.
-They are scaffolding, but they are the scaffolding the safety net hangs from.
+And one that was not on that list: **3.2, parameterise the predicate's
+constants**, is **DONE**.  It was the largest single number in the Phase 3 list
+and it had been sitting behind 3.6 — the benchmark could not tell the two
+predicate modes apart, so nothing in Phase 3 could be evaluated at all.  3.6
+landed first, its param arm turned out to be measuring the literal path for two
+of the three predicate shapes (**B33**), and the fix to that is what made the
+result readable.  Numbers at 3.2 below.
+
+So what is left is **3**, **5** and **6**, none of which blocks another, plus
+Phases 4–7.
 
 ### Which document owns what
 
