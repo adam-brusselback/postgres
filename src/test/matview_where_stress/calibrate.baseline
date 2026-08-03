@@ -18,6 +18,8 @@ nullable_composite|bare|0|0
 nullable_composite|concurrently|0|0
 nullable_key|bare|0|0
 nullable_key|concurrently|0|0
+nullable_key_nd|bare|0|0
+nullable_key_nd|concurrently|0|0
 pred_on_key|bare|0|0
 pred_on_key|concurrently|0|0
 proj_nonkey|bare|48|0
