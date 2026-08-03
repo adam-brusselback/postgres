@@ -2,7 +2,10 @@
 #
 # Dump one labelled bench_result run to a markdown table on stdout.
 #
-#   ./extract.sh <run_label> [port] [db]
+#   ./extract.sh <run_label>              one run, cell by cell
+#   ./extract.sh <label_a> <label_b>      two runs, compared cell by cell
+#
+# PORT and DB come from the environment (default 5610 / postgres).
 #
 # Why this exists
 # ---------------
@@ -36,11 +39,12 @@
 set -eu
 
 LABEL=${1:-}
-PORT=${2:-5610}
-DB=${3:-postgres}
+LABEL_B=${2:-}
+PORT=${PORT:-5610}
+DB=${DB:-postgres}
 BINDIR=${BINDIR:-/home/user/pgsql-opt/bin}
 
-[ -n "$LABEL" ] || { echo "usage: $0 <run_label> [port] [db]" >&2; exit 2; }
+[ -n "$LABEL" ] || { echo "usage: $0 <label_a> [label_b]" >&2; exit 2; }
 
 q() { su pgtest -c "$BINDIR/psql -p $PORT -d $DB -X -q $*"; }
 
@@ -76,32 +80,79 @@ q "-c \"SELECT predshape, count(*) AS rows, count(DISTINCT workload) AS workload
          FROM bench_result WHERE run_label='$LABEL'
         GROUP BY predshape ORDER BY predshape\""
 echo
-echo '### spi against querytree'
-echo
-echo 'Grouped by (workload, predshape, span).  pct_faster is the querytree'
-echo 'implementation against the text one: positive means querytree is faster.'
-echo
-q "-c \"SELECT workload, predshape AS shape, span, scope_rows,
-              spi AS spi_ms, qt AS qt_ms,
-              round(100.0*(1 - qt/spi), 1) AS pct_faster
-         FROM (SELECT workload, predshape, span, scope_rows,
-                      min(latency_ms) FILTER (WHERE form='spi')       AS spi,
-                      min(latency_ms) FILTER (WHERE form='querytree') AS qt
-                 FROM bench_result WHERE run_label='$LABEL'
-                GROUP BY 1,2,3,4) s
-        WHERE spi IS NOT NULL AND qt IS NOT NULL AND spi > 0
-        ORDER BY workload, predshape, span\""
-echo
-echo '### Summary by shape'
-echo
-q "-c \"SELECT predshape AS shape, count(*) AS cells,
-              round(avg(100.0*(1 - qt/spi)),1) AS avg_pct_faster,
-              round(min(100.0*(1 - qt/spi)),1) AS worst,
-              round(max(100.0*(1 - qt/spi)),1) AS best
-         FROM (SELECT workload, predshape, span,
-                      min(latency_ms) FILTER (WHERE form='spi')       AS spi,
-                      min(latency_ms) FILTER (WHERE form='querytree') AS qt
-                 FROM bench_result WHERE run_label='$LABEL'
-                GROUP BY 1,2,3) s
-        WHERE spi IS NOT NULL AND qt IS NOT NULL AND spi > 0
-        GROUP BY predshape ORDER BY predshape\""
+if [ -n "$LABEL_B" ]; then
+  exists_b=$(q "-Atc \"SELECT count(*) FROM bench_result WHERE run_label='$LABEL_B'\"")
+  [ "$exists_b" -gt 0 ] 2>/dev/null || {
+      echo "no rows for run_label='$LABEL_B'" >&2; exit 1; }
+
+  echo "### \`$LABEL\` against \`$LABEL_B\`"
+  echo
+  echo "Joined on (workload, predshape, span), which is the grouping the header"
+  echo "explains and the one that has already been got wrong once.  pct_faster is"
+  echo "\`$LABEL_B\` against \`$LABEL\`: positive means \`$LABEL_B\` is faster."
+  echo
+  echo "The absolute saving is the column to read when the effect is a FIXED cost"
+  echo "-- a plan built once instead of every call is the same number of"
+  echo "microseconds whether the refresh takes one millisecond or sixty, so the"
+  echo "percentage only says how cheap the refresh was."
+  echo
+  q "-c \"SELECT a.workload, a.predshape AS shape, a.span, a.scope_rows,
+                a.latency_ms AS a_ms, b.latency_ms AS b_ms,
+                round(100.0*(a.latency_ms-b.latency_ms)/a.latency_ms, 1) AS pct_faster,
+                round((a.latency_ms-b.latency_ms)*1000, 0) AS saving_us
+           FROM bench_result a
+           JOIN bench_result b
+             ON (a.workload,a.predshape,a.span,a.form,a.clients)
+              = (b.workload,b.predshape,b.span,b.form,b.clients)
+          WHERE a.run_label='$LABEL' AND b.run_label='$LABEL_B' AND a.latency_ms > 0
+          ORDER BY a.workload, a.predshape, a.span\""
+  echo
+  echo '### Summary by shape'
+  echo
+  echo 'Percentages are averaged over CELLS, not weighted by microseconds.  The'
+  echo 'saving is reported as a range rather than a mean for the same reason:'
+  echo 'these workloads refresh in 0.6 to 60 ms, so a mean over them describes no'
+  echo 'workload in particular.  Pooling absolute microseconds across scales is'
+  echo 'what produced the bogus band in the p21c sweep.  If the saving really is a'
+  echo 'fixed cost, the spread between min and max is the evidence for it.'
+  echo
+  q "-c \"SELECT a.predshape AS shape, count(*) AS cells,
+                round(avg(100.0*(a.latency_ms-b.latency_ms)/a.latency_ms),1) AS avg_pct,
+                round(min(100.0*(a.latency_ms-b.latency_ms)/a.latency_ms),1) AS worst,
+                round(max(100.0*(a.latency_ms-b.latency_ms)/a.latency_ms),1) AS best,
+                round(min((a.latency_ms-b.latency_ms)*1000)) AS min_saving_us,
+                round(max((a.latency_ms-b.latency_ms)*1000)) AS max_saving_us
+           FROM bench_result a
+           JOIN bench_result b
+             ON (a.workload,a.predshape,a.span,a.form,a.clients)
+              = (b.workload,b.predshape,b.span,b.form,b.clients)
+          WHERE a.run_label='$LABEL' AND b.run_label='$LABEL_B' AND a.latency_ms > 0
+          GROUP BY a.predshape ORDER BY a.predshape\""
+  echo
+  echo '### Any cell where the second run is SLOWER'
+  echo
+  echo 'Printed even when empty, because "no regressions" has to be something the'
+  echo 'reader can see rather than something absent from a table.'
+  echo
+  q "-c \"SELECT a.workload, a.predshape AS shape, a.span, a.scope_rows,
+                a.latency_ms AS a_ms, b.latency_ms AS b_ms,
+                round(100.0*(a.latency_ms-b.latency_ms)/a.latency_ms, 1) AS pct_faster
+           FROM bench_result a
+           JOIN bench_result b
+             ON (a.workload,a.predshape,a.span,a.form,a.clients)
+              = (b.workload,b.predshape,b.span,b.form,b.clients)
+          WHERE a.run_label='$LABEL' AND b.run_label='$LABEL_B'
+            AND b.latency_ms >= a.latency_ms
+          ORDER BY a.workload, a.predshape, a.span\""
+else
+  echo '### Cells'
+  echo
+  echo 'Grouped by (workload, predshape, span, form).  The form axis used to hold'
+  echo 'the two implementations of direct modification; the text one is gone, so'
+  echo 'it now holds conc, bare and opt -- lock level and the row comparison.'
+  echo
+  q "-c \"SELECT workload, predshape AS shape, span, scope_rows, form,
+                latency_ms, tps, vs_full_per_row
+           FROM bench_result WHERE run_label='$LABEL'
+          ORDER BY workload, predshape, span, form\""
+fi
