@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS public.opt_result(
   predshape  text,
   span       int,
   scope_rows bigint,
-  path       text,        -- spi | querytree
+  path       text,        -- always 'querytree' now; kept so rows taken
+                          -- before the text path was deleted still compare
   variant    text,        -- what is being varied
   iters      int,
   us         numeric      -- best of iters, microseconds
@@ -58,7 +59,7 @@ DO $outer$
 DECLARE
   w        bench_workload;
   shape    text; span int; pred text; arr text; scope bigint;
-  mode     text; path text; iters int; us numeric; mvrows bigint;
+  mode     text; iters int; us numeric; mvrows bigint;
   keymaxv  bigint;
 BEGIN
   SELECT * INTO w FROM bench_workload WHERE id = current_setting('opt.workload');
@@ -94,21 +95,16 @@ BEGIN
       CONTINUE WHEN scope IS NULL OR scope = 0;
       CONTINUE WHEN scope * 100 / GREATEST(mvrows, 1) >= 90;
 
-      FOREACH path IN ARRAY ARRAY['off','on'] LOOP
-        EXECUTE 'SET matview_partial_refresh_querytree = ' || path;
-        FOREACH mode IN ARRAY ARRAY['auto','force_generic_plan'] LOOP
-          EXECUTE 'SET plan_cache_mode = ' || mode;
-          -- aim for ~200 ms of measurement, between 3 and 60 iterations
-          iters := 20;
-          us := public.opt_time(pred, 3);
-          iters := GREATEST(3, LEAST(60, (200000 / GREATEST(us, 1))::int));
-          us := public.opt_time(pred, iters);
-          INSERT INTO public.opt_result(workload, predshape, span, scope_rows, path,
-                                 variant, iters, us)
-            VALUES (w.id, shape, span, scope,
-                    CASE path WHEN 'on' THEN 'querytree' ELSE 'spi' END,
-                    mode, iters, us);
-        END LOOP;
+      FOREACH mode IN ARRAY ARRAY['auto','force_generic_plan'] LOOP
+        EXECUTE 'SET plan_cache_mode = ' || mode;
+        -- aim for ~200 ms of measurement, between 3 and 60 iterations
+        iters := 20;
+        us := public.opt_time(pred, 3);
+        iters := GREATEST(3, LEAST(60, (200000 / GREATEST(us, 1))::int));
+        us := public.opt_time(pred, iters);
+        INSERT INTO public.opt_result(workload, predshape, span, scope_rows, path,
+                               variant, iters, us)
+          VALUES (w.id, shape, span, scope, 'querytree', mode, iters, us);
       END LOOP;
       RESET plan_cache_mode;
     END LOOP;
@@ -116,4 +112,3 @@ BEGIN
 END $outer$;
 
 RESET plan_cache_mode;
-RESET matview_partial_refresh_querytree;

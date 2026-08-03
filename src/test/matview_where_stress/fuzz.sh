@@ -520,11 +520,13 @@ SQL
     # element and says so, by name.  Run both; expect the second to be the one
     # that fires.  matview_where_cache Test 5 records the same asymmetry.
     #
-    # The GUC has to be set explicitly: it boots false, and a version of this
-    # mode that forgot ran clean against a build with the guard removed.
-    for arm in off on; do
+    # This used to run two arms, one per implementation, and only the
+    # Query-tree one could fire -- R30 caught C2 at 49-50 of 100 there and never
+    # in the other.  The text implementation is gone, so the surviving arm is
+    # the one that always did the detecting; the iteration count halves and the
+    # detection does not.
+    for arm in on; do
         : > "$WORKDIR/n-$arm.sql"
-        echo "SET matview_partial_refresh_querytree = $arm;" >> "$WORKDIR/n-$arm.sql"
         i=0
         while [ "$i" -lt "$ITER" ]; do
             # Vary the scope so adjacent sessions do not settle into lockstep,

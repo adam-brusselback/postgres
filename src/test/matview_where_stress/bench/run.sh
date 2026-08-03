@@ -14,13 +14,16 @@
 #   --scales     100000,1000000             base table rows
 #   --groups     1000                       distinct key values
 #   --spans      1,10,100                   keys per refresh
-#   --forms      conc,bare                  conc | bare | spi | querytree | qtopt
-#                                           spi and querytree are both direct
-#                                           modification, with the Query-tree
-#                                           implementation off and on.  Measure
-#                                           them against each other on ONE
-#                                           binary: that is the whole comparison,
-#                                           and it removes build variance from it.
+#   --forms      conc,bare                  conc | bare | opt
+#                                           conc and bare are the two spellings;
+#                                           routing is by unique-index count, so on
+#                                           a matview with one they are the same
+#                                           algorithm.  opt is conc with the row
+#                                           comparison on.  `spi` and `querytree`
+#                                           named the two implementations of direct
+#                                           modification and are GONE with the text
+#                                           path; naming one now is an error rather
+#                                           than a silent duplicate measurement.
 #   --shapes     key,array,range            predicate shape
 #   --clients    1,4,16                     concurrent sessions
 #   --overlap    disjoint,hot               disjoint scopes, or all fighting
@@ -190,14 +193,19 @@ for w in $(list "$WORKLOADS"); do
      # modification; spi and querytree additionally pin which implementation of
      # it runs, so the two can be measured against each other on one binary.
      CONC=$([ "$form" = bare ] && echo '' || echo 'CONCURRENTLY ')
-     QT=$(case "$form" in querytree|qtopt) echo on;; spi) echo off;; *) echo '';; esac)
-     OPT=$(case "$form" in qtopt) echo on;; querytree|spi) echo off;; *) echo '';; esac)
+     case "$form" in
+       spi|querytree|qtopt)
+         echo "form '$form' no longer exists: it named one of the two" >&2
+         echo "implementations of direct modification, and the text one is gone." >&2
+         echo "Use conc, bare or opt." >&2
+         exit 2 ;;
+     esac
+     OPT=$(case "$form" in opt) echo on;; conc|bare) echo off;; *) echo '';; esac)
      for nc in $(list "$CLIENTS"); do
       for ov in $(list "$OVERLAP"); do
        S="$TMP/s.bench"
        {
          echo "SET synchronous_commit = $SYNC;"
-         [ -n "$QT" ] && echo "SET matview_partial_refresh_querytree = $QT;"
          [ -n "$OPT" ] && echo "SET matview_partial_refresh_optimized = $OPT;"
          if [ "$ov" = disjoint ]; then
            echo "\\set slice greatest(1, :keymax / :nclients)"

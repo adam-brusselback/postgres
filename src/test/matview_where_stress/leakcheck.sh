@@ -69,7 +69,7 @@ PSQL="$PREFIX/bin/psql -p $PORT -d $DB -qtAX"
 # Every case runs on the Query-tree path, because that is the only one with a
 # source plansource at all.  With the GUC defaulted off this whole file would
 # measure nothing and report no leak.
-GUCS="SET matview_partial_refresh_querytree = on; SET matview_partial_refresh_optimized = off;"
+GUCS="SET matview_partial_refresh_optimized = off;"
 
 # Counted inside the session under test: a plansource leaked by one backend is
 # invisible to every other one.

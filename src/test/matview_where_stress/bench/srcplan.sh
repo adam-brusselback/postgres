@@ -79,12 +79,13 @@ VACUUM ANALYZE sp_mv;
 SQL
 }
 
-# One session: $REFRESHES refreshes of one scope-1 constant-literal predicate,
-# under one setting of the querytree GUC.  No VACUUM anywhere inside.
+# One session: $REFRESHES refreshes of one scope-1 constant-literal predicate.
+# No VACUUM anywhere inside.  The arm used to select the implementation; there
+# is only one now, and R33/R34's arms were always the cache being off or on
+# (mutations.py C4) rather than this.
 session() {
     arm=$1
     {
-        echo "SET matview_partial_refresh_querytree = $arm;"
         echo "SET matview_partial_refresh_optimized = off;"
         # One statement per line, autocommit: R26's protocol is 300 *committed*
         # refreshes, and R7 puts one-per-transaction 3.5-3.7x from all-in-one at

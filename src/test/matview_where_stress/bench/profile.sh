@@ -5,6 +5,10 @@
 #   ./profile.sh <workload> <shape> <span> [rounds] [seconds] [outdir]
 #   ./profile.sh window range 100 3 15
 #
+# The two arms are the row comparison off and on.  They were the text and
+# Query-tree implementations until the text path was deleted; the rig -- one
+# fixture, alternated arms, validated captures -- is what outlived it.
+#
 # What went wrong the first time, which is why this exists
 # --------------------------------------------------------
 # The first profile of this comparison was taken by starting run.sh for one
@@ -83,7 +87,7 @@ ASSERT=$(psql_c 'SHOW debug_assertions')
 [ -n "$ASSERT" ] || { echo "  server not answering on $PORT" >&2; exit 1; }
 [ "$ASSERT" = off ] || echo "  WARNING: assertions ON; not comparable with -O2 numbers" >&2
 echo "  server up, assertions=$ASSERT"
-echo "  querytree default=$(psql_c 'SHOW matview_partial_refresh_querytree')"
+echo "  optimized default=$(psql_c 'SHOW matview_partial_refresh_optimized')"
 echo "  build: $(psql_c "SELECT setting FROM pg_config() WHERE name='CONFIGURE'")"
 
 # ---- fixture, built once and then left alone ----
@@ -113,18 +117,17 @@ settle() {
 }
 
 script_for() {   # $1 = arm
-    qt=$([ "$1" = querytree ] && echo on || echo off)
+    opt=$([ "$1" = opt ] && echo on || echo off)
     cat > "$OUT/$1.bench" <<EOS
 SET synchronous_commit = off;
-SET matview_partial_refresh_querytree = $qt;
-SET matview_partial_refresh_optimized = off;
+SET matview_partial_refresh_optimized = $opt;
 \\set k random(1, greatest(1, 100 - $SPAN))
 REFRESH MATERIALIZED VIEW CONCURRENTLY bench.mv WHERE $PREDT;
 EOS
     chmod 644 "$OUT/$1.bench"
 }
-script_for spi
-script_for querytree
+script_for noopt
+script_for opt
 
 # ---- one capture: start load, wait for it to be real, record inside it ----
 capture() {   # $1 = arm, $2 = round
@@ -164,19 +167,19 @@ capture() {   # $1 = arm, $2 = round
     return 0
 }
 
-: > "$OUT/spi.folded.raw"; : > "$OUT/querytree.folded.raw"
+: > "$OUT/noopt.folded.raw"; : > "$OUT/opt.folded.raw"
 echo "== capture: $ROUNDS rounds x ${SECS}s per arm, alternating"
 r=0
 while [ $r -lt "$ROUNDS" ]; do
     r=$((r + 1))
     # Flip the order every round so neither arm is always first after settle().
-    if [ $((r % 2)) -eq 1 ]; then a1=spi; a2=querytree; else a1=querytree; a2=spi; fi
+    if [ $((r % 2)) -eq 1 ]; then a1=noopt; a2=opt; else a1=opt; a2=noopt; fi
     capture "$a1" "$r" || true
     capture "$a2" "$r" || true
 done
 
 # ---- sum duplicate stacks, render ----
-for arm in spi querytree; do
+for arm in noopt opt; do
     awk '{c=$NF; $NF=""; sub(/ $/,""); t[$0]+=c} END{for(k in t) print k, t[k]}' \
         "$OUT/$arm.folded.raw" > "$OUT/$arm.folded"
     n=$(awk '{s+=$NF} END{printf "%d", s/1000000}' "$OUT/$arm.folded")
@@ -184,8 +187,8 @@ for arm in spi querytree; do
         --subtitle "-O2 assertions off; $ROUNDS x ${SECS}s alternating; ~${n}ms CPU" \
         --width 1400 "$OUT/$arm.folded" > "$OUT/$arm.svg" 2>/dev/null
 done
-"$FG/difffolded.pl" -n "$OUT/spi.folded" "$OUT/querytree.folded" > "$OUT/diff.folded" 2>/dev/null
-"$FG/flamegraph.pl" --title "Query-tree vs text: differential (red = more in Query-tree)" \
+"$FG/difffolded.pl" -n "$OUT/noopt.folded" "$OUT/opt.folded" > "$OUT/diff.folded" 2>/dev/null
+"$FG/flamegraph.pl" --title "row comparison on vs off: differential (red = more with it on)" \
     --subtitle "$W $SHAPE span $SPAN scope $SCOPE; normalised; alternated $ROUNDS rounds" \
     --width 1400 "$OUT/diff.folded" > "$OUT/diff.svg" 2>/dev/null
 

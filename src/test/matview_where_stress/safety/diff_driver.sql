@@ -88,21 +88,15 @@ BEGIN
       -- shape -- direct modification collides on a non-arbiter index where
       -- match/merge does not.
       BEGIN
-        IF qt_a IS NOT NULL THEN
-          EXECUTE 'SET matview_partial_refresh_querytree = ' || qt_a;
-          IF opt_a IS NOT NULL THEN
-            EXECUTE 'SET matview_partial_refresh_optimized = ' || opt_a;
-          END IF;
+        IF opt_a IS NOT NULL THEN
+          EXECUTE 'SET matview_partial_refresh_optimized = ' || opt_a;
         END IF;
         EXECUTE 'REFRESH MATERIALIZED VIEW ' || conc_a || 'probe.mv_a WHERE ' || m.pred;
       EXCEPTION WHEN OTHERS THEN ea := ea + 1;
       END;
       BEGIN
-        IF qt_b IS NOT NULL THEN
-          EXECUTE 'SET matview_partial_refresh_querytree = ' || qt_b;
-          IF opt_b IS NOT NULL THEN
-            EXECUTE 'SET matview_partial_refresh_optimized = ' || opt_b;
-          END IF;
+        IF opt_b IS NOT NULL THEN
+          EXECUTE 'SET matview_partial_refresh_optimized = ' || opt_b;
         END IF;
         EXECUTE 'REFRESH MATERIALIZED VIEW ' || conc_b || 'probe.mv_b WHERE ' || m.pred;
       EXCEPTION WHEN OTHERS THEN eb := eb + 1;

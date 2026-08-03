@@ -79,7 +79,6 @@ $Q -c "CREATE OR REPLACE FUNCTION public.one_refresh(p_opt text, p_pred text)
                stmt text := 'REFRESH MATERIALIZED VIEW CONCURRENTLY bench.mv WHERE '
                             || p_pred;
        BEGIN
-         EXECUTE 'SET matview_partial_refresh_querytree = on';
          EXECUTE 'SET matview_partial_refresh_optimized = ' || p_opt;
          t0 := clock_timestamp();
          EXECUTE stmt;

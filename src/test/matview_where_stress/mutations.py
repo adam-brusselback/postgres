@@ -133,13 +133,13 @@ MUTATIONS = {
     # That is exactly why it belongs here.  A test that turns the optimisation
     # on and then only reads values back cannot tell the optimisation from its
     # absence, and would pass unchanged on a tree where it had silently stopped
-    # applying.  The realistic accident is small: use_optimized is an && of two
-    # GUCs, and a rewrite that drops one of them leaves all the code in place
-    # and none of it reachable.
+    # applying.  The realistic accident is small: a rewrite that stops threading
+    # the flag through leaves all the code in place and none of it reachable.
+    # It was smaller still when use_optimized was an && of two GUCs and dropping
+    # either one did it; the text path is gone and only one remains.
     'O1': ('-', 'perf',
            'the row comparison is never emitted (optimisation silently off)', [
-               ('\tbool\t\tuse_optimized = matview_partial_refresh_querytree &&\n'
-                '\t\tmatview_partial_refresh_optimized;',
+               ('\tbool\t\tuse_optimized = matview_partial_refresh_optimized;',
                 '\tbool\t\tuse_optimized = false;\t/* O1 */'),
            ]),
 

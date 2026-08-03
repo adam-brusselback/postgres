@@ -323,13 +323,12 @@ BEGIN
   stmt := 'REFRESH MATERIALIZED VIEW CONCURRENTLY bench.mv WHERE ' || pred;
 
   -- BOTH GUCs.  use_optimized in matview.c is
-  --     matview_partial_refresh_querytree && matview_partial_refresh_optimized
+  --     matview_partial_refresh_optimized
   -- so with querytree off the optimized flag changes nothing: both arms emit
   -- byte-identical SQL, the cache key matches so there is not even a replan,
   -- and the sweep reports a tidy ~0% across every churn level for an
   -- optimization it never enabled.  That is what this file did on its first
   -- clean run, and the answer looked entirely plausible.
-  EXECUTE 'SET matview_partial_refresh_querytree = on';
   EXECUTE 'SET matview_partial_refresh_optimized = ' ||
           CASE WHEN current_setting('churn.optimized')::bool THEN 'on' ELSE 'off' END;
 

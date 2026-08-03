@@ -68,7 +68,6 @@ $Q -c "CREATE OR REPLACE FUNCTION real_time(p_opt text, p_pred text)
        DECLARE t0 timestamptz; best numeric; us numeric; i int;
                stmt text := 'REFRESH MATERIALIZED VIEW CONCURRENTLY bench.mv WHERE ' || p_pred;
        BEGIN
-         EXECUTE 'SET matview_partial_refresh_querytree = on';
          EXECUTE 'SET matview_partial_refresh_optimized = ' || p_opt;
          FOR i IN 1..3 LOOP EXECUTE stmt; END LOOP;
          FOR i IN 1..5 LOOP
