@@ -969,8 +969,8 @@ optimise away. Close it and stop treating it as a lead.
     psql -f loop.sql
     SELECT calls FROM pg_stat_statements WHERE query LIKE '%pg_rewrite%';   -- 1
 
-**3.2 Parameterise predicate `Const`s. The largest single number here, and the
-one the benchmark has been measuring without saying so.** The cache is keyed on
+**3.2 Parameterise predicate `Const`s. DONE.  The largest single number here,
+and the one the benchmark was measuring without saying so.** The cache is keyed on
 the deparsed predicate text, so a literal that varies per call misses it every
 time. Re-measured on `-O2` after 2.1, in-backend, 300 scope-1 refreshes of
 `projection`:
@@ -991,6 +991,46 @@ awkward one:
   every run recorded so far is on the miss path. The suite has been measuring
   the 546 µs case exclusively and reporting it as the cost of a partial
   refresh. Fix the benchmark before optimising against it — see 3.6.
+
+**Implemented**, `parameterizeRefreshWhereClause()` between the transform and
+the deparse: each `Const` becomes a `Param` of the same type, typmod and
+collation, and the values ride the `ParamListInfo` the path already carried for
+a caller who bound one.  Before the deparse, because the deparsed text is the
+cache key and the tree is what the source query executes — rewriting one and
+not the other leaves them disagreeing about which rows the predicate selects.
+`PARAM_FLAG_CONST` is set, so `eval_const_expressions()` folds the value back
+in when plancache builds a custom plan and that plan is exactly the plan the
+literal used to get.  Which plan gets used stays plancache's decision; forcing
+generic was measured at 21.7% slower net over 94 comparisons (R1).
+
+**Measured across shape and span as R37: 40 paired cells, all 40 faster**, by
+0.3% to 45.3%, saving 40 to 1053 µs.  The saving is a fixed cost, so the
+percentage reports how cheap the refresh is rather than how much work was
+removed.  Two things the sweep settled that reasoning had not:
+
+- **`range` is the weak shape, and 4.1 predicted it.**  +9.9% averaged over 17
+  cells against +25.5% for `key`.  For a narrow range predicate the generic
+  estimate assumes a wide range, so the custom plan always wins on estimated
+  cost and the statement re-plans on every execution — which keeps the
+  parse-and-analyse saving and loses the planning one.  Still a win, a smaller
+  one.
+- **Nothing degrades as the scope grows.**  The risk was a *proportional* plan
+  penalty overtaking a *fixed* saving; at scope 10,000 on `nonkey` the refresh
+  is ~50 ms and the saving is still positive.
+
+Two cells of the measurement are worth keeping as method.  The `--predmode`
+axis was measuring the **literal** path for the `array` and `initplan` shapes
+(**B33**) — found because array and key disagreed, which a single-shape sweep
+would not have shown.  And `timerange` read four cells negative at `--repeat 4`
+and all five positive at `--repeat 8`, its own literal arm having drifted 8–22%
+between the two runs on one build and one boot.
+
+**Still open**, and both tracked rather than assumed away: a caller who repeats
+the *same* literal used to get `params == NULL` and therefore one specialised
+plan forever, and now goes through the custom-versus-generic comparison like
+anyone else; and every workload here has uniformly distributed keys, so nothing
+yet measures a skewed column where a generic plan is genuinely wrong.
+`bench/predskew.sh` exists for the second.
 
 **3.3 Revisit the rowcount wrapper.** 4% for reporting, and B8 is being changed
 anyway to unify the count across both forms. Worth doing at the same time.

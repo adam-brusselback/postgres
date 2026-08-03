@@ -107,3 +107,43 @@ reader can see rather than something absent from a table.
  timerange | range |   10 |       2000 | 14.276 | 14.327 |       -0.4
 (4 rows)
 
+
+---
+
+## timerange, re-probed
+
+The four slower cells in the table above are all `timerange`, and they did not
+survive.  Re-run alone at `--repeat 8 --time 12`, both arms paired, same build
+and same boot:
+
+| shape | span | scope | literal ms | param ms | pct | saving us |
+|---|---|---|---|---|---|---|
+| array | 1 | 200 | 2.725 | 2.011 | **+26.2** | 714 |
+| array | 10 | 2000 | 15.399 | 14.594 | **+5.2** | 805 |
+| key | 1 | 200 | 2.730 | 2.211 | **+19.0** | 519 |
+| range | 1 | 200 | 2.371 | 1.965 | **+17.1** | 406 |
+| range | 10 | 2000 | 15.610 | 14.557 | **+6.7** | 1053 |
+
+Every one positive, where the sweep read -10.1, -2.3, -4.3, +10.4 and -0.4.
+
+Two things say this is the workload's noise rather than a change in the answer,
+and they were both visible before the param arm ran:
+
+- **The sweep contradicted itself within the workload.**  `key`/1 read -10.1%
+  and `range`/1 read +10.4% at the *same* 200-row scope with near-identical
+  selectivity.  A twenty-point spread between two cells that differ in nothing
+  the change touches is noise; a mechanism would move them together.
+- **The literal arm -- the one nothing changed about -- drifted 8-22% between
+  the two runs**, an hour apart on one build and one boot: key/1 2.305 -> 2.730,
+  array/1 2.237 -> 2.725, array/10 14.216 -> 15.399.  The effect under test was
+  0.4-10.1%, well inside that.
+
+RESULTS.md R35 already carried this workload as the noise-limited one, with a
++0.0% reading over five cells that re-measured at +7.8% on the same build and
+boot, and with absolute latencies moving up to 20% between runs on both arms.
+The right conclusion is not that `timerange` is special but that **five samples
+of ten seconds does not resolve a sub-millisecond effect on a 2-15 ms cell**,
+and this workload is where that bites first.
+
+So the sweep's verdict, with those five cells replaced: **40 paired cells, all
+40 faster**, by 0.3% to 45.3%, saving 40 to 1053 us.
