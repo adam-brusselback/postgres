@@ -1440,6 +1440,41 @@ control that reads zero; **R43** is the concurrency case and its detector.
 refresh, inside the 4.3 µs the Query-tree path does not otherwise account for.
 Small, and cheap to do while touching that code for 3.7.
 
+## Every code candidate, closed positive or negative
+
+Written because "we glossed over it" is not something a reader can check.  Every
+numbered candidate in Phases 3 and 4, plus the untracked items, with a verdict
+and what produced it.  **No row is left as "listed".**
+
+| item | verdict | on what evidence |
+|---|---|---|
+| 3.1 commit-per-refresh cliff | **CLOSED, hypothesis wrong** | 300 committed refreshes call `pg_get_viewdef` once, not 300 times.  The 12× is the commit |
+| 3.2 parameterise `Const`s | **DONE** | R15, R37, R40, R41 |
+| 3.3 rowcount wrapper | **CLOSED, not removable** | it *is* the rowcount `SetQueryCompletion()` reports, which B8 made part of the command's contract.  Its old 4% was 1.6 µs of a 41.5 µs statement on superseded code and is below this suite's floor now |
+| 3.4 two-implementation question | **CLOSED** | R9: no crossover.  Match/merge keeps its place as a capability boundary, not a performance one |
+| 3.5 re-run the on-list benchmark | **DONE** | R51 |
+| 3.6 `--predmode` axis | **DONE**, and B33 found the axis measuring the wrong path for two shapes | R37 |
+| 3.7 cache the source plan | **DONE** | R34: 54.25 µs deficit to 0.38 |
+| 3.8 stop deparsing for the key | **DONE** | R48, R49 |
+| 3.9 arbiter index re-derived per refresh | **CLOSED, negative** | still per refresh, and profiled at **0.03 µs**.  Nothing to win |
+| 3.10 cache sweep walks every entry | **CLOSED as a cost, negative** | profiled at **0.00 µs**.  Its *correctness* half was closed differently — B14's depth guard, not by narrowing the sweep — and narrowing it now would reopen B7, which is the only thing reclaiming a dropped matview's plans (CACHE.md §4) |
+| 3.11 ENR claims the whole matview's row count | **CLOSED, negative, and the error's direction is protective** | tested by making the estimate wrong the *other* way (`enrtuples = 1`) in the cells where the anti-join actually runs — `CONCURRENTLY` at scope 1000 and 10000, and a non-key predicate.  All three got **worse**: 23.878 → 25.898, 2.632 → 2.766, 2.910 → 3.355 ms.  An overestimate biases toward a hash anti-join, which is right at the scales where the prune costs anything; the "hundred-thousand-fold" framing only holds at scope 1, where the prune is elided or trivial.  Correcting it would be neutral at best.  **First attempt at this experiment measured a bare key-range refresh, where R42's elision means the anti-join never runs at all** — the estimate could not have mattered in the cell chosen to test it |
+| 3.12 fold the locking `SELECT` in | **CLOSED, negative** | guarded by A3, P1 and P2, and the prize is 6.5 µs of 33.  Recommended against when written and nothing since changes that |
+| 4.1 fused statement re-plans under a bound parameter | **CLOSED, rejected** | R1: forcing generic is 21.7% slower net.  The narrow-range re-plan is core plancache behaviour, ~0.25 ms fixed, and needs a fix narrower than anything one-line (R51) |
+| 4.2 suppress the write when nothing changed | **DONE, on by default** | R45, R46, R47 |
+| 4.3 re-profile at scale | **DONE** | the ranking inverts; the DML is 87% at scope 10000 |
+| 4.4 the scope is scanned twice | **HALF DONE, remainder OPEN and narrow** | 4.6 removes the second scan on the bare form with a key-only predicate and nothing orphaned.  What is left is `CONCURRENTLY`, a non-key predicate, or a real deletion — and there the second scan is what *decides* the deletion, so reusing the first means materialising it, which is the cost being avoided.  **Recommend not pursuing**; recorded as a real question, not as work owed |
+| 4.5 `FOR NO KEY UPDATE` | **DONE** | R17's neighbour: identical acquisition cost, fewer conflicts |
+| 4.6 skip the prune when it cannot delete | **DONE** | R42, R43 |
+| 4.7 reuse the tuplestore and tupdesc | **CLOSED, negative** | it lives in the profile's unaccounted residual, and that residual is **−1.49 µs** — under the timer's resolution.  There is no ceiling to win |
+| `append_only` / `DO NOTHING` | **OPEN, needs a decision not code** | the only thing in the design that cannot be derived: no count taken during a refresh proves existing rows never need rewriting.  It is a reloption, which is user-visible surface that is hard to withdraw, and SPECIALIZE.md §2 Tier 4 argues against adding it |
+| B2 invalidation restructure | **OPEN, reachability unestablished** | CACHE.md §4 lists four things it must solve, and the demonstrable route was the view definition *as text* — which the text path's deletion may have closed by subtraction.  **Establish whether it is still reachable before writing anything** |
+
+Two things this audit changed rather than merely recorded: 3.11 and 4.7 were
+both carrying "not measured" and are now measured and closed, and 3.11's first
+experiment was invalid for a reason worth keeping — it tested the estimate in a
+cell where the code path it feeds does not execute.
+
 ## Phase 3 is a loop, not a pass
 
 Optimise, run the fuzzer, run the static gates, measure. Any divergence stops
