@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Re-introduce known bugs into matview.c, one at a time.
 
-    ./mutations.py B4          apply
-    ./mutations.py pristine    restore
-    ./mutations.py --list      show the corpus
-    ./mutations.py --check     verify every mutation still applies
+    ./mutations.py B4            apply
+    ./mutations.py pristine      restore
+    ./mutations.py --list        show the corpus
+    ./mutations.py --check       verify every mutation still applies
+    ./mutations.py --overlay=B4  apply on top of the working tree, not HEAD
 
 Pristine is defined as `git show HEAD:src/backend/commands/matview.c`, not as a
 copy kept somewhere.  A copy is a thing that can drift from what it claims to be
@@ -332,6 +333,38 @@ MUTATIONS = {
            '(same-shaped predicates on different columns share plans)', [
                ('\t\tequal(cacheEntry->qual, qual) &&\n',
                 '\t\tnodeTag(cacheEntry->qual) == nodeTag(qual) &&\n', 1),
+           ]),
+
+    # The measurement's off arm, and perf-only: deparsing on every refresh and
+    # throwing the string away is exactly what the code did before the elision,
+    # and every answer it gives is still right.  Same shape as C4, N3 and O1 --
+    # an optimisation switched off with nothing else touched, so the two arms
+    # differ by the one thing being measured.
+    #
+    # It reproduces the cost rather than the old code: the old code's string was
+    # then read by a strcmp that the tree comparison replaces.  So this measures
+    # the deparse alone and not (deparse + strcmp - equal), which is the right
+    # thing to measure -- the deparse is what was removed -- and worth stating
+    # because it makes the arm a lower bound on the saving by whatever the two
+    # comparisons differ by.
+    #
+    # It sits immediately before the cache-key comparison, which is where the
+    # string it produces used to be consumed.  That position is load-bearing and
+    # was wrong once: the first version put it beside the lock-level check at
+    # the top of the function, which is BEFORE profile.py starts MVP_TOTAL, so
+    # the instrument could not see the one thing the arm exists to add.  Both
+    # arms then measured the same work and read 8.2% apart on build noise alone
+    # (RESULTS.md X19).  Anywhere inside the timed region measures the same
+    # quantity -- a deparse costs what it costs -- but only inside.
+    'C9': ('-', 'perf',
+           'the predicate is deparsed on every refresh again '
+           '(the elision silently off)', [
+               ('\tif (found &&\n'
+                '\t\tcacheEntry->uniqueIndexOid == uniqueIndexOid &&',
+                '\tpfree(deparseRefreshWhereClause(matviewOid, qual));\n'
+                '\tif (found &&\n'
+                '\t\tcacheEntry->uniqueIndexOid == uniqueIndexOid &&',
+                1),
            ]),
 
     # The leak, as distinct from C3's crash.  C3 keeps the old plansource *and*
@@ -742,6 +775,37 @@ def main():
 
     if name == '--check':
         sys.exit(check_all())
+
+    # --overlay applies a mutation to the file AS IT STANDS instead of to HEAD,
+    # which is the only way a mutation and profile.py's instrumentation can be
+    # in one binary: both of those write the whole file from `git show HEAD:`,
+    # so applying either one undoes the other, silently and with a green build.
+    #
+    # It exists for the measurement harnesses, where the off arm has to be
+    # "instrumented, with the optimisation switched off" -- bench/deparse.sh is
+    # the caller.  The edits and their occurrence counts are the same ones
+    # --check verifies, so a pattern that has drifted is still loud here.
+    #
+    # It does not call refuse_if_uncommitted(), and that is the point rather
+    # than an oversight: the file it is handed is deliberately not one of the
+    # variants.  Nothing is lost that was not already at risk -- restoring still
+    # goes through HEAD, exactly as before -- but an overlaid tree is not a tree
+    # to commit from, so say so on the way out.
+    if name == '--overlay':
+        sys.exit('--overlay needs a mutation name')
+    overlay = name.startswith('--overlay=')
+    if overlay:
+        name = name[len('--overlay='):]
+        if name not in MUTATIONS:
+            sys.exit(f'unknown mutation {name}; try --list')
+        issue, needs, desc, edits = MUTATIONS[name]
+        with open(TARGET) as f:
+            src = apply_edits(f.read(), edits, name)
+        with open(TARGET, 'w') as f:
+            f.write(src)
+        print(f'{name} overlaid on the working tree ({issue}, needs {needs}): '
+              f'{desc}')
+        return
 
     if not force:
         refuse_if_uncommitted()
