@@ -51,7 +51,7 @@ CREATE UNIQUE INDEX ON ct_mv(id);
 --
 UPDATE ct_base SET val = val + 1 WHERE id <= 6;
 
-REFRESH MATERIALIZED VIEW ct_mv WHERE id <= 6;
+REFRESH MATERIALIZED VIEW CONCURRENTLY ct_mv WHERE id <= 6;
 
 SELECT count(*) AS p1_bare_in_scope_differs_from_view
   FROM ((SELECT id, grp, val FROM ct_mv WHERE id <= 6)
@@ -79,7 +79,7 @@ SELECT count(*) AS p1_conc_in_scope_differs_from_view
 --
 UPDATE ct_base SET val = 999 WHERE id > 6;
 
-REFRESH MATERIALIZED VIEW ct_mv WHERE id <= 6;
+REFRESH MATERIALIZED VIEW CONCURRENTLY ct_mv WHERE id <= 6;
 
 SELECT count(*) AS p2_out_of_scope_rows_changed
   FROM ct_mv WHERE id > 6 AND val = 999;
@@ -108,7 +108,7 @@ SELECT count(*) AS p3_initial FROM ct_act_mv;
 
 UPDATE ct_act SET state = 'off' WHERE id = 1;
 
-REFRESH MATERIALIZED VIEW ct_act_mv WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY ct_act_mv WHERE id = 1;
 
 -- id 1 has left the view's scope, so it must be gone; id 2 must remain.
 SELECT id FROM ct_act_mv ORDER BY id;
@@ -118,7 +118,7 @@ SELECT id FROM ct_act_mv ORDER BY id;
 --
 UPDATE ct_act SET state = 'on' WHERE id = 3;
 
-REFRESH MATERIALIZED VIEW ct_act_mv WHERE id = 3;
+REFRESH MATERIALIZED VIEW CONCURRENTLY ct_act_mv WHERE id = 3;
 
 SELECT id FROM ct_act_mv ORDER BY id;
 
@@ -165,7 +165,7 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY ct_null_mv WHERE id IS NULL;
 
 SELECT count(*) AS p6_after_two_concurrent_noops FROM ct_null_mv;
 
-REFRESH MATERIALIZED VIEW ct_null_mv WHERE id IS NULL;
+REFRESH MATERIALIZED VIEW CONCURRENTLY ct_null_mv WHERE id IS NULL;
 
 SELECT count(*) AS p6_after_bare_noop FROM ct_null_mv;
 
@@ -188,7 +188,7 @@ CREATE UNIQUE INDEX ON ct_agree_b(grp);
 
 UPDATE ct_agree SET val = val * 2 WHERE grp = 1;
 
-REFRESH MATERIALIZED VIEW ct_agree_a WHERE grp = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY ct_agree_a WHERE grp = 1;
 REFRESH MATERIALIZED VIEW CONCURRENTLY ct_agree_b WHERE grp = 1;
 
 SELECT count(*) AS p7_forms_disagree

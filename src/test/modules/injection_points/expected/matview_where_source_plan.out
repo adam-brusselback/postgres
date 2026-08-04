@@ -59,14 +59,14 @@ CREATE UNIQUE INDEX ON mvsp (id);
 --
 -- Let plancache make its choice, unwatched.
 UPDATE mvsp_base SET v = 101 WHERE id = 1;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 1;
 SELECT injection_points_attach('matview-where-source-planned', 'notice');
  injection_points_attach 
 -------------------------
@@ -76,9 +76,9 @@ SELECT injection_points_attach('matview-where-source-planned', 'notice');
 -- Now the plan must be reused.  No notice may appear here.  This is the
 -- assertion; everything above it is setup.
 UPDATE mvsp_base SET v = 102 WHERE id = 1;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 1;
 UPDATE mvsp_base SET v = 103 WHERE id = 1;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 1;
 SELECT id, v FROM mvsp ORDER BY id;
  id |  v  
 ----+-----
@@ -97,7 +97,7 @@ SELECT id, v FROM mvsp ORDER BY id;
 -- wrong answer, not a slow one.  The notice must come back.
 ALTER TABLE mvsp_base ADD COLUMN filler int;
 UPDATE mvsp_base SET v = 104 WHERE id = 1;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 1;
 NOTICE:  notice triggered for injection point matview-where-source-planned
 SELECT injection_points_detach('matview-where-source-planned');
  injection_points_detach 
@@ -119,14 +119,14 @@ SELECT injection_points_detach('matview-where-source-planned');
 -- Settle again first: part 2 invalidated the entry, so the plansource below is
 -- a new one with its own comparison to make.
 UPDATE mvsp_base SET v = 201 WHERE id = 1;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 2;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 3;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 4;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 5;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 2;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 3;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 2;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 3;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 4;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 5;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 2;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 3;
 SELECT injection_points_attach('matview-where-source-planned', 'notice');
  injection_points_attach 
 -------------------------
@@ -139,11 +139,11 @@ SELECT injection_points_attach('matview-where-source-planned', 'notice');
 -- matview-where-source-planned", because each is then a different cache key and
 -- gets a whole new plansource.
 UPDATE mvsp_base SET v = 202 WHERE id = 1;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 1;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 2;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 3;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 4;
-REFRESH MATERIALIZED VIEW mvsp WHERE id = 5;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 2;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 3;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 4;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsp WHERE id = 5;
 SELECT id, v FROM mvsp ORDER BY id;
  id |  v  
 ----+-----

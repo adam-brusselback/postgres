@@ -369,20 +369,10 @@ SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 -- Track the total number of rows affected by a partial
 -- REFRESH MATERIALIZED VIEW
 --
--- A partial refresh reports the number of rows it wrote to the matview.  Two
--- algorithms can do that work and they reach the same end state by different
--- means, so one logical change costs a different number of writes under each:
--- match/merge applies a changed row as a delete plus an insert, while the
--- upsert updates it in place.  Rows that simply disappear cost one write
--- either way.
---
--- Which algorithm runs is decided by how many unique indexes the matview
--- carries, and not by whether CONCURRENTLY was written.  With one unique index
--- both spellings take the upsert and both report the same count, which is what
--- says the spelling is not what decides it.  A matview with a second unique
--- index needs match/merge -- the upsert arbitrates on a single index and cannot
--- delete before it inserts -- and only the bare spelling can serve it, so that
--- shape appears once below rather than twice.
+-- A partial refresh reports the number of rows it wrote to the matview, which
+-- is not the number of rows its predicate selected: a row already holding the
+-- right values is not rewritten, and a row the defining query no longer
+-- produces costs a delete rather than an update.
 --
 -- Disposition: keep.  This belongs with the rows-tracking cases above; the
 -- count is part of the command's contract, not scaffolding.
@@ -393,28 +383,18 @@ CREATE UNIQUE INDEX ON pgss_pr_matv (a);
 UPDATE pgss_pr_base SET b = 'w' WHERE a <= 3;
 DELETE FROM pgss_pr_base WHERE a >= 9;
 
--- The second unique index is on a column the updates below leave alone, so it
--- changes which algorithm runs and nothing else.
-CREATE TABLE pgss_pr_base2 AS
-  SELECT a, a * 100 AS c, 'v'::text AS b FROM generate_series(1, 10) a;
-CREATE MATERIALIZED VIEW pgss_pr_matv2 AS SELECT a, c, b FROM pgss_pr_base2;
-CREATE UNIQUE INDEX ON pgss_pr_matv2 (a);
-CREATE UNIQUE INDEX ON pgss_pr_matv2 (c);
-UPDATE pgss_pr_base2 SET b = 'w' WHERE a <= 3;
-
 SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
--- One unique index, so both spellings take the upsert: three changed rows are
--- updated in place, so 3 writes each.
-REFRESH MATERIALIZED VIEW pgss_pr_matv WHERE a <= 3;
+-- Three changed rows are updated in place, so 3 writes.
+REFRESH MATERIALIZED VIEW CONCURRENTLY pgss_pr_matv WHERE a <= 3;
 -- ... and two vanished rows cost 2 deletes.
-REFRESH MATERIALIZED VIEW pgss_pr_matv WHERE a >= 9;
+REFRESH MATERIALIZED VIEW CONCURRENTLY pgss_pr_matv WHERE a >= 9;
+-- Changing them again costs the same 3, so the count tracks the work rather
+-- than the scope.
 UPDATE pgss_pr_base SET b = 'x' WHERE a <= 3;
 REFRESH MATERIALIZED VIEW CONCURRENTLY pgss_pr_matv WHERE a <= 3;
-
--- Two unique indexes, so this takes match/merge: the same three changed rows
--- become 3 deletes plus 3 inserts, so 6 writes for the change that cost 3 above.
-REFRESH MATERIALIZED VIEW pgss_pr_matv2 WHERE a <= 3;
+-- Repeating that refresh with nothing changed writes nothing at all.
+REFRESH MATERIALIZED VIEW CONCURRENTLY pgss_pr_matv WHERE a <= 4;
 
 SELECT calls, rows, query FROM pg_stat_statements
   WHERE query LIKE 'REFRESH MATERIALIZED VIEW%pgss_pr_matv%'
@@ -422,8 +402,6 @@ SELECT calls, rows, query FROM pg_stat_statements
 
 DROP MATERIALIZED VIEW pgss_pr_matv;
 DROP TABLE pgss_pr_base;
-DROP MATERIALIZED VIEW pgss_pr_matv2;
-DROP TABLE pgss_pr_base2;
 
 SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 

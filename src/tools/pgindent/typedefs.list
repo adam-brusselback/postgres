@@ -2587,7 +2587,6 @@ RecursiveUnion
 RecursiveUnionPath
 RecursiveUnionState
 RefetchForeignRow_function
-RefreshKeyOnlyContext
 RefreshMatViewStmt
 RefreshParamizeContext
 RegProcedure

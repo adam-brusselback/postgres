@@ -406,7 +406,7 @@ UPDATE mv_c7_base SET v = 1;
 
 -- Warm the entry.  Schema-qualified because REFRESH runs under a restricted
 -- search_path.
-REFRESH MATERIALIZED VIEW mv_c7 WHERE public.mv_c7_pred(id);
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c7 WHERE public.mv_c7_pred(id);
 SELECT * FROM mv_c7 ORDER BY id;
 
 -- Rename the predicate's function and give a different one the old name.  This
@@ -420,7 +420,7 @@ UPDATE mv_c7_base SET v = 2;
 
 -- The same function as the warm call, under its new name.  Rows 1 and 2 must
 -- move; row 3 must be left alone and must still be there.
-REFRESH MATERIALIZED VIEW mv_c7 WHERE public.mv_c7_pred2(id);
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_c7 WHERE public.mv_c7_pred2(id);
 SELECT * FROM mv_c7 ORDER BY id;
 
 DROP MATERIALIZED VIEW mv_c7;

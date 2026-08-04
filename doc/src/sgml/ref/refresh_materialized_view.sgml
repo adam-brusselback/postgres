@@ -22,7 +22,9 @@ PostgreSQL documentation
  <refsynopsisdiv>
 <synopsis>
 REFRESH MATERIALIZED VIEW [ CONCURRENTLY ] <replaceable class="parameter">name</replaceable>
-    [ WITH [ NO ] DATA ] [ WHERE <replaceable class="parameter">condition</replaceable> ]
+    [ WITH [ NO ] DATA ]
+REFRESH MATERIALIZED VIEW CONCURRENTLY <replaceable class="parameter">name</replaceable>
+    WHERE <replaceable class="parameter">condition</replaceable>
 </synopsis>
  </refsynopsisdiv>
 
@@ -51,6 +53,8 @@ REFRESH MATERIALIZED VIEW [ CONCURRENTLY ] <replaceable class="parameter">name</
    present in the underlying base tables (or no longer match the query definition)
    are deleted. New rows from the base tables that match the condition are inserted.
    Rows in the materialized view that do not match the condition are left unchanged.
+   A partial refresh modifies rows in place rather than replacing the
+   materialized view's contents, so <literal>CONCURRENTLY</literal> is required.
    The <literal>WHERE</literal> clause cannot be used with <literal>WITH NO DATA</literal>.
   </para>
  </refsect1>
@@ -82,7 +86,9 @@ REFRESH MATERIALIZED VIEW [ CONCURRENTLY ] <replaceable class="parameter">name</
      </para>
      <para>
       Even with this option only one <literal>REFRESH</literal> at a time may
-      run against any one materialized view.
+      run against any one materialized view.  A partial refresh is the
+      exception: refreshes whose <literal>WHERE</literal> clauses select
+      disjoint sets of rows run concurrently with each other.
      </para>
     </listitem>
    </varlistentry>
@@ -165,36 +171,25 @@ REFRESH MATERIALIZED VIEW [ CONCURRENTLY ] <replaceable class="parameter">name</
       reaches it far more often.
      </para>
      <para>
-      Two implementations are available, chosen by whether
-      <literal>CONCURRENTLY</literal> is specified.  Both allow concurrent
-      reads throughout, and both require a usable unique index and an already
-      populated materialized view.
-     </para>
-     <para>
-      With <literal>CONCURRENTLY</literal>, rows are modified in place with an
-      upsert under a <literal>ROW EXCLUSIVE</literal> lock.  Refreshes whose
-      predicates cover disjoint rows run in parallel; those that overlap
-      serialize on row locks.  As with ordinary row-level locking, two
-      transactions that refresh overlapping sets of rows in different orders can
-      deadlock, and are reported as such.
+      A partial refresh requires a usable unique index and an already populated
+      materialized view, which are the same preconditions
+      <literal>CONCURRENTLY</literal> imposes on a full refresh.  Rows are
+      modified in place with an upsert under a <literal>ROW EXCLUSIVE</literal>
+      lock, so reads are never blocked and writes to rows the condition does not
+      select are unaffected.  Refreshes whose conditions cover disjoint rows run
+      in parallel; those that overlap serialize on row locks.  As with ordinary
+      row-level locking, two transactions that refresh overlapping sets of rows
+      in different orders can deadlock, and are reported as such.
      </para>
      <para>
       The upsert resolves collisions against a single index, so it cannot apply
       a change that would require deleting one row before inserting another to
       satisfy a <emphasis>second</emphasis> unique index — two rows exchanging
-      their values on one, for instance.  A partial refresh of a materialized
-      view carrying more than one unique index therefore requires the form
-      below, and specifying <literal>CONCURRENTLY</literal> for one is an error
-      rather than a silent change of algorithm.  Dropping the extra unique
-      index, where the materialized view does not need it, makes
-      <literal>CONCURRENTLY</literal> available again.
-     </para>
-     <para>
-      Without <literal>CONCURRENTLY</literal>, the rows matching the condition
-      are compared against freshly computed data and the differences applied,
-      under an <literal>EXCLUSIVE</literal> lock.  Partial refreshes of the same
-      materialized view therefore serialize with each other, and cannot
-      deadlock.
+      their values on one, for instance.  A <literal>WHERE</literal> clause is
+      therefore rejected on a materialized view carrying more than one unique
+      index, rather than failing partway through on whichever change it cannot
+      express.  Refresh such a materialized view in full, or drop the extra
+      unique index where it is not needed.
      </para>
      <para>
       A partial refresh is only proportional to the number of rows it touches if
@@ -211,11 +206,9 @@ REFRESH MATERIALIZED VIEW [ CONCURRENTLY ] <replaceable class="parameter">name</
      <para>
       A partial refresh costs several times more per row than a full rebuild
       does, so beyond some fraction of the materialized view rebuilding it
-      outright is faster.  The two forms differ here: with
-      <literal>CONCURRENTLY</literal> the crossover is around a tenth of the
-      materialized view, and without it around a quarter.  Both figures depend
-      on the defining query and on how many indexes the materialized view
-      carries, so measure rather than assume.
+      outright is faster.  The crossover is around a tenth of the materialized
+      view, but it depends on the defining query and on how many indexes the
+      materialized view carries, so measure rather than assume.
      </para>
      <para>
       The <literal>WHERE</literal> clause cannot contain volatile functions or
@@ -274,7 +267,7 @@ REFRESH MATERIALIZED VIEW annual_statistics_basis WITH NO DATA;
    <literal>order_summary</literal> where the <literal>order_date</literal>
    is in the year 2024:
 <programlisting>
-REFRESH MATERIALIZED VIEW order_summary WHERE order_date >= '2024-01-01' AND order_date &lt; '2025-01-01';
+REFRESH MATERIALIZED VIEW CONCURRENTLY order_summary WHERE order_date >= '2024-01-01' AND order_date &lt; '2025-01-01';
 </programlisting></para>
 
  </refsect1>

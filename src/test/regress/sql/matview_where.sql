@@ -26,22 +26,27 @@ CREATE UNIQUE INDEX ON mv_test_a(id);
 -- Test 1: Syntax and Error handling
 --
 
--- 1.1 WITH NO DATA + WHERE -> Error
-REFRESH MATERIALIZED VIEW mv_test_a WITH NO DATA WHERE id = 1;
+-- 1.1 WHERE without CONCURRENTLY -> Error.  A partial refresh modifies rows in
+-- place, which is what CONCURRENTLY selects; the bare form replaces the
+-- matview's contents wholesale and has no way to restrict that to a scope.
+REFRESH MATERIALIZED VIEW mv_test_a WHERE id = 1;
 
--- 1.2 Unpopulated + WHERE -> Error
+-- 1.2 WITH NO DATA + WHERE -> Error
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_test_a WITH NO DATA WHERE id = 1;
+
+-- 1.3 Unpopulated + WHERE -> Error
 CREATE MATERIALIZED VIEW mv_unpop AS SELECT * FROM mv_base_a WITH NO DATA;
-REFRESH MATERIALIZED VIEW mv_unpop WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_unpop WHERE id = 1;
 DROP MATERIALIZED VIEW mv_unpop;
 
--- 1.3 Volatile functions -> Error
-REFRESH MATERIALIZED VIEW mv_test_a WHERE random() > 0.5;
+-- 1.4 Volatile functions -> Error
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_test_a WHERE random() > 0.5;
 
--- 1.4 Aggregates -> Error
-REFRESH MATERIALIZED VIEW mv_test_a WHERE count(*) > 0;
+-- 1.5 Aggregates -> Error
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_test_a WHERE count(*) > 0;
 
 --
--- Test 2: Non-concurrent Partial Refresh
+-- Test 2: only the rows the predicate names are refreshed
 --
 
 -- Modify base data
@@ -49,17 +54,22 @@ UPDATE mv_base_a SET val = 'One Updated' WHERE id = 1;
 UPDATE mv_base_a SET val = 'Two Updated' WHERE id = 2;
 
 -- Refresh only id=1
-REFRESH MATERIALIZED VIEW mv_test_a WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_test_a WHERE id = 1;
 
 -- Verify: id=1 should be updated, id=2 should remain stale
 SELECT * FROM mv_test_a ORDER BY id;
 
 -- Refresh id=2
-REFRESH MATERIALIZED VIEW mv_test_a WHERE id = 2;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_test_a WHERE id = 2;
 SELECT * FROM mv_test_a ORDER BY id;
 
 --
--- Test 3: Concurrent Partial Refresh
+-- Test 3: a later refresh of the same rows picks up the newer values
+--
+-- The pair used to be the two spellings, before a WHERE clause required
+-- CONCURRENTLY.  Kept as a second round rather than deleted: it is the only
+-- case that refreshes a scope twice from one session with different data both
+-- times, which is what a cached plan serving a stale answer would break.
 --
 
 -- Modify base data
@@ -106,7 +116,7 @@ INSERT INTO invoice_items VALUES (1, 25);
 INSERT INTO invoice_items VALUES (2, 50);
 
 -- Refresh only invoice 1
-REFRESH MATERIALIZED VIEW mv_invoices WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_invoices WHERE id = 1;
 
 -- Verify: Invoice 1 updated (175), Invoice 2 stale (200)
 SELECT * FROM mv_invoices ORDER BY id;
@@ -141,11 +151,11 @@ UPDATE items SET status = 'active' WHERE id = 2;
 
 -- Refresh partial WHERE id=1
 -- Should remove id=1 because it no longer matches view definition
-REFRESH MATERIALIZED VIEW mv_active_items WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_active_items WHERE id = 1;
 SELECT * FROM mv_active_items ORDER BY id;
 
 -- Case B: Refresh to add row 2 (which is now active)
-REFRESH MATERIALIZED VIEW mv_active_items WHERE id = 2;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_active_items WHERE id = 2;
 SELECT * FROM mv_active_items ORDER BY id;
 
 -- Cleanup
@@ -224,28 +234,62 @@ DROP TABLE mv_drift_base;
 -- Test 8: Multiple Unique Keys
 -- Addressed specific worry: "what if we have multiple UKs?"
 --
+-- A partial refresh applies its changes with ON CONFLICT against a single
+-- arbiter index, so a row set that needs a delete before an insert to satisfy a
+-- *second* unique index cannot be applied that way.  No choice of arbiter
+-- avoids it: whichever unique index arbitrates, a swap collides on the other
+-- one.  A WHERE clause is therefore refused outright on a matview carrying more
+-- than one unique index, rather than failing partway through on whichever
+-- change it cannot express.
+--
+-- Disposition: keep.  It pins the precondition in both directions -- the
+-- refusal, and the same command succeeding once the extra index is gone -- and
+-- it is the case that would notice if a future statement shape (a scoped delete
+-- before the insert, say) let the upsert express this after all, at which point
+-- the restriction can be lifted without breaking anyone.
+--
 
-CREATE TABLE mv_multi_uk (id int primary key, email text, username text);
-INSERT INTO mv_multi_uk VALUES (1, 'a@example.com', 'user_a');
+CREATE TABLE mv_multi_base (id int primary key, email text, uname text);
+INSERT INTO mv_multi_base VALUES (1, 'a@example.com', 'ua'),
+                                 (2, 'b@example.com', 'ub');
 
-CREATE MATERIALIZED VIEW mv_multi AS SELECT * FROM mv_multi_uk;
+CREATE MATERIALIZED VIEW mv_multi AS
+  SELECT id, email, uname FROM mv_multi_base;
 CREATE UNIQUE INDEX ON mv_multi(email);
-CREATE UNIQUE INDEX ON mv_multi(username);
+CREATE UNIQUE INDEX ON mv_multi(uname);
 
--- Update all columns
-UPDATE mv_multi_uk SET email = 'b@example.com', username = 'user_b' WHERE id = 1;
+-- Swap the two email addresses.  Both the old and the new row set satisfy every
+-- unique index, so nothing about the data is wrong; it is the upsert that
+-- cannot get from one to the other.
+UPDATE mv_multi_base SET email = CASE id WHEN 1 THEN 'b@example.com'
+                                         ELSE 'a@example.com' END;
 
--- Refresh should succeed updating all unique indexes.  The bare spelling,
--- because a second unique index routes a partial refresh to diff/merge and
--- CONCURRENTLY is refused there -- Test 14 has the rule and the reason.  The
--- answer to the question this case was written for is unchanged: a change
--- touching several unique keys at once is applied correctly.
-REFRESH MATERIALIZED VIEW mv_multi WHERE id = 1;
+-- Refused, because of the second unique index.
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_multi WHERE id IN (1, 2);
 
-SELECT * FROM mv_multi;
+-- The matview is untouched by the refusal: it still holds the pre-swap rows.
+SELECT * FROM mv_multi ORDER BY id;
+
+-- A full refresh has no such limit, and applies the swap.
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_multi;
+SELECT * FROM mv_multi ORDER BY id;
+
+-- Drop the second unique index and a partial refresh takes it -- and still
+-- applies a swap, because with only the arbiter left there is nothing to
+-- collide with: the upsert matches each row by the very column being swapped
+-- and updates it in place.  The collision needs a unique index that is NOT the
+-- arbiter, which needs a second one.  So the restriction above is specific
+-- rather than a blanket refusal of predicates on this matview, and the answer
+-- to the question this case was written for is that a change touching several
+-- unique keys at once is applied correctly whenever it can be applied at all.
+DROP INDEX mv_multi_uname_idx;
+UPDATE mv_multi_base SET email = CASE id WHEN 1 THEN 'a@example.com'
+                                         ELSE 'b@example.com' END;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_multi WHERE id IN (1, 2);
+SELECT * FROM mv_multi ORDER BY id;
 
 DROP MATERIALIZED VIEW mv_multi;
-DROP TABLE mv_multi_uk;
+DROP TABLE mv_multi_base;
 
 --
 -- Test 9: Trigger-based Automatic Maintenance
@@ -260,12 +304,12 @@ CREATE UNIQUE INDEX ON mv_trigger_view(id);
 CREATE OR REPLACE FUNCTION maintain_mv_trigger_view() RETURNS TRIGGER AS $$
 BEGIN
     IF (TG_OP IN ('INSERT', 'UPDATE')) THEN
-        EXECUTE 'REFRESH MATERIALIZED VIEW mv_trigger_view WHERE id = ANY($1);'
+        EXECUTE 'REFRESH MATERIALIZED VIEW CONCURRENTLY mv_trigger_view WHERE id = ANY($1);'
             USING (SELECT array_agg(id) FROM new_table);
     END IF;
 
     IF (TG_OP IN ('DELETE')) THEN
-        EXECUTE 'REFRESH MATERIALIZED VIEW mv_trigger_view WHERE id = ANY($1);'
+        EXECUTE 'REFRESH MATERIALIZED VIEW CONCURRENTLY mv_trigger_view WHERE id = ANY($1);'
             USING (SELECT array_agg(id) FROM old_table);
     END IF;
 
@@ -342,7 +386,7 @@ CREATE UNIQUE INDEX ON mv_incl(id) INCLUDE (extra);
 -- list has to cover the INCLUDE column while the conflict target must not.
 UPDATE mv_incl_base SET extra = 'x2', v = 'one-updated' WHERE id = 1;
 
-REFRESH MATERIALIZED VIEW mv_incl WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_incl WHERE id = 1;
 SELECT * FROM mv_incl ORDER BY id;
 
 -- The match/merge path builds its join quals from indnkeyatts as well.
@@ -380,8 +424,8 @@ CREATE UNIQUE INDEX ON mv_null(id);
 SELECT count(*) AS rows_initial FROM mv_null;
 
 -- The base table is not modified, so each of these must be a no-op.
-REFRESH MATERIALIZED VIEW mv_null WHERE id IS NULL;
-REFRESH MATERIALIZED VIEW mv_null WHERE id IS NULL;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_null WHERE id IS NULL;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_null WHERE id IS NULL;
 
 -- Must still be 2, and is: the anti-join now takes its NULL handling from the
 -- arbiter index (B4), so the upsert and the anti-join agree that the
@@ -400,8 +444,8 @@ CREATE MATERIALIZED VIEW mv_null_nnd AS SELECT id, v FROM mv_null_base;
 CREATE UNIQUE INDEX ON mv_null_nnd(id) NULLS NOT DISTINCT;
 
 SELECT count(*) AS rows_initial FROM mv_null_nnd;
-REFRESH MATERIALIZED VIEW mv_null_nnd WHERE id IS NULL;
-REFRESH MATERIALIZED VIEW mv_null_nnd WHERE id IS NULL;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_null_nnd WHERE id IS NULL;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_null_nnd WHERE id IS NULL;
 SELECT count(*) AS rows_after_two_noop_refreshes FROM mv_null_nnd;
 
 DROP MATERIALIZED VIEW mv_null_nnd;
@@ -435,7 +479,7 @@ UPDATE mv_drift2_base SET category_id = 200 WHERE id = 1;
 -- The bare spelling absorbs the collision.  (Both spellings run direct
 -- modification here -- one unique index -- so this is not a routing
 -- difference; it is the upsert matching the drifted row by its key.)
-REFRESH MATERIALIZED VIEW mv_drift2 WHERE category_id = 200;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_drift2 WHERE category_id = 200;
 SELECT * FROM mv_drift2 ORDER BY id;
 
 -- The same drift through direct modification (CONCURRENTLY).
@@ -491,10 +535,10 @@ INSERT INTO mv_sp_ids VALUES (1);
 SHOW search_path;
 
 -- An unqualified reference fails even though "public" is in search_path.
-REFRESH MATERIALIZED VIEW mv_sp WHERE id IN (SELECT id FROM mv_sp_ids);
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_sp WHERE id IN (SELECT id FROM mv_sp_ids);
 
 -- Schema-qualifying it works.
-REFRESH MATERIALIZED VIEW mv_sp WHERE id IN (SELECT s.id FROM public.mv_sp_ids s);
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_sp WHERE id IN (SELECT s.id FROM public.mv_sp_ids s);
 SELECT * FROM mv_sp ORDER BY id;
 
 DROP TABLE mv_sp_ids;
@@ -502,101 +546,7 @@ DROP MATERIALIZED VIEW mv_sp;
 DROP TABLE mv_sp_base;
 
 --
--- Test 14: More than one unique index
---
--- Not yet reported on -hackers; found while writing these tests.  Test 8 above
--- covers a change that happens to arbitrate cleanly; this covers one that does
--- not.
---
--- The direct-modification path resolves collisions with ON CONFLICT against a
--- single arbiter index, so a row set that needs a delete before an insert to
--- satisfy a *second* unique index cannot be applied that way.
---
--- No choice of arbiter avoids it: whichever unique index arbitrates, the swap
--- collides on the other one.  Diff/merge deletes before it inserts and has no
--- such limit, which is why it is still here -- it lost to direct modification
--- at every scope from 10% to 90% of the matview, by 24-52%, so it earns its
--- place on capability rather than on speed.
---
--- The two are selected by counting unique indexes, not by spelling.  With one,
--- the collision is impossible rather than unlikely, so direct modification is
--- provably safe and both spellings use it.  With more than one, diff/merge is
--- the only algorithm that can apply the change -- and it is available to the
--- bare spelling only, which is the second half of this test.
---
--- CONCURRENTLY is refused there because the lock is chosen from the spelling
--- before the algorithm is known: it takes RowExclusiveLock, diff/merge then
--- takes ExclusiveLock itself, and two such refreshes deadlock on the upgrade
--- rather than serialize.  Measured at 796 of 1200 refreshes before the refusal
--- went in, against zero for the bare spelling.  Nothing is given up by refusing
--- it, because the upgrade already serialized every such refresh against every
--- other -- CONCURRENTLY was not buying the parallelism it names.
---
--- Disposition: keep.  It pins the routing rule in both directions and the
--- refusal that follows from it, and it is the test that would notice if a
--- future statement shape (a scoped delete before the insert, say) let direct
--- modification express this after all -- at which point the fork disappears and
--- the refusal can be lifted without breaking anyone.
---
-
-CREATE TABLE mv_multi2_base (id int primary key, email text, uname text);
-INSERT INTO mv_multi2_base VALUES (1, 'a@example.com', 'ua'),
-                                 (2, 'b@example.com', 'ub');
-
-CREATE MATERIALIZED VIEW mv_multi2 AS
-  SELECT id, email, uname FROM mv_multi2_base;
-CREATE UNIQUE INDEX ON mv_multi2(email);
-CREATE UNIQUE INDEX ON mv_multi2(uname);
-
--- Swap the two email addresses.  Both the old and the new row set satisfy
--- every unique index, so a refresh has no reason to fail.
-UPDATE mv_multi2_base SET email = CASE id WHEN 1 THEN 'b@example.com'
-                                          ELSE 'a@example.com' END;
-
--- Two unique indexes, so CONCURRENTLY is refused rather than deadlocking.
-REFRESH MATERIALIZED VIEW CONCURRENTLY mv_multi2 WHERE id IN (1, 2);
-
--- The matview is untouched by the refusal: it still holds the pre-swap rows.
-SELECT * FROM mv_multi2 ORDER BY id;
-
--- The bare spelling reaches diff/merge and applies the swap.
-REFRESH MATERIALIZED VIEW mv_multi2 WHERE id IN (1, 2);
-SELECT * FROM mv_multi2 ORDER BY id;
-
--- Swap them back, to show the first one was not a one-way accident.
-UPDATE mv_multi2_base SET email = CASE id WHEN 1 THEN 'a@example.com'
-                                          ELSE 'b@example.com' END;
-REFRESH MATERIALIZED VIEW mv_multi2 WHERE id IN (1, 2);
-SELECT * FROM mv_multi2 ORDER BY id;
-
--- A FULL concurrent refresh is unaffected: it takes ExclusiveLock from the
--- start, so diff/merge does not upgrade anything and there is nothing to refuse.
-REFRESH MATERIALIZED VIEW CONCURRENTLY mv_multi2;
-SELECT * FROM mv_multi2 ORDER BY id;
-
--- Drop the second unique index and the same matview takes the fast path again
--- -- and still applies the swap, because with only the arbiter left there is
--- nothing for it to collide with: the upsert matches each row by the very
--- column being swapped and updates it in place.  That is the point of the
--- routing rule.  The collision needs a unique index that is NOT the arbiter,
--- which needs a second unique index, which is exactly the case that routes to
--- diff/merge.  So the fast path is not merely safe here, it is complete: no
--- capability is given up by taking it.
---
--- This is also what says the refusal above is specific rather than a blanket
--- ban on CONCURRENTLY: the same command on the same matview succeeds once the
--- second unique index is gone.
-DROP INDEX mv_multi2_uname_idx;
-UPDATE mv_multi2_base SET email = CASE id WHEN 1 THEN 'b@example.com'
-                                          ELSE 'a@example.com' END;
-REFRESH MATERIALIZED VIEW CONCURRENTLY mv_multi2 WHERE id IN (1, 2);
-SELECT * FROM mv_multi2 ORDER BY id;
-
-DROP MATERIALIZED VIEW mv_multi2;
-DROP TABLE mv_multi2_base;
-
---
--- Test 15: the row comparison and NULL
+-- Test 14: the row comparison and NULL
 --
 -- The upsert's DO UPDATE carries WHERE (mv cols) IS DISTINCT FROM (EXCLUDED
 -- cols), so a row whose values did not change is not rewritten.  IS DISTINCT
@@ -641,11 +591,11 @@ DROP MATERIALIZED VIEW mv_null;
 DROP TABLE mv_null_base;
 
 --
--- Test 16: an unchanged row is not rewritten
+-- Test 15: an unchanged row is not rewritten
 --
 -- Found here, not on the -hackers thread.
 --
--- Test 15 reads values back, which is what a NULL bug corrupts.  It cannot see
+-- Test 14 reads values back, which is what a NULL bug corrupts.  It cannot see
 -- the comparison being absent: without it every matched row is rewritten, which
 -- is what the code did before 03cb4f0 and is still correct, so the values are
 -- right either way.  Measured rather than supposed -- mutation O1, the
@@ -677,7 +627,7 @@ CREATE TEMP TABLE mv_rowver_was AS SELECT id, ctid AS was FROM mv_rowver;
 
 -- Row 3 is the only one that now differs from what the matview holds.
 UPDATE mv_rowver_base SET v = 999 WHERE id = 3;
-REFRESH MATERIALIZED VIEW mv_rowver WHERE id BETWEEN 1 AND 5;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_rowver WHERE id BETWEEN 1 AND 5;
 
 -- Only row 3 may have been written.
 SELECT w.id, (w.was = m.ctid) AS same_row_version
@@ -693,7 +643,7 @@ DROP TABLE mv_rowver_base;
 
 
 --
--- Test 17: the predicate's constants become parameters, and the values still
+-- Test 16: the predicate's constants become parameters, and the values still
 --          reach the right rows
 --
 -- The plan cache is keyed on the deparsed predicate, so "WHERE id = 1" and
@@ -726,12 +676,12 @@ CREATE MATERIALIZED VIEW mv_pp AS SELECT a, b, v, tag FROM mv_pp_base;
 CREATE UNIQUE INDEX ON mv_pp (a, b);
 
 UPDATE mv_pp_base SET v = 'V12' WHERE a = 1 AND b = 2;
-REFRESH MATERIALIZED VIEW mv_pp WHERE a = 1 AND b = 2;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_pp WHERE a = 1 AND b = 2;
 
 -- Same predicate shape, same two constants, swapped.  Under a plan that reused
 -- the first refresh's values this refreshes (1,2) again and leaves (2,1) stale.
 UPDATE mv_pp_base SET v = 'V21' WHERE a = 2 AND b = 1;
-REFRESH MATERIALIZED VIEW mv_pp WHERE a = 2 AND b = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_pp WHERE a = 2 AND b = 1;
 
 -- (3,3) has never been in scope and must still hold its original value, which
 -- is what says the refreshes were partial rather than accidentally total.
@@ -746,9 +696,9 @@ SELECT a, b, v FROM mv_pp ORDER BY a, b;
 -- own predicate's scope and be pruned, which is a different behaviour and not
 -- the one under test.
 UPDATE mv_pp_base SET v = 'T33' WHERE a = 3;
-REFRESH MATERIALIZED VIEW mv_pp WHERE tag = 'cold' AND a = 3;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_pp WHERE tag = 'cold' AND a = 3;
 UPDATE mv_pp_base SET v = 'T44' WHERE a = 4;
-REFRESH MATERIALIZED VIEW mv_pp WHERE tag = 'hot' AND a = 4;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_pp WHERE tag = 'hot' AND a = 4;
 SELECT a, b, v, tag FROM mv_pp ORDER BY a, b;
 
 -- A caller-supplied parameter and a constant in one predicate: $1 keeps its
@@ -757,7 +707,7 @@ SELECT a, b, v, tag FROM mv_pp ORDER BY a, b;
 DO $$
 BEGIN
   UPDATE mv_pp_base SET v = 'W12' WHERE a = 1 AND b = 2;
-  EXECUTE 'REFRESH MATERIALIZED VIEW mv_pp WHERE a = $1 AND b = 2' USING 1;
+  EXECUTE 'REFRESH MATERIALIZED VIEW CONCURRENTLY mv_pp WHERE a = $1 AND b = 2' USING 1;
 END $$;
 SELECT a, b, v FROM mv_pp ORDER BY a, b;
 
@@ -765,32 +715,37 @@ DROP MATERIALIZED VIEW mv_pp;
 DROP TABLE mv_pp_base;
 
 --
--- Test 18: the prune is skipped only when it provably cannot delete
+-- Test 17: a row that leaves the scope is deleted, in the shapes where a
+-- cheaper implementation would stop deleting it
 --
--- The fused statement's DELETE carries a guard so the scope is not scanned a
--- second time when nothing in it can be orphaned.  Two counts decide it: how
--- many matview rows the pre-lock matched, and how many rows the source
--- produced.  If every source row is accounted for by a row that was already in
--- scope or by one the upsert has just inserted, nothing in scope is orphaned.
+-- The prune scans the scope a second time to find rows the defining query no
+-- longer produces.  An implementation that wanted to skip that scan would have
+-- to decide, without doing it, that nothing in scope can be orphaned -- and the
+-- cheap accounting for that is unsound.  It would compare how many matview rows
+-- the pre-lock matched and how many rows the source produced, and skip the
+-- prune when every source row is accounted for by a row already in scope or one
+-- the upsert has just inserted.
 --
--- That accounting is UNSOUND on its own, and its failure is a silently missing
--- DELETE rather than a slow refresh, so the interesting cases here are the ones
--- where the counts agree and the prune must run anyway.  It assumes a source
--- row that conflicts with an existing matview row conflicts with one IN SCOPE.
--- A predicate reading a non-key column breaks that: ON CONFLICT arbitrates on
--- the key and knows nothing about the predicate, so the upsert can match a row
--- the pre-lock never counted -- and a genuinely orphaned row elsewhere in the
--- scope cancels the discrepancy exactly.  Hence the gate: the predicate must
--- read nothing but the arbiter index's key columns, where two rows with the
--- same key necessarily agree on the predicate.
+-- That assumes a source row conflicting with an existing matview row conflicts
+-- with one IN SCOPE.  A predicate reading a non-key column breaks it: ON
+-- CONFLICT arbitrates on the key and knows nothing about the predicate, so the
+-- upsert can match a row the pre-lock never counted -- and a genuinely orphaned
+-- row elsewhere in the scope cancels the discrepancy exactly.  The failure is a
+-- silently missing DELETE rather than a slow refresh.
+--
+-- Such a guard was built, measured and removed: it was sound only while the
+-- matview was held at ExclusiveLock, since the counts are taken under an
+-- earlier snapshot than the DELETE they stand in for, and a partial refresh
+-- takes RowExclusiveLock.  These cases are what is left of it, and they are
+-- worth more than it was.
 --
 -- Disposition: keep.  These are not tests of an optimisation, they are tests of
--- the promise the optimisation is allowed to keep -- "a row that leaves the
+-- the promise an optimisation is allowed to keep -- "a row that leaves the
 -- scope is deleted" -- in the cases where a cheaper implementation would stop
 -- keeping it.  They outlive any particular guard.
 --
 
--- 20a: the counterexample.  One row leaves the scope and one enters it, so
+-- 17a: the counterexample.  One row leaves the scope and one enters it, so
 -- locked, source and inserted balance while a row is orphaned all the same.
 CREATE TABLE mv_nd_base (k int PRIMARY KEY, status text);
 INSERT INTO mv_nd_base VALUES (1, 'A'), (2, 'B');
@@ -804,10 +759,10 @@ UPDATE mv_nd_base SET status = 'A' WHERE k = 2;   -- enters it
 -- n_locked = 1 (the matview's (1,'A')), n_source = 1 (the base's (2,'A')),
 -- n_inserted = 0 (k=2 conflicts with the matview's (2,'B')).  1 + 0 = 1, and
 -- k=1 must still be deleted.
-REFRESH MATERIALIZED VIEW mv_nd WHERE status = 'A';
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_nd WHERE status = 'A';
 SELECT k, status FROM mv_nd ORDER BY k;
 
--- 20b: the same cancellation with a predicate that DOES name a key column, so
+-- 17b: the same cancellation with a predicate that DOES name a key column, so
 -- the gate cannot be "does the predicate mention the key".
 CREATE TABLE mv_nd5_base (k int PRIMARY KEY, status text, v text);
 INSERT INTO mv_nd5_base VALUES (1, 'A', 'p'), (2, 'B', 'q');
@@ -818,10 +773,10 @@ CREATE UNIQUE INDEX ON mv_nd5 (k);
 UPDATE mv_nd5_base SET status = 'B' WHERE k = 1;
 UPDATE mv_nd5_base SET status = 'A' WHERE k = 2;
 
-REFRESH MATERIALIZED VIEW mv_nd5 WHERE k <= 2 AND status = 'A';
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_nd5 WHERE k <= 2 AND status = 'A';
 SELECT k, status, v FROM mv_nd5 ORDER BY k;
 
--- 20c: a key-only predicate, both directions.  The first refresh is the case
+-- 17c: a key-only predicate, both directions.  The first refresh is the case
 -- the elision exists for -- every source row matches a row already in scope --
 -- and the second is the same statement when a row really has gone.
 CREATE TABLE mv_nd2_base (k int PRIMARY KEY, v text);
@@ -831,21 +786,21 @@ CREATE MATERIALIZED VIEW mv_nd2 AS SELECT k, v FROM mv_nd2_base;
 CREATE UNIQUE INDEX ON mv_nd2 (k);
 
 UPDATE mv_nd2_base SET v = 'A' WHERE k = 1;
-REFRESH MATERIALIZED VIEW mv_nd2 WHERE k <= 2;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_nd2 WHERE k <= 2;
 SELECT k, v FROM mv_nd2 ORDER BY k;
 
 DELETE FROM mv_nd2_base WHERE k = 2;
-REFRESH MATERIALIZED VIEW mv_nd2 WHERE k <= 2;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_nd2 WHERE k <= 2;
 SELECT k, v FROM mv_nd2 ORDER BY k;
 
--- 20d: nothing in scope at all.  The matview holds no row the predicate
+-- 17d: nothing in scope at all.  The matview holds no row the predicate
 -- selects, so the DELETE cannot match -- the upsert's own insert is not
 -- visible to it -- and the row still has to arrive.
 INSERT INTO mv_nd2_base VALUES (2, 'B');
-REFRESH MATERIALIZED VIEW mv_nd2 WHERE k = 2;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_nd2 WHERE k = 2;
 SELECT k, v FROM mv_nd2 ORDER BY k;
 
--- 20e: a composite key with the predicate covering only its leading column.
+-- 17e: a composite key with the predicate covering only its leading column.
 -- Still key-only, and the counts still have to notice the row that went.
 CREATE TABLE mv_nd4_base (a int, b int, v text, PRIMARY KEY (a, b));
 INSERT INTO mv_nd4_base VALUES (1, 1, 'x'), (1, 2, 'y'), (2, 1, 'z');
@@ -855,10 +810,10 @@ CREATE UNIQUE INDEX ON mv_nd4 (a, b);
 
 DELETE FROM mv_nd4_base WHERE a = 1 AND b = 2;
 UPDATE mv_nd4_base SET v = 'X' WHERE a = 1 AND b = 1;
-REFRESH MATERIALIZED VIEW mv_nd4 WHERE a = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_nd4 WHERE a = 1;
 SELECT a, b, v FROM mv_nd4 ORDER BY a, b;
 
--- 20f: every column is a key column, so the upsert is ON CONFLICT DO NOTHING
+-- 17f: every column is a key column, so the upsert is ON CONFLICT DO NOTHING
 -- and a conflicting row returns nothing at all.  The count still has to come
 -- out right, because what it counts is the inserts and an insert is returned on
 -- either branch.  This is also the only case that exercises the RETURNING
@@ -872,7 +827,7 @@ CREATE UNIQUE INDEX ON mv_nd6 (a, b);
 -- one row leaves and one arrives, so n_locked 2 + n_inserted 1 <> n_source 2
 DELETE FROM mv_nd6_base WHERE a = 1 AND b = 2;
 INSERT INTO mv_nd6_base VALUES (1, 3);
-REFRESH MATERIALIZED VIEW mv_nd6 WHERE a = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_nd6 WHERE a = 1;
 SELECT a, b FROM mv_nd6 ORDER BY a, b;
 
 DROP MATERIALIZED VIEW mv_nd6;

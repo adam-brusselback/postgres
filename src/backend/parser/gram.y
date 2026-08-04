@@ -5120,7 +5120,15 @@ RefreshMatViewStmt:
 					if (n->skipData && n->whereClause)
 						ereport(ERROR,
 								(errcode(ERRCODE_SYNTAX_ERROR),
-								 errmsg("cannot specify WHERE clause with WITH NO DATA")));
+								 errmsg("cannot specify WHERE clause with WITH NO DATA"),
+								 parser_errposition(@7)));
+
+					if (n->whereClause && !n->concurrent)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot specify WHERE clause without CONCURRENTLY"),
+								 errdetail("A partial refresh modifies rows in place; the non-concurrent form replaces the materialized view's contents entirely."),
+								 parser_errposition(@7)));
 					$$ = (Node *) n;
 				}
 		;

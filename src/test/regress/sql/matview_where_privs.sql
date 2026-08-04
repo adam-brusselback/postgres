@@ -97,7 +97,7 @@ INSERT INTO public.matview_priv_target VALUES ('direct write');
 -- be refused.  42501 is insufficient_privilege.
 DO $$
 BEGIN
-  EXECUTE 'REFRESH MATERIALIZED VIEW matview_priv_mv'
+  EXECUTE 'REFRESH MATERIALIZED VIEW CONCURRENTLY matview_priv_mv'
           ' WHERE matview_priv_atk.pred(id)';
   RAISE NOTICE 'refresh was allowed';
 EXCEPTION WHEN others THEN
@@ -172,7 +172,7 @@ SELECT count(*) AS victim_rows_before FROM matview_mw_victim;
 -- wrong_object_type, which is what "cannot change materialized view" carries.
 DO $$
 BEGIN
-  EXECUTE 'REFRESH MATERIALIZED VIEW matview_mw_driver'
+  EXECUTE 'REFRESH MATERIALIZED VIEW CONCURRENTLY matview_mw_driver'
           ' WHERE public.matview_mw_pred(id)';
   RAISE NOTICE 'refresh was allowed';
 EXCEPTION WHEN others THEN
@@ -314,7 +314,7 @@ SELECT count(*) AS rows_before FROM mv_leak;
 -- Failing here is correct; what matters is the state left behind.
 UPDATE mv_leak_base SET code = 999 WHERE id IN (1, 2);
 \set VERBOSITY terse
-REFRESH MATERIALIZED VIEW mv_leak WHERE id <= 2;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_leak WHERE id <= 2;
 \set VERBOSITY default
 
 -- Both of these must still be refused, and the contents must be unchanged.
