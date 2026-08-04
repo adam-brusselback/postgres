@@ -472,11 +472,12 @@ DROP TABLE mv_drift2_base;
 -- stays, because the predicate runs as the matview owner and a caller-supplied
 -- search_path plus owner-context execution is the CVE-2018-1058 shape.  So the
 -- schema-qualification requirement is real behaviour worth asserting, not a
--- record of something about to change.  What is still owed is a better error --
--- an errhint pointing at qualification rather than a bare "relation does not
--- exist".  Note that a Query-tree implementation may make this moot by letting
--- the predicate run as the invoker; if so, this becomes an assertion of the new
--- behaviour.
+-- record of something about to change.  The bare "relation does not exist" that
+-- used to be all a caller got now carries an error context and, for the errors a
+-- missing qualification actually produces, a hint naming the restricted
+-- search_path -- which is what the expected output below pins.  Note that a
+-- Query-tree implementation may make this moot by letting the predicate run as
+-- the invoker; if so, this becomes an assertion of the new behaviour.
 --
 
 CREATE TABLE mv_sp_base (id int primary key, v text);

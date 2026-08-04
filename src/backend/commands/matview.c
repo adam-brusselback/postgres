@@ -335,6 +335,29 @@ refresh_where_clause_is_leakproof(Node *qual)
 	return !contain_non_leakproof_walker(qual, NULL);
 }
 /*
+ * Say where a parse-analysis error came from, and why a name may not have
+ * resolved.
+ *
+ * The command runs under RestrictSearchPath(), so an object the caller did not
+ * schema-qualify is simply not found and the message says only that it does not
+ * exist -- true, and no help at all.  The hint is limited to the errors a
+ * missing qualification actually produces; on any other failure it would be
+ * advice pointing away from the cause.
+ */
+static void
+refresh_where_clause_error_callback(void *arg)
+{
+	int			sqlerrcode = geterrcode();
+
+	errcontext("WHERE clause of REFRESH MATERIALIZED VIEW");
+
+	if (sqlerrcode == ERRCODE_UNDEFINED_TABLE ||
+		sqlerrcode == ERRCODE_UNDEFINED_FUNCTION ||
+		sqlerrcode == ERRCODE_UNDEFINED_OBJECT)
+		errhint("The condition is analyzed with search_path set to \"pg_catalog, pg_temp\", so it must schema-qualify the objects it names.");
+}
+
+/*
  * Parse-analyse a partial refresh's WHERE clause against the matview, and
  * reject the expressions that cannot be allowed there.
  */
@@ -347,6 +370,7 @@ transformRefreshWhereClause(Oid relid, Node *whereClause, ParamListInfo params,
 	Relation	rel = table_open(relid, NoLock);
 	ParseNamespaceItem *nsitem;
 	Node	   *result;
+	ErrorContextCallback errcallback;
 
 	pstate->p_paramref_hook = refresh_paramref_hook;
 	pstate->p_ref_hook_state = (void *) params;
@@ -354,8 +378,19 @@ transformRefreshWhereClause(Oid relid, Node *whereClause, ParamListInfo params,
 	nsitem = addRangeTableEntryForRelation(pstate, rel, AccessShareLock, NULL, false, true);
 	addNSItemToQuery(pstate, nsitem, false, true, true);
 
+	/*
+	 * Only around the analysis: the rejections below say plainly what is wrong
+	 * with the expression and need nothing added.
+	 */
+	errcallback.callback = refresh_where_clause_error_callback;
+	errcallback.arg = NULL;
+	errcallback.previous = error_context_stack;
+	error_context_stack = &errcallback;
+
 	result = transformExpr(pstate, whereClause, EXPR_KIND_WHERE);
 	result = coerce_to_boolean(pstate, result, "WHERE");
+
+	error_context_stack = errcallback.previous;
 
 	assign_expr_collations(pstate, result);
 
