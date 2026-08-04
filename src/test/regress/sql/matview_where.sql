@@ -541,6 +541,25 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY mv_sp WHERE id IN (SELECT id FROM mv_sp_i
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_sp WHERE id IN (SELECT s.id FROM public.mv_sp_ids s);
 SELECT * FROM mv_sp ORDER BY id;
 
+-- A CORRELATED subquery, which is the case the uncorrelated one above cannot
+-- reach.  The predicate is deparsed back to text for the statements SPI builds,
+-- and ruleutils only qualifies a Var once something else is in scope -- which a
+-- subquery referring back to the matview is the first thing to do.  If the
+-- deparse names the matview differently from the way those statements do, this
+-- is where it shows up, as "missing FROM-clause entry".  Both halves of the
+-- statement carry the predicate, so both would fail.
+UPDATE mv_sp_base SET v = 'ONE' WHERE id = 1;
+UPDATE mv_sp_base SET v = 'TWO' WHERE id = 2;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_sp
+  WHERE EXISTS (SELECT 1 FROM public.mv_sp_ids s WHERE s.id = mv_sp.id);
+-- id 1 is in mv_sp_ids and id 2 is not, so only id 1 moves.
+SELECT * FROM mv_sp ORDER BY id;
+
+-- And the other direction, so a predicate that selected everything would show.
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_sp
+  WHERE NOT EXISTS (SELECT 1 FROM public.mv_sp_ids s WHERE s.id = mv_sp.id);
+SELECT * FROM mv_sp ORDER BY id;
+
 DROP TABLE mv_sp_ids;
 DROP MATERIALIZED VIEW mv_sp;
 DROP TABLE mv_sp_base;

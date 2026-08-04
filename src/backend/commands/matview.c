@@ -76,6 +76,12 @@
  */
 #define MATVIEW_SOURCE_ENR_NAME	"new_data"
 
+/*
+ * Alias the generated SQL gives the matview, and therefore the name the
+ * predicate must be deparsed against.  See deparseRefreshWhereClause().
+ */
+#define MATVIEW_ALIAS			"mv"
+
 typedef struct
 {
 	DestReceiver pub;			/* publicly-known function pointers */
@@ -401,14 +407,21 @@ transformRefreshWhereClause(Oid relid, Node *whereClause, ParamListInfo params,
 
 /*
  * Render an analysed WHERE clause back to text, for the statements SPI builds.
+ *
+ * The deparse has to name the matview the way those statements do, which is
+ * MATVIEW_ALIAS.  pg_get_expr() would use the matview's own name instead, and
+ * that only happens to work while the predicate is simple enough that ruleutils
+ * never qualifies anything.  Bring a second relation into scope -- any subquery
+ * does -- and it qualifies the matview's Vars with a name the statement never
+ * defines, so the refresh fails with "missing FROM-clause entry".
  */
 
 static char *
 deparseRefreshWhereClause(Oid relid, Node *whereClause)
 {
-	return TextDatumGetCString(DirectFunctionCall2(pg_get_expr,
-												   CStringGetTextDatum(nodeToString(whereClause)),
-												   ObjectIdGetDatum(relid)));
+	List	   *dpcontext = deparse_context_for(MATVIEW_ALIAS, relid);
+
+	return deparse_expression(whereClause, dpcontext, false, false);
 }
 
 /*
@@ -1594,7 +1607,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		{
 			StringInfoData buf;
 			char	   *matview_name;
-			const char *matview_alias;
 			char	   *whereClauseStr;
 			Oid		   *argtypes = NULL;
 			int			nargs = 0;
@@ -1615,7 +1627,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 
 			matview_name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
 													  RelationGetRelationName(matviewRel));
-			matview_alias = quote_identifier(RelationGetRelationName(matviewRel));
 
 			whereClauseStr = deparseRefreshWhereClause(matviewOid, qual);
 
@@ -1664,7 +1675,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 				first = false;
 
 				appendStringInfoString(&conflict_cols, quoted);
-				appendStringInfo(&join_clause, "nd.%s %s mv.%s",
+				appendStringInfo(&join_clause, "nd.%s %s " MATVIEW_ALIAS ".%s",
 								 quoted, anti_join_op, quoted);
 			}
 
@@ -1706,7 +1717,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 					appendStringInfoString(&excluded_cols, ", ");
 				}
 				first_distinct = false;
-				appendStringInfo(&mv_cols, "%s.%s", matview_alias, quoted);
+				appendStringInfo(&mv_cols, MATVIEW_ALIAS ".%s", quoted);
 				appendStringInfo(&excluded_cols, "EXCLUDED.%s", quoted);
 			}
 
@@ -1720,13 +1731,9 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 			/*
 			 * A fixed lock order, so two refreshes whose predicates overlap
 			 * cannot take the same rows in opposite orders and deadlock.
-			 * Emitted unconditionally: dropping it for the serialized form
-			 * was tried and reverted, because the cheaper statement stops the
-			 * plan cache settling and is re-planned on every call, which
-			 * costs more than the clause did.
 			 */
 			appendStringInfo(&buf,
-							 "SELECT 1 FROM %s mv WHERE (%s) ORDER BY %s "
+							 "SELECT 1 FROM %s " MATVIEW_ALIAS " WHERE (%s) ORDER BY %s "
 							 "FOR NO KEY UPDATE",
 							 matview_name, whereClauseStr, conflict_cols.data);
 
@@ -1742,7 +1749,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 
 			appendStringInfo(&buf,
 							 "upsert AS ( "
-							 "  INSERT INTO %s SELECT * FROM new_data "
+							 "  INSERT INTO %s AS " MATVIEW_ALIAS
+							 "  SELECT * FROM new_data "
 							 "  ON CONFLICT (%s) DO ",
 							 matview_name, conflict_cols.data);
 
@@ -1762,7 +1770,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 							 "  RETURNING 1 "
 							 "), "
 							 "pruned AS ( "
-							 "  DELETE FROM %s mv WHERE (%s) AND NOT EXISTS ( "
+							 "  DELETE FROM %s " MATVIEW_ALIAS " WHERE (%s) AND NOT EXISTS ( "
 							 "    SELECT 1 FROM new_data nd WHERE %s"
 							 "  ) RETURNING 1 "
 							 ") "
