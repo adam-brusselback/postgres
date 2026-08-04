@@ -130,27 +130,18 @@ static void transientrel_shutdown(DestReceiver *self);
 static void transientrel_destroy(DestReceiver *self);
 static uint64 refresh_matview_datafill(DestReceiver *dest, Query *query,
 									   const char *queryString, bool is_create);
-static uint64 refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
-									 int save_sec_context, char *whereClauseStr,
-									 ParamListInfo params);
+static void refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
+								   int save_sec_context);
 static uint64 refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 											 int save_sec_context,
 											 Query *dataQuery, Node *qual,
 											 ParamListInfo params);
 static void refresh_by_heap_swap(Oid matviewOid, Oid OIDNewHeap, char relpersistence);
 static bool is_usable_unique_index(Relation indexRel);
-static Oid	matview_pick_arbiter_index(Relation matviewRel);
-static void matview_build_upsert_clause(Relation matviewRel, Oid arbiterOid,
-										StringInfo conflict_cols,
-										StringInfo set_clause,
-										bool *has_non_key_cols,
-										const char **anti_join_op);
 static void OpenMatViewIncrementalMaintenance(Oid relid);
 static void CloseMatViewIncrementalMaintenance(void);
-static int	matview_execute_spi(const char *command, ParamListInfo params, bool read_only);
 static int	matview_execute_spi_plan(SPIPlanPtr plan, ParamListInfo params,
 									 Snapshot snapshot, bool read_only);
-static char *get_matview_view_query(Oid matviewOid);
 static void InitMatViewCache(void);
 static void InvalidateMatViewCache(Datum arg, Oid relid);
 static void matview_cache_sweep(void);
@@ -539,49 +530,6 @@ parameterizeRefreshWhereClause(Node *qual, ParamListInfo *params)
 }
 
 /*
- * Execute a one-off SPI command, binding the caller's parameters if any.
- */
-
-static int
-matview_execute_spi(const char *command, ParamListInfo params, bool read_only)
-{
-	if (params && params->numParams > 0)
-	{
-		Oid		   *argtypes;
-		Datum	   *argvalues;
-		char	   *nulls;
-		int			i;
-		int			res;
-
-		argtypes = (Oid *) palloc(params->numParams * sizeof(Oid));
-		argvalues = (Datum *) palloc(params->numParams * sizeof(Datum));
-		nulls = (char *) palloc(params->numParams * sizeof(char));
-
-		for (i = 0; i < params->numParams; i++)
-		{
-			ParamExternData *prm = &params->params[i];
-
-			argtypes[i] = prm->ptype;
-			argvalues[i] = prm->value;
-			nulls[i] = prm->isnull ? 'n' : ' ';
-		}
-
-		res = SPI_execute_with_args(command, params->numParams, argtypes,
-									argvalues, nulls, read_only, 0);
-
-		pfree(argtypes);
-		pfree(argvalues);
-		pfree(nulls);
-
-		return res;
-	}
-	else
-	{
-		return SPI_exec(command, 0);
-	}
-}
-
-/*
  * Execute a prepared SPI plan, optionally under a caller-supplied snapshot.
  */
 
@@ -967,7 +915,7 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 		PG_TRY();
 		{
 			refresh_by_match_merge(matviewOid, OIDNewHeap, relowner,
-								   save_sec_context, NULL, NULL);
+								   save_sec_context);
 		}
 		PG_CATCH();
 		{
@@ -1207,30 +1155,6 @@ static void
 transientrel_destroy(DestReceiver *self)
 {
 	pfree(self);
-}
-
-/*
- * get_matview_view_query
- *
- * Retrieve the SQL definition of a materialized view's underlying query.
- * Returns the query text with trailing semicolons and whitespace removed.
- */
-static char *
-get_matview_view_query(Oid matviewOid)
-{
-	char	   *view_sql;
-
-	view_sql = TextDatumGetCString(DirectFunctionCall2(pg_get_viewdef,
-													   ObjectIdGetDatum(matviewOid),
-													   BoolGetDatum(false)));
-	if (view_sql)
-	{
-		int			len = strlen(view_sql);
-
-		while (len > 0 && (view_sql[len - 1] == ';' || isspace((unsigned char) view_sql[len - 1])))
-			view_sql[--len] = '\0';
-	}
-	return view_sql;
 }
 
 /*
@@ -1976,103 +1900,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 }
 
 /*
- * Choose the unique index the upsert will arbitrate on.
- */
-
-static Oid
-matview_pick_arbiter_index(Relation matviewRel)
-{
-	List	   *indexoidlist = RelationGetIndexList(matviewRel);
-	ListCell   *lc;
-	Oid			result = InvalidOid;
-
-	foreach(lc, indexoidlist)
-	{
-		Oid			indexoid = lfirst_oid(lc);
-		Relation	indexRel;
-		bool		usable;
-
-		indexRel = index_open(indexoid, AccessShareLock);
-		usable = is_usable_unique_index(indexRel);
-		index_close(indexRel, AccessShareLock);
-
-		if (usable)
-		{
-			result = indexoid;
-			break;
-		}
-	}
-	list_free(indexoidlist);
-	return result;
-}
-
-/*
- * Build the ON CONFLICT column list, the DO UPDATE SET list and the prune's
- * join condition for the fused statement.
- */
-
-static void
-matview_build_upsert_clause(Relation matviewRel, Oid arbiterOid,
-							StringInfo conflict_cols, StringInfo set_clause,
-							bool *has_non_key_cols, const char **anti_join_op)
-{
-	Relation	indexRel = index_open(arbiterOid, AccessShareLock);
-	Form_pg_index indexStruct = indexRel->rd_index;
-	TupleDesc	tupdesc = matviewRel->rd_att;
-	bool		first;
-	int			i;
-	int			j;
-
-	*has_non_key_cols = false;
-	if (anti_join_op)
-		*anti_join_op = indexStruct->indnullsnotdistinct ?
-			"IS NOT DISTINCT FROM" : "=";
-
-	first = true;
-	for (i = 0; i < indexStruct->indnkeyatts; i++)
-	{
-		int			attnum = indexStruct->indkey.values[i];
-		Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
-
-		if (!first)
-			appendStringInfoString(conflict_cols, ", ");
-		first = false;
-		appendStringInfoString(conflict_cols,
-							   quote_identifier(NameStr(attr->attname)));
-	}
-
-	first = true;
-	for (i = 0; i < tupdesc->natts; i++)
-	{
-		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
-		const char *quoted;
-		bool		is_key = false;
-
-		if (attr->attisdropped)
-			continue;
-		for (j = 0; j < indexStruct->indnkeyatts; j++)
-		{
-			if (indexStruct->indkey.values[j] == (i + 1))
-			{
-				is_key = true;
-				break;
-			}
-		}
-		if (is_key)
-			continue;
-
-		if (!first)
-			appendStringInfoString(set_clause, ", ");
-		first = false;
-		*has_non_key_cols = true;
-		quoted = quote_identifier(NameStr(attr->attname));
-		appendStringInfo(set_clause, "%s = EXCLUDED.%s", quoted, quoted);
-	}
-
-	index_close(indexRel, AccessShareLock);
-}
-
-/*
  * refresh_by_match_merge
  *
  * Refresh a materialized view with transactional semantics, while allowing
@@ -2089,10 +1916,6 @@ matview_build_upsert_clause(Relation matviewRel, Oid arbiterOid,
  * are consistent with default behavior.  If there is at least one UNIQUE
  * index on the materialized view, we have exactly the guarantee we need.
  *
- * If whereClauseStr is provided, only rows matching the WHERE condition
- * in the existing matview are considered for the diff operation, enabling
- * partial concurrent refresh.
- *
  * The temporary table used to hold the diff results contains just the TID of
  * the old record (if matched) and the ROW from the new table as a single
  * column of complex record type (if matched).
@@ -2108,13 +1931,11 @@ matview_build_upsert_clause(Relation matviewRel, Oid arbiterOid,
  * SELECT FOR UPDATE or SELECT FOR SHARE on rows being updated or deleted by
  * this command.
  */
-static uint64
+static void
 refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
-					   int save_sec_context, char *whereClauseStr,
-					   ParamListInfo params)
+					   int save_sec_context)
 {
 	StringInfoData querybuf;
-	uint64		applied = 0;
 	Relation	matviewRel;
 	Relation	tempRel;
 	char	   *matviewname;
@@ -2226,15 +2047,8 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 	appendStringInfo(&querybuf,
 					 "INSERT INTO %s "
 					 "SELECT mv.ctid AS tid, newdata.*::%s AS newdata "
-					 "FROM ",
-					 diffname, tempname);
-
-	if (whereClauseStr)
-		appendStringInfo(&querybuf, "(SELECT ctid, * FROM %s WHERE %s) mv", matviewname, whereClauseStr);
-	else
-		appendStringInfo(&querybuf, "%s mv", matviewname);
-
-	appendStringInfo(&querybuf, " FULL JOIN %s newdata ON (", tempname);
+					 "FROM %s mv FULL JOIN %s newdata ON (",
+					 diffname, tempname, matviewname, tempname);
 
 	/*
 	 * Get the list of index OIDs for the table from the relcache, and look up
@@ -2356,42 +2170,13 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 				errmsg("could not find suitable unique index on materialized view \"%s\"",
 					   RelationGetRelationName(matviewRel)));
 
-	if (whereClauseStr)
-	{
-		StringInfoData cols;
-		int			i;
-		bool		first = true;
-
-		initStringInfo(&cols);
-		for (i = 0; i < relnatts; i++)
-		{
-			Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
-
-			if (attr->attisdropped)
-				continue;
-			if (!first)
-				appendStringInfoString(&cols, ", ");
-			first = false;
-			appendStringInfo(&cols, "mv.%s", quote_qualified_identifier(NULL, NameStr(attr->attname)));
-		}
-
-		appendStringInfo(&querybuf,
-						 " AND newdata.* OPERATOR(pg_catalog.*=) ROW(%s)) "
-						 "WHERE newdata.* IS NULL OR mv.ctid IS NULL "
-						 "ORDER BY tid",
-						 cols.data);
-		pfree(cols.data);
-	}
-	else
-	{
-		appendStringInfoString(&querybuf,
-							   " AND newdata.* OPERATOR(pg_catalog.*=) mv.*) "
-							   "WHERE newdata.* IS NULL OR mv.* IS NULL "
-							   "ORDER BY tid");
-	}
+	appendStringInfoString(&querybuf,
+						   " AND newdata.* OPERATOR(pg_catalog.*=) mv.*) "
+						   "WHERE newdata.* IS NULL OR mv.* IS NULL "
+						   "ORDER BY tid");
 
 	/* Populate the temporary "diff" table. */
-	if (matview_execute_spi(querybuf.data, params, false) != SPI_OK_INSERT)
+	if (SPI_exec(querybuf.data, 0) != SPI_OK_INSERT)
 		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
 
 	/*
@@ -2417,7 +2202,6 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 					 matviewname, diffname);
 	if (SPI_exec(querybuf.data, 0) != SPI_OK_DELETE)
 		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
-	applied += SPI_processed;
 
 	/* Inserts go last. */
 	resetStringInfo(&querybuf);
@@ -2425,47 +2209,8 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 					 "INSERT INTO %s SELECT (diff.newdata).* "
 					 "FROM %s diff WHERE tid IS NULL",
 					 matviewname, diffname);
-
-	/*
-	 * For a partial refresh the diff only covers rows matching the predicate,
-	 * so a fresh row can collide on the unique key with an existing row that
-	 * does not match it and was therefore never considered for deletion -- a
-	 * row that "drifted" into scope.  Resolve that in place rather than
-	 * failing, which is what the direct-modification path does.
-	 *
-	 * A full concurrent refresh diffs the whole matview, so no such row can
-	 * exist and the plain insert is left alone.
-	 */
-	if (whereClauseStr)
-	{
-		Oid			arbiterOid = matview_pick_arbiter_index(matviewRel);
-		StringInfoData conflict_cols;
-		StringInfoData set_clause;
-		bool		has_non_key_cols;
-
-		if (!OidIsValid(arbiterOid))
-			elog(ERROR, "could not find suitable unique index on materialized view \"%s\"",
-				 RelationGetRelationName(matviewRel));
-
-		initStringInfo(&conflict_cols);
-		initStringInfo(&set_clause);
-		matview_build_upsert_clause(matviewRel, arbiterOid, &conflict_cols,
-									&set_clause, &has_non_key_cols, NULL);
-
-		if (has_non_key_cols)
-			appendStringInfo(&querybuf, " ON CONFLICT (%s) DO UPDATE SET %s",
-							 conflict_cols.data, set_clause.data);
-		else
-			appendStringInfo(&querybuf, " ON CONFLICT (%s) DO NOTHING",
-							 conflict_cols.data);
-
-		pfree(conflict_cols.data);
-		pfree(set_clause.data);
-	}
-
 	if (SPI_exec(querybuf.data, 0) != SPI_OK_INSERT)
 		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
-	applied += SPI_processed;
 
 	/* We're done maintaining the materialized view. */
 	CloseMatViewIncrementalMaintenance();
@@ -2481,8 +2226,6 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 	/* Close SPI context. */
 	if (SPI_finish() != SPI_OK_FINISH)
 		elog(ERROR, "SPI_finish failed");
-
-	return applied;
 }
 
 /*
