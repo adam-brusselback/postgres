@@ -731,11 +731,12 @@ SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 -- either way.
 --
 -- Which algorithm runs is decided by how many unique indexes the matview
--- carries, and not by whether CONCURRENTLY was written.  The upsert has to
--- arbitrate on a single index, so a matview with a second one takes match/merge
--- whichever way the command is spelled.  Both spellings are run against both
--- shapes below, which is what says so: the counts pair by matview, not by
--- spelling.
+-- carries, and not by whether CONCURRENTLY was written.  With one unique index
+-- both spellings take the upsert and both report the same count, which is what
+-- says the spelling is not what decides it.  A matview with a second unique
+-- index needs match/merge -- the upsert arbitrates on a single index and cannot
+-- delete before it inserts -- and only the bare spelling can serve it, so that
+-- shape appears once below rather than twice.
 --
 -- Disposition: keep.  This belongs with the rows-tracking cases above; the
 -- count is part of the command's contract, not scaffolding.
@@ -766,22 +767,19 @@ REFRESH MATERIALIZED VIEW pgss_pr_matv WHERE a <= 3;
 REFRESH MATERIALIZED VIEW pgss_pr_matv WHERE a >= 9;
 UPDATE pgss_pr_base SET b = 'x' WHERE a <= 3;
 REFRESH MATERIALIZED VIEW CONCURRENTLY pgss_pr_matv WHERE a <= 3;
--- Two unique indexes, so both spellings take match/merge: the same three
--- changed rows become 3 deletes plus 3 inserts, so 6 writes each.
+-- Two unique indexes, so this takes match/merge: the same three changed rows
+-- become 3 deletes plus 3 inserts, so 6 writes for the change that cost 3 above.
 REFRESH MATERIALIZED VIEW pgss_pr_matv2 WHERE a <= 3;
-UPDATE pgss_pr_base2 SET b = 'x' WHERE a <= 3;
-REFRESH MATERIALIZED VIEW CONCURRENTLY pgss_pr_matv2 WHERE a <= 3;
 SELECT calls, rows, query FROM pg_stat_statements
   WHERE query LIKE 'REFRESH MATERIALIZED VIEW%pgss_pr_matv%'
   ORDER BY query COLLATE "C";
- calls | rows |                               query                               
--------+------+-------------------------------------------------------------------
+ calls | rows |                              query                               
+-------+------+------------------------------------------------------------------
      1 |    3 | REFRESH MATERIALIZED VIEW CONCURRENTLY pgss_pr_matv WHERE a <= 3
-     1 |    6 | REFRESH MATERIALIZED VIEW CONCURRENTLY pgss_pr_matv2 WHERE a <= 3
      1 |    3 | REFRESH MATERIALIZED VIEW pgss_pr_matv WHERE a <= 3
      1 |    2 | REFRESH MATERIALIZED VIEW pgss_pr_matv WHERE a >= 9
      1 |    6 | REFRESH MATERIALIZED VIEW pgss_pr_matv2 WHERE a <= 3
-(5 rows)
+(4 rows)
 
 DROP MATERIALIZED VIEW pgss_pr_matv;
 DROP TABLE pgss_pr_base;

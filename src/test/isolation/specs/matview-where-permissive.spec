@@ -57,11 +57,20 @@ setup
     INSERT INTO mvperm_base VALUES (1, 'one'), (2, 'two'), (3, 'three');
     CREATE MATERIALIZED VIEW mvperm AS SELECT id, v FROM mvperm_base;
     CREATE UNIQUE INDEX mvperm_id_idx ON mvperm(id);
+
+    -- The same matview with a second unique index, which is what routes a
+    -- partial refresh to diff/merge.  The extra column is unique in its own
+    -- right so the index is satisfiable without constraining anything else.
+    CREATE MATERIALIZED VIEW mvperm2 AS SELECT id, id * 100 AS u, v
+                                          FROM mvperm_base;
+    CREATE UNIQUE INDEX mvperm2_id_idx ON mvperm2(id);
+    CREATE UNIQUE INDEX mvperm2_u_idx ON mvperm2(u);
 }
 
 teardown
 {
     DROP MATERIALIZED VIEW mvperm;
+    DROP MATERIALIZED VIEW mvperm2;
     DROP TABLE mvperm_base;
 }
 
@@ -70,6 +79,7 @@ setup             { BEGIN; }
 step s1_bare      { REFRESH MATERIALIZED VIEW mvperm WHERE id = 1; }
 step s1_conc      { REFRESH MATERIALIZED VIEW CONCURRENTLY mvperm WHERE id = 1; }
 step s1_full      { REFRESH MATERIALIZED VIEW mvperm; }
+step s1_bare2     { REFRESH MATERIALIZED VIEW mvperm2 WHERE id = 1; }
 step s1_commit    { COMMIT; }
 
 session s2
@@ -77,6 +87,8 @@ setup             { BEGIN; }
 # Disjoint from every predicate s1 uses: nothing about the rows can order these.
 step s2_conc      { REFRESH MATERIALIZED VIEW CONCURRENTLY mvperm WHERE id = 3; }
 step s2_read      { SELECT id, v FROM mvperm ORDER BY id; }
+step s2_bare2     { REFRESH MATERIALIZED VIEW mvperm2 WHERE id = 3; }
+step s2_read2     { SELECT id, u, v FROM mvperm2 ORDER BY id; }
 step s2_commit    { COMMIT; }
 
 # 1. The bare form is the exclusive one: a disjoint refresh waits for it, and a
@@ -90,3 +102,10 @@ permutation s1_conc s2_read s2_conc s1_commit s2_commit
 
 # 3. A full refresh gives up the readers too, which the partial forms do not.
 permutation s1_full s2_read s1_commit s2_commit
+
+# 4. The path a multi-unique-index matview is steered to.  CONCURRENTLY is
+#    refused there -- the upsert cannot delete before it inserts, and the lock
+#    is chosen from the spelling before that is known -- so the bare form is the
+#    only way to refresh one partially, and it has to behave like the bare form
+#    everywhere else: a second refresh waits, a reader does not.
+permutation s1_bare2 s2_read2 s2_bare2 s1_commit s2_commit

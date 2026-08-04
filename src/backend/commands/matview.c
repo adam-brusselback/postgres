@@ -857,6 +857,33 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 							quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
 													   RelationGetRelationName(matviewRel))),
 					 errhint("Create a unique index with no WHERE clause on one or more columns of the materialized view.")));
+
+		/*
+		 * A partial refresh that needs diff/merge cannot be spelled
+		 * CONCURRENTLY, because the lock is chosen from the spelling before
+		 * the algorithm is known.  CONCURRENTLY with a predicate takes
+		 * RowExclusiveLock so refreshes over disjoint scopes run in parallel;
+		 * diff/merge then takes ExclusiveLock itself, upgrading mid-statement.
+		 * Two such refreshes hold RowExclusiveLock and both wait for
+		 * ExclusiveLock, which deadlocks by construction -- measured at 796 of
+		 * 1200 refreshes, against zero for the bare spelling and zero for a
+		 * matview with one unique index.
+		 *
+		 * Refusing it gives up nothing that worked: the upgrade means such a
+		 * refresh already serialized against every other one, so CONCURRENTLY
+		 * was not buying the parallelism it names, and the bare spelling
+		 * reaches the same algorithm under the same lock taken once.  Lifting
+		 * the restriction needs direct modification to delete before it
+		 * inserts, which would remove the routing fork and this check with it.
+		 */
+		if (qual && concurrent && nUniqueIndexes > 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot refresh materialized view \"%s\" concurrently with a WHERE clause",
+							quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
+													   RelationGetRelationName(matviewRel))),
+					 errdetail("The materialized view has more than one unique index."),
+					 errhint("Use REFRESH MATERIALIZED VIEW without CONCURRENTLY.")));
 	}
 
 	/*

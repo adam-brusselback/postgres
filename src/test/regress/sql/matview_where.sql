@@ -235,8 +235,12 @@ CREATE UNIQUE INDEX ON mv_multi(username);
 -- Update all columns
 UPDATE mv_multi_uk SET email = 'b@example.com', username = 'user_b' WHERE id = 1;
 
--- Refresh should succeed updating all unique indexes
-REFRESH MATERIALIZED VIEW CONCURRENTLY mv_multi WHERE id = 1;
+-- Refresh should succeed updating all unique indexes.  The bare spelling,
+-- because a second unique index routes a partial refresh to diff/merge and
+-- CONCURRENTLY is refused there -- Test 14 has the rule and the reason.  The
+-- answer to the question this case was written for is unchanged: a change
+-- touching several unique keys at once is applied correctly.
+REFRESH MATERIALIZED VIEW mv_multi WHERE id = 1;
 
 SELECT * FROM mv_multi;
 
@@ -515,13 +519,23 @@ DROP TABLE mv_sp_base;
 --
 -- The two are selected by counting unique indexes, not by spelling.  With one,
 -- the collision is impossible rather than unlikely, so direct modification is
--- provably safe and both spellings use it.  With more than one, both spellings
--- use diff/merge and pay for the capability.  A matview that does not need the
--- second unique index gets the fast path back by dropping it.
+-- provably safe and both spellings use it.  With more than one, diff/merge is
+-- the only algorithm that can apply the change -- and it is available to the
+-- bare spelling only, which is the second half of this test.
 --
--- Disposition: keep.  It pins the routing rule in both directions, and it is
--- the test that would notice if a future statement shape (a scoped delete
--- before the insert, say) let direct modification express this after all.
+-- CONCURRENTLY is refused there because the lock is chosen from the spelling
+-- before the algorithm is known: it takes RowExclusiveLock, diff/merge then
+-- takes ExclusiveLock itself, and two such refreshes deadlock on the upgrade
+-- rather than serialize.  Measured at 796 of 1200 refreshes before the refusal
+-- went in, against zero for the bare spelling.  Nothing is given up by refusing
+-- it, because the upgrade already serialized every such refresh against every
+-- other -- CONCURRENTLY was not buying the parallelism it names.
+--
+-- Disposition: keep.  It pins the routing rule in both directions and the
+-- refusal that follows from it, and it is the test that would notice if a
+-- future statement shape (a scoped delete before the insert, say) let direct
+-- modification express this after all -- at which point the fork disappears and
+-- the refusal can be lifted without breaking anyone.
 --
 
 CREATE TABLE mv_multi2_base (id int primary key, email text, uname text);
@@ -538,14 +552,25 @@ CREATE UNIQUE INDEX ON mv_multi2(uname);
 UPDATE mv_multi2_base SET email = CASE id WHEN 1 THEN 'b@example.com'
                                           ELSE 'a@example.com' END;
 
--- Two unique indexes, so both spellings route to diff/merge and both apply it.
+-- Two unique indexes, so CONCURRENTLY is refused rather than deadlocking.
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_multi2 WHERE id IN (1, 2);
+
+-- The matview is untouched by the refusal: it still holds the pre-swap rows.
 SELECT * FROM mv_multi2 ORDER BY id;
 
--- Swap them back, this time with the bare spelling.
+-- The bare spelling reaches diff/merge and applies the swap.
+REFRESH MATERIALIZED VIEW mv_multi2 WHERE id IN (1, 2);
+SELECT * FROM mv_multi2 ORDER BY id;
+
+-- Swap them back, to show the first one was not a one-way accident.
 UPDATE mv_multi2_base SET email = CASE id WHEN 1 THEN 'a@example.com'
                                           ELSE 'b@example.com' END;
 REFRESH MATERIALIZED VIEW mv_multi2 WHERE id IN (1, 2);
+SELECT * FROM mv_multi2 ORDER BY id;
+
+-- A FULL concurrent refresh is unaffected: it takes ExclusiveLock from the
+-- start, so diff/merge does not upgrade anything and there is nothing to refuse.
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_multi2;
 SELECT * FROM mv_multi2 ORDER BY id;
 
 -- Drop the second unique index and the same matview takes the fast path again
@@ -556,6 +581,10 @@ SELECT * FROM mv_multi2 ORDER BY id;
 -- which needs a second unique index, which is exactly the case that routes to
 -- diff/merge.  So the fast path is not merely safe here, it is complete: no
 -- capability is given up by taking it.
+--
+-- This is also what says the refusal above is specific rather than a blanket
+-- ban on CONCURRENTLY: the same command on the same matview succeeds once the
+-- second unique index is gone.
 DROP INDEX mv_multi2_uname_idx;
 UPDATE mv_multi2_base SET email = CASE id WHEN 1 THEN 'b@example.com'
                                           ELSE 'a@example.com' END;

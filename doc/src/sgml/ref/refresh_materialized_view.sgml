@@ -176,9 +176,18 @@ REFRESH MATERIALIZED VIEW [ CONCURRENTLY ] <replaceable class="parameter">name</
       predicates cover disjoint rows run in parallel; those that overlap
       serialize on row locks.  As with ordinary row-level locking, two
       transactions that refresh overlapping sets of rows in different orders can
-      deadlock, and are reported as such.  This form cannot apply a change that
-      would require deleting one row before inserting another to satisfy a
-      second unique index; use the form below for that.
+      deadlock, and are reported as such.
+     </para>
+     <para>
+      The upsert resolves collisions against a single index, so it cannot apply
+      a change that would require deleting one row before inserting another to
+      satisfy a <emphasis>second</emphasis> unique index — two rows exchanging
+      their values on one, for instance.  A partial refresh of a materialized
+      view carrying more than one unique index therefore requires the form
+      below, and specifying <literal>CONCURRENTLY</literal> for one is an error
+      rather than a silent change of algorithm.  Dropping the extra unique
+      index, where the materialized view does not need it, makes
+      <literal>CONCURRENTLY</literal> available again.
      </para>
      <para>
       Without <literal>CONCURRENTLY</literal>, the rows matching the condition
