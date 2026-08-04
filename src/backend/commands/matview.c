@@ -290,7 +290,6 @@ contain_non_leakproof_walker(Node *node, void *context)
 		case T_List:
 			break;
 
-
 		case T_FuncExpr:
 		case T_OpExpr:
 		case T_DistinctExpr:
@@ -447,7 +446,6 @@ refresh_const_is_paramizable(Const *con)
 	if (!OidIsValid(con->consttype) || con->consttype == UNKNOWNOID)
 		return false;
 
-
 	if (get_typtype(con->consttype) == TYPTYPE_PSEUDO)
 		return false;
 
@@ -507,7 +505,6 @@ parameterizeRefreshWhereClause(Node *qual, ParamListInfo *params)
 	ctx.consts = NIL;
 
 	newqual = paramize_refresh_consts_mutator(qual, &ctx);
-
 
 	if (ctx.consts == NIL)
 		return qual;
@@ -835,8 +832,8 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 					 errhint("Create a unique index with no WHERE clause on one or more columns of the materialized view.")));
 
 		/*
-		 * Lifting this needs the upsert to delete before it inserts, which
-		 * ON CONFLICT cannot do.  A full refresh has no such limit, since it
+		 * Lifting this needs the upsert to delete before it inserts, which ON
+		 * CONFLICT cannot do.  A full refresh has no such limit, since it
 		 * rewrites the whole matview and never has to reconcile a new row
 		 * against one it is not replacing.
 		 */
@@ -1228,7 +1225,6 @@ matview_cache_sweep(void)
 		if (entry->metacxt)
 			MemoryContextDelete(entry->metacxt);
 
-
 		if (hash_search(MatViewRefreshCache, &entry->matviewOid,
 						HASH_REMOVE, NULL) == NULL)
 			elog(ERROR, "hash table corrupted");
@@ -1278,12 +1274,10 @@ matview_build_source_query(Relation matviewRel, Query *dataQuery, Node *qual,
 										   true);
 	addNSItemToQuery(pstate, nsitem, true, false, true);
 
-
 	Assert(nsitem->p_rtindex == 1);
 
 	sourceQuery->commandType = CMD_SELECT;
 	sourceQuery->canSetTag = true;
-
 
 	sourceQuery->targetList = expandNSItemAttrs(pstate, nsitem, 0, false, -1);
 
@@ -1293,7 +1287,6 @@ matview_build_source_query(Relation matviewRel, Query *dataQuery, Node *qual,
 		TargetEntry *tle = list_nth_node(TargetEntry, sourceQuery->targetList,
 										 attnum - 1);
 		SortBy	   *sortby = makeNode(SortBy);
-
 
 		Assert(attnum > 0 && tle->resno == attnum);
 
@@ -1346,7 +1339,6 @@ matview_build_source_plansource(Query *sourceQuery)
 	AcquireRewriteLocks(sourceQuery, true, false);
 
 	querytree_list = pg_rewrite_query(sourceQuery);
-
 
 	if (list_length(querytree_list) != 1)
 		elog(ERROR, "unexpected rewrite result for REFRESH MATERIALIZED VIEW");
@@ -1502,13 +1494,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	 * this tree, so two trees that compare equal deparse to the same
 	 * statement.  argtypes is still checked, since a caller may bind a
 	 * parameter the predicate never names.
-	 */
-
-	/*
-	 * Same predicate means an equal() tree: the plans were built by deparsing
-	 * this tree, so two trees that compare equal deparse to the same
-	 * statement.  argtypes is still checked, since a caller may bind a
-	 * parameter the predicate never names.
 	 *
 	 * The plans must also still be valid, and that is not belt and braces.  A
 	 * qual tree names a function or operator by OID, so renaming one leaves
@@ -1657,7 +1642,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 			initStringInfo(&set_clause);
 			initStringInfo(&join_clause);
 
-
 			first = true;
 			for (i = 0; i < indexStruct->indnkeyatts; i++)
 			{
@@ -1678,7 +1662,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 				appendStringInfo(&join_clause, "nd.%s %s " MATVIEW_ALIAS ".%s",
 								 quoted, anti_join_op, quoted);
 			}
-
 
 			first = true;
 			for (i = 0; i < tupdesc->natts; i++)
@@ -1818,7 +1801,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 				pfree(argtypes);
 		}
 
-
 		/*
 		 * Lock the matview rows in scope before evaluating the source, and
 		 * take the snapshot the source runs under only afterwards.  The order
@@ -1889,7 +1871,6 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	{
 		matview_maintenance_depth = old_depth;
 		matview_maintenance_relid = old_relid;
-
 
 		if (!use_cache && cacheEntry->sourcePlan != NULL)
 		{

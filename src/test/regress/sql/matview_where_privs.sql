@@ -291,13 +291,11 @@ DROP ROLE regress_mvlp_owner;
 -- Zsolt's repro, extended to show that the exemption is not scoped to the
 -- matview being refreshed.
 --
--- refresh_by_direct_modification() has no PG_TRY between
--- OpenMatViewIncrementalMaintenance() and its matching Close (compare the
--- match/merge call site, which does).  An error in between skips the Close and
--- leaves the counter above zero, disabling the "cannot change materialized
--- view" check for the remainder of the session.
---
--- NB: while this leak still exists, nothing may be added after this test.
+-- refresh_by_direct_modification() had no PG_TRY between
+-- OpenMatViewIncrementalMaintenance() and its matching Close, so an error in
+-- between skipped the Close and left the counter above zero, disabling the
+-- "cannot change materialized view" check for the remainder of the session.
+-- It has one now, and this is what says so.
 --
 
 CREATE TABLE mv_leak_base (id int, code int, v text);

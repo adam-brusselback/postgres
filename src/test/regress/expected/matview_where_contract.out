@@ -192,11 +192,12 @@ SELECT count(*) AS p6_after_bare_noop FROM ct_null_mv;
 (1 row)
 
 --
--- Promise 7: both forms agree.
+-- Promise 7: a partial refresh converges with a full one.
 --
--- The bare form and CONCURRENTLY select different maintenance strategies, and
--- which one is which changed once already (A8).  What must not change is that
--- they produce the same rows from the same input.
+-- This is the promise the whole feature rests on, and the one no amount of
+-- reading the implementation establishes: whatever a partial refresh does to
+-- the rows its predicate names, the result must be what a full refresh would
+-- have produced.  Two identical matviews, one refreshed each way.
 --
 CREATE TABLE ct_agree (id int PRIMARY KEY, grp int, val int);
 INSERT INTO ct_agree SELECT g, g % 3, g FROM generate_series(1, 9) g;
@@ -207,26 +208,27 @@ CREATE MATERIALIZED VIEW ct_agree_b AS
   SELECT grp, sum(val) AS total FROM ct_agree GROUP BY grp;
 CREATE UNIQUE INDEX ON ct_agree_b(grp);
 UPDATE ct_agree SET val = val * 2 WHERE grp = 1;
-REFRESH MATERIALIZED VIEW CONCURRENTLY ct_agree_a WHERE grp = 1;
+REFRESH MATERIALIZED VIEW ct_agree_a;
 REFRESH MATERIALIZED VIEW CONCURRENTLY ct_agree_b WHERE grp = 1;
-SELECT count(*) AS p7_forms_disagree
+-- Both directions, because EXCEPT ALL is not symmetric: one way finds rows the
+-- partial refresh failed to produce, the other finds rows it produced and
+-- should not have.  Checking one of them is half a test.
+SELECT count(*) AS p7_full_has_rows_partial_does_not
   FROM ((SELECT grp, total FROM ct_agree_a)
         EXCEPT ALL
         (SELECT grp, total FROM ct_agree_b)) d;
- p7_forms_disagree 
--------------------
-                 0
+ p7_full_has_rows_partial_does_not 
+-----------------------------------
+                                 0
 (1 row)
 
--- and both agree with a full refresh
-REFRESH MATERIALIZED VIEW ct_agree_a;
-SELECT count(*) AS p7_partial_differs_from_full
-  FROM ((SELECT grp, total FROM ct_agree_a)
+SELECT count(*) AS p7_partial_has_rows_full_does_not
+  FROM ((SELECT grp, total FROM ct_agree_b)
         EXCEPT ALL
-        (SELECT grp, total FROM ct_agree_b)) d;
- p7_partial_differs_from_full 
-------------------------------
-                            0
+        (SELECT grp, total FROM ct_agree_a)) d;
+ p7_partial_has_rows_full_does_not 
+-----------------------------------
+                                 0
 (1 row)
 
 --
