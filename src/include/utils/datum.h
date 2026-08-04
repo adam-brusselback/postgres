@@ -64,6 +64,14 @@ extern bool datum_image_eq(Datum value1, Datum value2,
 extern uint32 datum_image_hash(Datum value, bool typByVal, int typLen);
 
 /*
+ * datum_image_hash_extended
+ *
+ * As above, but returns a 64-bit hash value and accepts a seed.
+ */
+extern uint64 datum_image_hash_extended(Datum value, bool typByVal, int typLen,
+										uint64 seed);
+
+/*
  * Serialize and restore datums so that we can transfer them to parallel
  * workers.
  */

@@ -413,6 +413,77 @@ datum_image_hash(Datum value, bool typByVal, int typLen)
 }
 
 /*-------------------------------------------------------------------------
+ * datum_image_hash_extended
+ *
+ * As datum_image_hash, but returns a 64-bit hash value and takes a seed.
+ *
+ * This must normalize its input in exactly the same way datum_image_eq()
+ * does, so that datums which that function considers equal always hash
+ * alike.
+ *-------------------------------------------------------------------------
+ */
+uint64
+datum_image_hash_extended(Datum value, bool typByVal, int typLen, uint64 seed)
+{
+	Size		len;
+	uint64		result;
+
+	if (typByVal)
+	{
+		switch (typLen)
+		{
+			case sizeof(char):
+				value = CharGetDatum(DatumGetChar(value));
+				break;
+			case sizeof(int16):
+				value = Int16GetDatum(DatumGetInt16(value));
+				break;
+			case sizeof(int32):
+				value = Int32GetDatum(DatumGetInt32(value));
+				break;
+				/* Nothing needs done for 64-bit types */
+		}
+
+		result = hash_bytes_extended((unsigned char *) &value, sizeof(Datum),
+									 seed);
+	}
+	else if (typLen > 0)
+		result = hash_bytes_extended((unsigned char *) DatumGetPointer(value),
+									 typLen, seed);
+	else if (typLen == -1)
+	{
+		varlena    *val;
+
+		len = toast_raw_datum_size(value);
+
+		val = PG_DETOAST_DATUM_PACKED(value);
+
+		result = hash_bytes_extended((unsigned char *) VARDATA_ANY(val),
+									 len - VARHDRSZ, seed);
+
+		/* Only free memory if it's a copy made here. */
+		if (val != DatumGetPointer(value))
+			pfree(val);
+	}
+	else if (typLen == -2)
+	{
+		char	   *s;
+
+		s = DatumGetCString(value);
+		len = strlen(s) + 1;
+
+		result = hash_bytes_extended((unsigned char *) s, len, seed);
+	}
+	else
+	{
+		elog(ERROR, "unexpected typLen: %d", typLen);
+		result = 0;				/* keep compiler quiet */
+	}
+
+	return result;
+}
+
+/*-------------------------------------------------------------------------
  * btequalimage
  *
  * Generic "equalimage" support function.

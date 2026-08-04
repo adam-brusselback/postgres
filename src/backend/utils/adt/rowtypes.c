@@ -2050,3 +2050,142 @@ hash_record_extended(PG_FUNCTION_ARGS)
 
 	PG_RETURN_UINT64(result);
 }
+
+/*
+ * Row type hash functions based on raw byte images
+ *
+ * These must agree with record_image_eq(), in the sense that any two records
+ * that record_image_eq() reports as equal must hash alike.  We therefore walk
+ * the columns exactly as that function does -- skipping dropped columns and
+ * treating nulls as a distinguished value -- and hash each remaining field
+ * with datum_image_hash(), the same primitive record_image_eq() compares with.
+ *
+ * Note that, unlike hash_record(), no per-column hash support function is
+ * needed: image hashing works off the bits, so these functions never fail for
+ * lack of a hashable column type.  That is what makes record_image_eq
+ * unconditionally hashable, whereas record_eq is hashable only when every
+ * column type is.
+ */
+
+Datum
+hash_record_image(PG_FUNCTION_ARGS)
+{
+	HeapTupleHeader record = PG_GETARG_HEAPTUPLEHEADER(0);
+	uint32		result = 0;
+	Oid			tupType;
+	int32		tupTypmod;
+	TupleDesc	tupdesc;
+	HeapTupleData tuple;
+	int			ncolumns;
+	Datum	   *values;
+	bool	   *nulls;
+
+	/* Extract type info from tuple */
+	tupType = HeapTupleHeaderGetTypeId(record);
+	tupTypmod = HeapTupleHeaderGetTypMod(record);
+	tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+	ncolumns = tupdesc->natts;
+
+	/* Build temporary HeapTuple control structure */
+	tuple.t_len = HeapTupleHeaderGetDatumLength(record);
+	ItemPointerSetInvalid(&(tuple.t_self));
+	tuple.t_tableOid = InvalidOid;
+	tuple.t_data = record;
+
+	/* Break down the tuple into fields */
+	values = palloc_array(Datum, ncolumns);
+	nulls = palloc_array(bool, ncolumns);
+	heap_deform_tuple(&tuple, tupdesc, values, nulls);
+
+	for (int i = 0; i < ncolumns; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+		uint32		element_hash;
+
+		/*
+		 * Dropped columns are skipped, not hashed as nulls.  record_image_eq
+		 * ignores them on each side independently, so two records can be
+		 * equal while having dropped columns in different positions.
+		 */
+		if (att->attisdropped)
+			continue;
+
+		if (nulls[i])
+			element_hash = 0;
+		else
+			element_hash = datum_image_hash(values[i], att->attbyval,
+											att->attlen);
+
+		/* see hash_record() */
+		result = (result << 5) - result + element_hash;
+	}
+
+	pfree(values);
+	pfree(nulls);
+	ReleaseTupleDesc(tupdesc);
+
+	/* Avoid leaking memory when handed toasted input. */
+	PG_FREE_IF_COPY(record, 0);
+
+	PG_RETURN_UINT32(result);
+}
+
+Datum
+hash_record_image_extended(PG_FUNCTION_ARGS)
+{
+	HeapTupleHeader record = PG_GETARG_HEAPTUPLEHEADER(0);
+	uint64		seed = PG_GETARG_INT64(1);
+	uint64		result = 0;
+	Oid			tupType;
+	int32		tupTypmod;
+	TupleDesc	tupdesc;
+	HeapTupleData tuple;
+	int			ncolumns;
+	Datum	   *values;
+	bool	   *nulls;
+
+	/* Extract type info from tuple */
+	tupType = HeapTupleHeaderGetTypeId(record);
+	tupTypmod = HeapTupleHeaderGetTypMod(record);
+	tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+	ncolumns = tupdesc->natts;
+
+	/* Build temporary HeapTuple control structure */
+	tuple.t_len = HeapTupleHeaderGetDatumLength(record);
+	ItemPointerSetInvalid(&(tuple.t_self));
+	tuple.t_tableOid = InvalidOid;
+	tuple.t_data = record;
+
+	/* Break down the tuple into fields */
+	values = palloc_array(Datum, ncolumns);
+	nulls = palloc_array(bool, ncolumns);
+	heap_deform_tuple(&tuple, tupdesc, values, nulls);
+
+	for (int i = 0; i < ncolumns; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+		uint64		element_hash;
+
+		/* see hash_record_image() */
+		if (att->attisdropped)
+			continue;
+
+		if (nulls[i])
+			element_hash = 0;
+		else
+			element_hash = datum_image_hash_extended(values[i], att->attbyval,
+													 att->attlen, seed);
+
+		/* see hash_record_extended() */
+		result = (result << 5) - result + element_hash;
+	}
+
+	pfree(values);
+	pfree(nulls);
+	ReleaseTupleDesc(tupdesc);
+
+	/* Avoid leaking memory when handed toasted input. */
+	PG_FREE_IF_COPY(record, 0);
+
+	PG_RETURN_UINT64(result);
+}

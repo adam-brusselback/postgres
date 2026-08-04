@@ -3026,7 +3026,7 @@
 
 # byte-oriented tests for identical rows and fast sorting
 { oid => '3188', descr => 'identical',
-  oprname => '*=', oprcanmerge => 't', oprleft => 'record',
+  oprname => '*=', oprcanmerge => 't', oprcanhash => 't', oprleft => 'record',
   oprright => 'record', oprresult => 'bool', oprcom => '*=(record,record)',
   oprnegate => '*<>(record,record)', oprcode => 'record_image_eq',
   oprrest => 'eqsel', oprjoin => 'eqjoinsel' },
