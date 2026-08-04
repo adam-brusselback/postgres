@@ -858,3 +858,102 @@ DROP MATERIALIZED VIEW mv_nd5;
 DROP TABLE mv_nd5_base;
 DROP MATERIALIZED VIEW mv_nd;
 DROP TABLE mv_nd_base;
+
+--
+-- Test 18: a subquery in the predicate
+--
+-- Naming the right scope often needs one.  A change to a dimension table
+-- changes the output rows of every fact row joined to it, and the predicate has
+-- to select those rows -- which means asking the fact table which they are, not
+-- naming the dimension's own key.  That is the shape the documentation's
+-- blast-radius warning tells people to write, so it has to work.
+--
+-- The correlated case is the one worth pinning.  An uncorrelated subquery is
+-- resolved without ever referring back to the matview, so nothing about how the
+-- matview is named can go wrong; the moment a subquery refers back, the
+-- predicate has to be deparsed into the generated statements under the name
+-- those statements actually use.  Test 13 covers the deparse itself; these
+-- cover the shapes it has to survive, and that the result converges with a full
+-- refresh.
+--
+-- Disposition: keep.  Correlated predicates reach parts of the generated SQL
+-- that no other case does, and the failure is loud rather than silent, which
+-- makes these cheap to keep and easy to read when they break.
+--
+
+CREATE TABLE mv_sq_fact (id int PRIMARY KEY, did int, v int);
+CREATE TABLE mv_sq_dim (id int PRIMARY KEY, nm text);
+INSERT INTO mv_sq_dim VALUES (1, 'one'), (2, 'two'), (3, 'three');
+INSERT INTO mv_sq_fact SELECT g, (g % 3) + 1, g * 10 FROM generate_series(1, 9) g;
+
+CREATE MATERIALIZED VIEW mv_sq AS
+  SELECT f.id, f.did, d.nm, f.v
+    FROM mv_sq_fact f JOIN mv_sq_dim d ON d.id = f.did;
+CREATE UNIQUE INDEX ON mv_sq(id);
+
+-- The dimension row changes, so every fact row joined to it is stale.  The
+-- correct scope is "the fact rows whose did is 1", which only the fact table
+-- knows.
+UPDATE mv_sq_dim SET nm = 'ONE' WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_sq
+  WHERE EXISTS (SELECT 1 FROM public.mv_sq_fact f
+                 WHERE f.id = mv_sq.id AND f.did = 1);
+SELECT id, did, nm FROM mv_sq ORDER BY id;
+
+-- IN, correlated on a different column from the one it selects.
+UPDATE mv_sq_dim SET nm = 'TWO' WHERE id = 2;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_sq
+  WHERE id IN (SELECT f.id FROM public.mv_sq_fact f
+                WHERE f.did = mv_sq.did AND f.did = 2);
+SELECT id, did, nm FROM mv_sq ORDER BY id;
+
+-- Nested, so the correlation crosses two levels.
+UPDATE mv_sq_dim SET nm = 'THREE' WHERE id = 3;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_sq
+  WHERE EXISTS (SELECT 1 FROM public.mv_sq_fact o
+                 WHERE o.id = mv_sq.id
+                   AND EXISTS (SELECT 1 FROM public.mv_sq_dim i
+                                WHERE i.id = o.did AND i.id = 3));
+SELECT id, did, nm FROM mv_sq ORDER BY id;
+
+-- Correlated, with the constant arriving as a bound parameter.  The predicate's
+-- own constants become parameters before the deparse, so a correlated
+-- subquery has to survive that too.
+UPDATE mv_sq_dim SET nm = 'uno' WHERE id = 1;
+DO $$
+BEGIN
+  EXECUTE 'REFRESH MATERIALIZED VIEW CONCURRENTLY mv_sq
+             WHERE EXISTS (SELECT 1 FROM public.mv_sq_fact f
+                            WHERE f.id = mv_sq.id AND f.did = $1)' USING 1;
+END $$;
+SELECT id, did, nm FROM mv_sq ORDER BY id;
+
+-- Twice with the same predicate, so the second refresh runs off the cached
+-- plan, and with the subquery's own table changed in between -- which the
+-- cached statement has to notice.  Row 2 moves into did 1 and must be picked up
+-- by a predicate that names did 1 but never mentions row 2.
+UPDATE mv_sq_dim SET nm = 'A1' WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_sq
+  WHERE EXISTS (SELECT 1 FROM public.mv_sq_fact f
+                 WHERE f.id = mv_sq.id AND f.did = 1);
+UPDATE mv_sq_fact SET did = 1 WHERE id = 2;
+UPDATE mv_sq_dim SET nm = 'A2' WHERE id = 1;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_sq
+  WHERE EXISTS (SELECT 1 FROM public.mv_sq_fact f
+                 WHERE f.id = mv_sq.id AND f.did = 1);
+SELECT id, did, nm FROM mv_sq ORDER BY id;
+
+-- ... and all of that converged with what a full refresh produces.  This is the
+-- check that makes the ones above mean something: they assert particular rows,
+-- this asserts there is nothing else wrong.
+CREATE TEMP TABLE mv_sq_partial AS SELECT * FROM mv_sq;
+REFRESH MATERIALIZED VIEW mv_sq;
+SELECT count(*) AS full_has_rows_partial_does_not
+  FROM (SELECT * FROM mv_sq EXCEPT ALL SELECT * FROM mv_sq_partial) d;
+SELECT count(*) AS partial_has_rows_full_does_not
+  FROM (SELECT * FROM mv_sq_partial EXCEPT ALL SELECT * FROM mv_sq) d;
+
+DROP TABLE mv_sq_partial;
+DROP MATERIALIZED VIEW mv_sq;
+DROP TABLE mv_sq_fact;
+DROP TABLE mv_sq_dim;

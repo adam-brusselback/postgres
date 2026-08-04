@@ -18,7 +18,7 @@
 -- so its wording is not knowable here; the SQLSTATE that a correct rejection
 -- must carry is.
 --
--- Disposition: keep, all three.  These are security regressions, and the
+-- Disposition: keep, all of them.  These are security regressions, and the
 -- classes they cover -- a caller reaching objects through a predicate it could
 -- not reach directly, a predicate modifying a matview, and an error leaving the
 -- maintenance flag raised -- are all easy to reintroduce.  They should stay in
@@ -38,8 +38,9 @@
 -- leak cannot happen rather than that the rejection does -- do not simply
 -- regenerate the expected output, which would silently retire the check.
 --
--- The last test deliberately leaves the session unable to protect any matview
--- from direct DML, so nothing may be added after it.
+-- Test 4 used to leave the session unable to protect any matview from direct
+-- DML, so nothing could follow it.  That was the defect it exists to catch;
+-- with the flag restored on error, the ordering constraint is gone with it.
 --
 
 --
@@ -331,3 +332,92 @@ SELECT count(*) AS other_rows_after_delete FROM mv_leak_other;
 DROP MATERIALIZED VIEW mv_leak_other;
 DROP MATERIALIZED VIEW mv_leak;
 DROP TABLE mv_leak_base;
+
+--
+-- Test 5: a subquery in the predicate is owner-only
+--
+-- Found here, not on the -hackers thread.  This is a consequence of Test 1's
+-- rule rather than a separate decision, and it is recorded separately because
+-- of what it costs: naming the correct scope for a change to a dimension table
+-- requires asking the fact table which rows joined to it, which is a subquery,
+-- and that is the pattern the documentation's blast-radius warning tells people
+-- to write.  So the documented correct usage is available to the owner and to
+-- nobody else.
+--
+-- The mechanism is that the leakproof gate walks the predicate over an allowed
+-- list of node tags and refuses everything else (Test 3), and SubLink is not on
+-- that list.  Refusing is the safe default and it is not obviously wrong: the
+-- subquery runs as the owner, so a caller who cannot read the table it names
+-- would otherwise learn which of its rows intersect the matview.  But it is
+-- indiscriminate -- it refuses the subquery whether or not the caller could
+-- have run it themselves.
+--
+-- Note also what the message says.  There is no function anywhere in these
+-- predicates, and the hint still blames one.
+--
+-- Disposition: keep.  If the rule is ever narrowed to "the caller may read
+-- everything the subquery reads", these cases are what says so: the first two
+-- would start succeeding and the last must not.
+--
+
+CREATE ROLE regress_mvsq_owner;
+CREATE ROLE regress_mvsq_maint;
+CREATE SCHEMA mvsq;
+GRANT USAGE ON SCHEMA mvsq TO regress_mvsq_owner, regress_mvsq_maint;
+
+CREATE TABLE mvsq.fact (id int PRIMARY KEY, did int);
+CREATE TABLE mvsq.dim (id int PRIMARY KEY, nm text);
+CREATE TABLE mvsq.secret (id int, s text);
+INSERT INTO mvsq.dim VALUES (1, 'one'), (2, 'two');
+INSERT INTO mvsq.fact SELECT g, (g % 2) + 1 FROM generate_series(1, 4) g;
+INSERT INTO mvsq.secret VALUES (1, 'x');
+
+CREATE MATERIALIZED VIEW mvsq.mv AS
+  SELECT f.id, f.did, d.nm FROM mvsq.fact f JOIN mvsq.dim d ON d.id = f.did;
+CREATE UNIQUE INDEX ON mvsq.mv (id);
+
+ALTER TABLE mvsq.fact OWNER TO regress_mvsq_owner;
+ALTER TABLE mvsq.dim OWNER TO regress_mvsq_owner;
+ALTER TABLE mvsq.secret OWNER TO regress_mvsq_owner;
+ALTER MATERIALIZED VIEW mvsq.mv OWNER TO regress_mvsq_owner;
+GRANT MAINTAIN ON mvsq.mv TO regress_mvsq_maint;
+-- The maintainer may read the fact and dimension tables, and not the secret.
+GRANT SELECT ON mvsq.fact, mvsq.dim TO regress_mvsq_maint;
+
+UPDATE mvsq.dim SET nm = 'ONE' WHERE id = 1;
+
+-- Control: a plain column predicate is available to MAINTAIN, as Test 1 says.
+SET ROLE regress_mvsq_maint;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsq.mv WHERE id = 3;
+
+-- Refused, though the maintainer has SELECT on every table the subquery names
+-- and could run it themselves.
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsq.mv
+  WHERE id IN (SELECT f.id FROM mvsq.fact f WHERE f.did = 1);
+
+-- Refused, correlated form of the same thing.
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsq.mv
+  WHERE EXISTS (SELECT 1 FROM mvsq.fact f WHERE f.id = mvsq.mv.id AND f.did = 1);
+
+-- Refused, and this one must stay refused however the rule is narrowed: the
+-- maintainer cannot read mvsq.secret, so the answer would tell them which of
+-- its rows exist.
+SELECT count(*) FROM mvsq.secret;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsq.mv
+  WHERE id IN (SELECT s.id FROM mvsq.secret s);
+RESET ROLE;
+
+-- The owner may use all three.
+SET ROLE regress_mvsq_owner;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsq.mv
+  WHERE EXISTS (SELECT 1 FROM mvsq.fact f WHERE f.id = mvsq.mv.id AND f.did = 1);
+RESET ROLE;
+SELECT id, did, nm FROM mvsq.mv ORDER BY id;
+
+DROP MATERIALIZED VIEW mvsq.mv;
+DROP TABLE mvsq.secret;
+DROP TABLE mvsq.fact;
+DROP TABLE mvsq.dim;
+DROP SCHEMA mvsq;
+DROP ROLE regress_mvsq_owner;
+DROP ROLE regress_mvsq_maint;
