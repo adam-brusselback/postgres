@@ -1735,12 +1735,33 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 	 * statement.  argtypes is still checked, since a caller may bind a
 	 * parameter the predicate never names.
 	 */
+	/*
+	 * Same predicate means an equal() tree: the plans were built by deparsing
+	 * this tree, so two trees that compare equal deparse to the same
+	 * statement.  argtypes is still checked, since a caller may bind a
+	 * parameter the predicate never names.
+	 *
+	 * The plans must also still be valid, and that is not belt and braces.  A
+	 * qual tree names a function or operator by OID, so renaming one leaves
+	 * the tree equal() to the cached one while the statements built from it
+	 * still spell the old name.  plancache invalidates those statements and
+	 * re-analyses their text, binding the old name to whatever holds it now --
+	 * a different object, or none.  The tree would then drive the source and
+	 * the stale text the pre-lock and the prune, over different rows.  Asking
+	 * plancache whether its plan is still good, and rebuilding from a fresh
+	 * deparse when it is not, is what ri_FetchPreparedPlan() does and for this
+	 * reason.
+	 */
 	if (found &&
 		cacheEntry->uniqueIndexOid == uniqueIndexOid &&
 		cacheEntry->qual != NULL &&
 		equal(cacheEntry->qual, qual) &&
 		cacheEntry->nargs == (params ? params->numParams : 0) &&
-		matview_argtypes_match(cacheEntry, params))
+		matview_argtypes_match(cacheEntry, params) &&
+		cacheEntry->lockPlan != NULL &&
+		cacheEntry->refreshPlan != NULL &&
+		SPI_plan_is_valid(cacheEntry->lockPlan) &&
+		SPI_plan_is_valid(cacheEntry->refreshPlan))
 	{
 	}
 	else

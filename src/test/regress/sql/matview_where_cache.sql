@@ -358,3 +358,72 @@ SELECT * FROM mv_c6 ORDER BY id;
 
 DROP MATERIALIZED VIEW mv_c6;
 DROP TABLE mv_c6_base;
+
+--
+-- Test 7: Cached plans whose text names a renamed object are not reused
+--
+-- The key is the predicate's parse tree, and a tree names a function by OID, so
+-- renaming that function leaves the tree equal() to the cached one and the
+-- entry is reused.  The two SPI statements built from it are still text, and
+-- that text spells the old name.  plancache invalidates them -- it registers a
+-- syscache callback on pg_proc, which this cache does not -- and re-analyses
+-- the text, binding the old name to whatever holds it now.
+--
+-- The result is that the source query and the DML disagree about which rows the
+-- predicate selects: the source runs from the tree, the pre-lock and the prune
+-- from the stale text.  The prune then deletes rows that are in scope according
+-- to the text and absent from new_data according to the tree.
+--
+-- Found by asking whether ISSUES.md B2 was still reachable once the view
+-- definition stopped being text.  It was, by a route B2 did not describe, and
+-- the deparse elision is what opened it: while the deparsed predicate was the
+-- cache key, a rename changed the key and forced a rebuild.  Keying on the tree
+-- removed that protection along with the deparse.
+--
+-- Seen to fail two ways before the fix.  With a replacement function holding
+-- the old name, row 3 was deleted from the matview while the base still
+-- produced it and the predicate never named it -- silent data loss.  With no
+-- replacement, the refresh raised "function public.mv_c7_pred(integer) does not
+-- exist" from a statement the caller never wrote.
+--
+-- The fix is ri_FetchPreparedPlan()'s: let plancache be the detector, and
+-- rebuild the text ourselves when it says the plan is stale.
+--
+-- Disposition: keep.  It asserts that a refresh acts on the rows its predicate
+-- names, which holds however the plans are or are not cached.
+--
+
+CREATE TABLE mv_c7_base (id int primary key, v int);
+INSERT INTO mv_c7_base SELECT g, 0 FROM generate_series(1, 5) g;
+
+CREATE MATERIALIZED VIEW mv_c7 AS SELECT id, v FROM mv_c7_base;
+CREATE UNIQUE INDEX ON mv_c7(id);
+
+CREATE FUNCTION mv_c7_pred(int) RETURNS boolean LANGUAGE sql STABLE
+  AS 'SELECT $1 <= 2';
+
+UPDATE mv_c7_base SET v = 1;
+
+-- Warm the entry.  Schema-qualified because REFRESH runs under a restricted
+-- search_path.
+REFRESH MATERIALIZED VIEW mv_c7 WHERE public.mv_c7_pred(id);
+SELECT * FROM mv_c7 ORDER BY id;
+
+-- Rename the predicate's function and give a different one the old name.  This
+-- emits no relcache invalidation, so the cache entry survives -- which is what
+-- makes the case reach the stale text rather than a rebuilt plan.
+ALTER FUNCTION mv_c7_pred(int) RENAME TO mv_c7_pred2;
+CREATE FUNCTION mv_c7_pred(int) RETURNS boolean LANGUAGE sql STABLE
+  AS 'SELECT $1 = 3';
+
+UPDATE mv_c7_base SET v = 2;
+
+-- The same function as the warm call, under its new name.  Rows 1 and 2 must
+-- move; row 3 must be left alone and must still be there.
+REFRESH MATERIALIZED VIEW mv_c7 WHERE public.mv_c7_pred2(id);
+SELECT * FROM mv_c7 ORDER BY id;
+
+DROP MATERIALIZED VIEW mv_c7;
+DROP TABLE mv_c7_base;
+DROP FUNCTION mv_c7_pred(int);
+DROP FUNCTION mv_c7_pred2(int);
