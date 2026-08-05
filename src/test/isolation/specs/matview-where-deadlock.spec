@@ -1,48 +1,24 @@
-# REFRESH MATERIALIZED VIEW ... WHERE ... lock ordering
+# REFRESH MATERIALIZED VIEW ... WHERE ... lock ordering across statements
 #
-# Reported on -hackers by Vellaipandiyan: "I wonder whether overlapping
-# refreshes could still encounter deadlock scenarios around UPSERT conflicts."
-# Adam Brusselback confirmed that the locking SELECT had no ORDER BY, so "two
-# overlapping refreshes could lock the existing rows in different physical orders
-# and deadlock", and said the next patch would give it "a deterministic ORDER BY
-# on the unique key columns".  That ORDER BY is now in the tree; it fixes the
-# single-statement variant but not the permutation below -- see the note further
-# down.
+# Vellaipandiyan asked on the thread whether overlapping refreshes could still
+# deadlock around UPSERT conflicts.  They can, in one case, and this spec
+# records it.
 #
-# The direct-modification path (CONCURRENTLY) locks the matview rows matching its
-# predicate with "SELECT 1 FROM matview WHERE (predicate) ORDER BY key FOR
-# UPDATE", and those locks are held until the refreshing transaction ends.  The
-# ORDER BY fixes the order within one statement, but says nothing about the order
-# of separate statements, so two transactions that issue several single-row
-# refreshes in opposite orders still deadlock.
+# A partial refresh locks the matview rows matching its predicate with
+# "SELECT 1 FROM matview WHERE (predicate) ORDER BY key FOR NO KEY UPDATE" and
+# holds those locks until the refreshing transaction ends.  The ORDER BY fixes
+# the order within one statement.  It says nothing about the order of separate
+# statements, so two transactions that issue several single-row refreshes in
+# opposite orders still deadlock.  That is the permutation below, and it is
+# what a trigger-driven maintenance scheme produces naturally.
 #
-# This spec covers the deterministic case: two transactions each issuing several
-# single-row partial refreshes in opposite orders, which is what a trigger-driven
-# maintenance scheme produces naturally.
-#
-# Unlike the regression tests for this feature, this spec records what happens
-# today rather than asserting a fix, and so it passes.  That is deliberate: the
-# stated contract is that overlapping partial refreshes serialize, and the
-# permutation below violates it, but no row-granularity locking scheme can
-# satisfy it here -- the two transactions form a genuine cycle.  Honouring the
-# contract needs a coarser lock, under which s2's first refresh would block
-# immediately and this permutation could not be driven at all.  Until that design
-# question is settled there is no correct output to assert, so the expected file
-# below is a characterisation, and the XXX marks the contract violation.
-#
-# Disposition: REPLACE or DELETE once the locking model is settled.  If
-# overlapping refreshes are made to serialize properly, this permutation stops
-# being drivable and the spec should be rewritten around whatever the new model
-# guarantees.  If deadlock is accepted as normal for row-level locking, the
-# behaviour belongs in the documentation and this spec can go.
-#
-# XXX There is a second, non-deterministic variant that this spec cannot cover:
-# a *single* refresh statement locks rows in whatever order its plan happens to
-# produce, so two overlapping refreshes with different predicates (and therefore
-# different plans) deadlock against each other without any help.  Note that
-# adding ORDER BY to the row-locking SELECT fixes only that variant, not the
-# one below -- ordering within one statement says nothing about the order of
-# separate statements.
+# This spec records what happens rather than asserting a fix, so it passes.
+# The documented guarantee is that overlapping partial refreshes serialize, and
+# this permutation violates it, but no row-granularity locking can satisfy it
+# here: the two transactions form a genuine cycle.  Honouring it would need a
+# coarser lock, under which s2's first refresh would block immediately and this
+# permutation could not be driven at all.  Until that is settled there is no
+# correct output to assert.
 
 setup
 {

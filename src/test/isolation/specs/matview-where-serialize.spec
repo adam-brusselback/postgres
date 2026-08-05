@@ -1,20 +1,16 @@
 # REFRESH MATERIALIZED VIEW ... WHERE ... concurrency model
 #
-# Asked for on -hackers by Dharin Shah ("I think it would help the patch to
-# explicitly define the intended safety model") and by Vellaipandiyan ("It may
-# also help to document the intended guarantees around overlapping partial
-# refreshes and concurrent DML on base tables").  Adam Brusselback answered with
-# a written-out set of guarantees; this spec is the executable form of the three
-# that concern overlapping refreshes.  The prose itself has not landed in the
-# docs yet, which remains an open review item.
+# Dharin Shah and Vellaipandiyan both asked on the thread for the guarantees
+# around overlapping partial refreshes to be written down.  This is the
+# executable form of the three that concern overlapping refreshes.
 #
-# With a WHERE clause, CONCURRENTLY selects the direct-modification path, which
-# takes only RowExclusiveLock and relies on a "SELECT ... FOR NO KEY UPDATE"
-# over the rows matching the predicate to serialize against other partial
-# refreshes.  FOR NO KEY UPDATE conflicts with itself, which is the whole of
-# what that serialization needs; FOR UPDATE would additionally conflict with
-# FOR KEY SHARE, which nothing takes on a matview.
-# This spec pins down the three claims that follow from that design:
+# A partial refresh takes RowExclusiveLock and relies on a
+# "SELECT ... FOR NO KEY UPDATE" over the rows matching the predicate to
+# serialize against other partial refreshes.  FOR NO KEY UPDATE conflicts with
+# itself, which is all that serialization needs.  FOR UPDATE would additionally
+# conflict with FOR KEY SHARE, which nothing takes on a matview.
+#
+# Three claims follow from that:
 #
 #   - readers are never blocked;
 #   - two refreshes whose predicates cover overlapping existing rows serialize;
@@ -23,14 +19,8 @@
 # The row locks are held to the end of the refreshing transaction, so a refresh
 # issued inside an explicit transaction block keeps them until COMMIT.
 #
-# All three claims hold today, so this spec passes; it is here to keep them from
-# regressing while the rest of the feature is reworked.  The claim it does not
-# cover is that overlapping refreshes never abort -- see
+# Whether overlapping refreshes can abort is a separate question, covered by
 # matview-where-deadlock.spec.
-#
-# Disposition: keep.  This is the executable form of the feature's concurrency
-# contract, and it will need rewriting rather than deleting if the locking model
-# changes.
 
 setup
 {

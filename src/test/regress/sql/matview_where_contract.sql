@@ -32,7 +32,7 @@ UPDATE ct_base SET val = val + 1 WHERE id <= 6;
 
 REFRESH MATERIALIZED VIEW CONCURRENTLY ct_mv WHERE id <= 6;
 
-SELECT count(*) AS p1_bare_in_scope_differs_from_view
+SELECT count(*) AS p1_in_scope_differs_from_view
   FROM ((SELECT id, grp, val FROM ct_mv WHERE id <= 6)
         EXCEPT ALL
         (SELECT id, grp, val FROM ct_base WHERE id <= 6)) d;
@@ -41,7 +41,7 @@ UPDATE ct_base SET val = val + 1 WHERE id <= 6;
 
 REFRESH MATERIALIZED VIEW CONCURRENTLY ct_mv WHERE id <= 6;
 
-SELECT count(*) AS p1_conc_in_scope_differs_from_view
+SELECT count(*) AS p1_in_scope_differs_after_second_refresh
   FROM ((SELECT id, grp, val FROM ct_mv WHERE id <= 6)
         EXCEPT ALL
         (SELECT id, grp, val FROM ct_base WHERE id <= 6)) d;
@@ -130,7 +130,7 @@ SELECT count(*) AS p6_after_two_concurrent_noops FROM ct_null_mv;
 
 REFRESH MATERIALIZED VIEW CONCURRENTLY ct_null_mv WHERE id IS NULL;
 
-SELECT count(*) AS p6_after_bare_noop FROM ct_null_mv;
+SELECT count(*) AS p6_after_third_noop FROM ct_null_mv;
 
 --
 -- Promise 7: a partial refresh converges with a full one.

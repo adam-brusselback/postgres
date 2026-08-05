@@ -1,39 +1,37 @@
 # REFRESH MATERIALIZED VIEW ... WHERE ... lock ordering over INSERTED rows
 #
-# P2's cousin.  matview-where-lockorder covers rows the matview already holds,
-# where the refresh takes a row lock and the order is visible as xmax.  This
-# covers rows it does not hold yet, where the refresh INSERTs and the conflict
-# is between two speculative insertions of the same key.  Two refreshes that
-# insert an overlapping set of new keys in opposite orders deadlock, exactly as
-# they would over existing rows.
+# matview-where-lockorder covers rows the matview already holds, where the
+# refresh takes a row lock and the order shows up in xmax.  This covers rows it
+# does not hold yet, where the refresh INSERTs and the conflict is between two
+# speculative insertions of the same key.  Two refreshes inserting an
+# overlapping set of new keys in opposite orders deadlock, exactly as they would
+# over existing rows.
 #
 # The observable has to be different, because the rows are not there to carry an
-# xmax.  What is there is the blocking relationship: a refresh that hits a key
-# another transaction has speculatively inserted waits on that transaction, and
-# pg_blocking_pids() names it.  So pin the two ENDS of the range in two separate
-# sessions, one key each, and ask which one the wide refresh stopped on.  That
-# answers "which end did it start from", which is the order.
+# xmax.  What is there is the blocking relationship.  A refresh that reaches a
+# key another transaction has speculatively inserted waits on that transaction,
+# and pg_blocking_pids() names it.  So pin the two ends of the range in two
+# separate sessions, one key each, and ask which one the wide refresh stopped
+# on.  That is the end it started from, which is the order.
 #
 #   with ORDER BY on new_data   wide reaches key 1 first  -> blocked by pin_lo
 #   without it                  a heap-order scan starts at key 10 -> pin_hi
 #
 # The base rows are inserted with id descending, so heap order is the reverse of
 # key order and the two answers differ.  The matview deliberately does not hold
-# the hot range at the start -- see the setup -- so every hot key is an INSERT
-# and not an UPDATE, which is what makes this P3 rather than a second P2 test.
+# the hot range at the start, so every hot key is an INSERT rather than an
+# UPDATE.
 #
-# This asserts the property (the insertion order is deterministic and ascending,
-# whoever is doing the inserting) rather than the mechanism.  An implementation
-# that acquires the locks separately and in order, then inserts in any order,
-# still passes.  The single-session version of this -- reading the inserted rows
-# back in ctid order -- does not: it observes physical order, which reveals the
-# ordering only while insertion order and lock order are the same thing.
+# This asserts the property, that the insertion order is deterministic and
+# ascending whoever is doing the inserting, rather than the mechanism.  An
+# implementation that acquires the locks separately and in order, then inserts
+# in any order, still passes.  Reading the inserted rows back in ctid order does
+# not: that observes physical order, which reveals the ordering only while
+# insertion order and lock order are the same thing.
 #
-# Verified as a detector, not assumed: with the ORDER BY removed from new_data
-# in refresh_by_direct_modification(), blocked_by flips from pin_lo to pin_hi.
-#
-# Disposition: keep.  This and matview-where-lockorder are the two gates on the
-# lock-ordering guarantees.
+# Checked as a detector rather than assumed.  With the ORDER BY removed from
+# new_data in refresh_by_direct_modification(), blocked_by flips from pin_lo to
+# pin_hi.
 
 setup
 {
