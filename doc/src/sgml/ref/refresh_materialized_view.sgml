@@ -165,9 +165,9 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY <replaceable class="parameter">name</repl
      </para>
 
      <para>
-      If the defining query's result is not a function of the base data alone &mdash;
-      <literal>DISTINCT ON</literal> or <literal>LIMIT</literal> without an
-      <literal>ORDER BY</literal> that breaks every tie, for instance &mdash; then a
+      If the defining query's result is not a function of the base data alone,
+      for instance <literal>DISTINCT ON</literal> or <literal>LIMIT</literal>
+      without an <literal>ORDER BY</literal> that breaks every tie, then a
       partial refresh may produce a different, equally valid answer from the one
       a full refresh would produce, because it plans a different query.  Two
       full refreshes may also disagree in that case, but a partial refresh
@@ -187,8 +187,8 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY <replaceable class="parameter">name</repl
      <para>
       The upsert resolves collisions against a single index, so it cannot apply
       a change that would require deleting one row before inserting another to
-      satisfy a <emphasis>second</emphasis> unique index &mdash; two rows exchanging
-      their values on one, for instance.  A <literal>WHERE</literal> clause is
+      satisfy a <emphasis>second</emphasis> unique index, such as two rows
+      exchanging their values on one.  A <literal>WHERE</literal> clause is
       therefore rejected on a materialized view carrying more than one unique
       index, rather than failing partway through on whichever change it cannot
       express.  Refresh such a materialized view in full, or drop the extra
@@ -226,9 +226,9 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY <replaceable class="parameter">name</repl
       owner is subject to neither.
      </para>
      <para>
-      Every relation the condition reads &mdash; the materialized view itself
-      as much as anything a subquery names &mdash; must be one the caller
-      could have read directly.  They must hold <literal>SELECT</literal> on
+      Every relation the condition reads must be one the caller could have
+      read directly, and that means the materialized view itself as much as
+      anything a subquery names.  They must hold <literal>SELECT</literal> on
       the columns the condition reads of it, must not be seeing its rows
       through <link linkend="ddl-rowsecurity">row-level security</link> that
       does not also apply to the owner, and must not be reaching it through a
