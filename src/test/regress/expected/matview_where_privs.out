@@ -318,7 +318,7 @@ SELECT count(*) AS rows_before FROM mv_leak;
 UPDATE mv_leak_base SET code = 999 WHERE id IN (1, 2);
 \set VERBOSITY terse
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_leak WHERE id <= 2;
-ERROR:  ON CONFLICT DO UPDATE command cannot affect row a second time
+ERROR:  new data for materialized view "mv_leak" contains duplicate rows
 \set VERBOSITY default
 -- Both of these must still be refused, and the contents must be unchanged.
 -- Before the fix the maintenance exemption outlived the refresh and both
@@ -1237,3 +1237,59 @@ DROP ROLE regress_mvg_owner;
 DROP ROLE regress_mvg_maint;
 DROP ROLE regress_mvg_bypass;
 DROP ROLE regress_mvg_super;
+--
+-- Test 7: the duplicate-key refusal names the key only for the owner
+--
+-- Found here.  refresh_by_match_merge()'s duplicate error prints the offending
+-- row, and says why it may: "REFRESH MAT VIEW is only able to be run by the
+-- owner of the mat view (or a superuser) and therefore there is no need to
+-- check for access to data in the mat view."  That has not been true since
+-- MAINTAIN was added, and a partial refresh is the path a MAINTAIN-only caller
+-- is most likely to be on, so its own version of the error asks first.
+--
+-- Reaching the check without SELECT takes a predicate that reads no column of
+-- the matview, since one that does is refused earlier by Test 6's column rule.
+-- WHERE true is that predicate, and it is also the one a caller would reach
+-- for if they were fishing.
+--
+-- Disposition: keep.  The interesting half is the caller who gets no key, and
+-- nothing else in the suite covers an error message that has to be redacted.
+--
+CREATE ROLE regress_mvd_owner;
+CREATE ROLE regress_mvd_maint;
+CREATE SCHEMA mvd;
+GRANT USAGE ON SCHEMA mvd TO regress_mvd_owner, regress_mvd_maint;
+CREATE TABLE mvd.base (a text, b text);
+INSERT INTO mvd.base VALUES ('visible', 'unreadable');
+CREATE MATERIALIZED VIEW mvd.mv AS SELECT a, b FROM mvd.base;
+CREATE UNIQUE INDEX ON mvd.mv (a);
+ALTER TABLE mvd.base OWNER TO regress_mvd_owner;
+ALTER MATERIALIZED VIEW mvd.mv OWNER TO regress_mvd_owner;
+-- MAINTAIN and nothing else.  No SELECT on the matview or on the base table.
+GRANT MAINTAIN ON mvd.mv TO regress_mvd_maint;
+-- Make the source ambiguous.
+INSERT INTO mvd.base VALUES ('visible', 'unreadable');
+SET ROLE regress_mvd_maint;
+-- Control: they cannot read either relation.
+SELECT count(*) FROM mvd.mv;
+ERROR:  permission denied for materialized view mv
+SELECT count(*) FROM mvd.base;
+ERROR:  permission denied for table base
+-- Refused, and the key is withheld.
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvd.mv WHERE true;
+ERROR:  new data for materialized view "mv" contains duplicate rows
+DETAIL:  More than one row of the new data has the same key as another for the unique index a partial refresh applies its changes against.
+HINT:  A partial refresh applies its changes one row at a time, so the new data must not contain two rows with the same key.
+RESET ROLE;
+-- The owner gets the key, which is the point of reporting it at all.
+SET ROLE regress_mvd_owner;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvd.mv WHERE true;
+ERROR:  new data for materialized view "mv" contains duplicate rows
+DETAIL:  Key: (visible)
+HINT:  A partial refresh applies its changes one row at a time, so the new data must not contain two rows with the same key.
+RESET ROLE;
+DROP MATERIALIZED VIEW mvd.mv;
+DROP TABLE mvd.base;
+DROP SCHEMA mvd;
+DROP ROLE regress_mvd_owner;
+DROP ROLE regress_mvd_maint;

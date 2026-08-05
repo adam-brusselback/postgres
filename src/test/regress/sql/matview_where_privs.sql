@@ -869,3 +869,58 @@ DROP ROLE regress_mvg_owner;
 DROP ROLE regress_mvg_maint;
 DROP ROLE regress_mvg_bypass;
 DROP ROLE regress_mvg_super;
+
+--
+-- Test 7: the duplicate-key refusal names the key only for the owner
+--
+-- Found here.  refresh_by_match_merge()'s duplicate error prints the offending
+-- row, and says why it may: "REFRESH MAT VIEW is only able to be run by the
+-- owner of the mat view (or a superuser) and therefore there is no need to
+-- check for access to data in the mat view."  That has not been true since
+-- MAINTAIN was added, and a partial refresh is the path a MAINTAIN-only caller
+-- is most likely to be on, so its own version of the error asks first.
+--
+-- Reaching the check without SELECT takes a predicate that reads no column of
+-- the matview, since one that does is refused earlier by Test 6's column rule.
+-- WHERE true is that predicate, and it is also the one a caller would reach
+-- for if they were fishing.
+--
+-- Disposition: keep.  The interesting half is the caller who gets no key, and
+-- nothing else in the suite covers an error message that has to be redacted.
+--
+
+CREATE ROLE regress_mvd_owner;
+CREATE ROLE regress_mvd_maint;
+CREATE SCHEMA mvd;
+GRANT USAGE ON SCHEMA mvd TO regress_mvd_owner, regress_mvd_maint;
+
+CREATE TABLE mvd.base (a text, b text);
+INSERT INTO mvd.base VALUES ('visible', 'unreadable');
+CREATE MATERIALIZED VIEW mvd.mv AS SELECT a, b FROM mvd.base;
+CREATE UNIQUE INDEX ON mvd.mv (a);
+ALTER TABLE mvd.base OWNER TO regress_mvd_owner;
+ALTER MATERIALIZED VIEW mvd.mv OWNER TO regress_mvd_owner;
+-- MAINTAIN and nothing else.  No SELECT on the matview or on the base table.
+GRANT MAINTAIN ON mvd.mv TO regress_mvd_maint;
+
+-- Make the source ambiguous.
+INSERT INTO mvd.base VALUES ('visible', 'unreadable');
+
+SET ROLE regress_mvd_maint;
+-- Control: they cannot read either relation.
+SELECT count(*) FROM mvd.mv;
+SELECT count(*) FROM mvd.base;
+-- Refused, and the key is withheld.
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvd.mv WHERE true;
+RESET ROLE;
+
+-- The owner gets the key, which is the point of reporting it at all.
+SET ROLE regress_mvd_owner;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvd.mv WHERE true;
+RESET ROLE;
+
+DROP MATERIALIZED VIEW mvd.mv;
+DROP TABLE mvd.base;
+DROP SCHEMA mvd;
+DROP ROLE regress_mvd_owner;
+DROP ROLE regress_mvd_maint;

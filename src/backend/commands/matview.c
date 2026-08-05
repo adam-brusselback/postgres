@@ -136,6 +136,7 @@ typedef struct MatViewPartialRefreshCache
 								 * be freed piecemeal */
 
 	SPIPlanPtr	lockPlan;		/* SELECT ... FOR NO KEY UPDATE */
+	SPIPlanPtr	dupPlan;		/* the duplicate-key check on the source */
 	SPIPlanPtr	refreshPlan;	/* the fused upsert and prune */
 	CachedPlanSource *sourcePlan;	/* the matview's own query */
 
@@ -165,6 +166,7 @@ static uint64 refresh_matview_datafill(DestReceiver *dest, Query *query,
 static void refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 								   int save_sec_context);
 static uint64 refresh_by_direct_modification(Oid matviewOid, Oid relowner,
+											 Oid callerId,
 											 int save_sec_context,
 											 Query *dataQuery, Node *qual,
 											 ParamListInfo params);
@@ -1185,8 +1187,8 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	if (qual && !skipData)
 	{
 		processed = refresh_by_direct_modification(matviewOid, relowner,
-												   save_sec_context, dataQuery,
-												   qual, params);
+												   save_userid, save_sec_context,
+												   dataQuery, qual, params);
 	}
 
 	/*
@@ -1518,6 +1520,8 @@ matview_cache_sweep(void)
 
 		if (entry->lockPlan)
 			SPI_freeplan(entry->lockPlan);
+		if (entry->dupPlan)
+			SPI_freeplan(entry->dupPlan);
 		if (entry->refreshPlan)
 			SPI_freeplan(entry->refreshPlan);
 		if (entry->sourcePlan)
@@ -1712,7 +1716,7 @@ matview_materialize_source(CachedPlanSource *plansource, ParamListInfo params,
 }
 
 static uint64
-refresh_by_direct_modification(Oid matviewOid, Oid relowner,
+refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 							   int save_sec_context, Query *dataQuery,
 							   Node *qual, ParamListInfo params)
 {
@@ -1813,8 +1817,10 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		cacheEntry->nargs == (params ? params->numParams : 0) &&
 		matview_argtypes_match(cacheEntry, params) &&
 		cacheEntry->lockPlan != NULL &&
+		cacheEntry->dupPlan != NULL &&
 		cacheEntry->refreshPlan != NULL &&
 		SPI_plan_is_valid(cacheEntry->lockPlan) &&
+		SPI_plan_is_valid(cacheEntry->dupPlan) &&
 		SPI_plan_is_valid(cacheEntry->refreshPlan))
 	{
 	}
@@ -1824,6 +1830,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		{
 			if (cacheEntry->lockPlan)
 				SPI_freeplan(cacheEntry->lockPlan);
+			if (cacheEntry->dupPlan)
+				SPI_freeplan(cacheEntry->dupPlan);
 			if (cacheEntry->refreshPlan)
 				SPI_freeplan(cacheEntry->refreshPlan);
 			if (cacheEntry->sourcePlan)
@@ -1833,6 +1841,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		}
 
 		cacheEntry->lockPlan = NULL;
+		cacheEntry->dupPlan = NULL;
 		cacheEntry->refreshPlan = NULL;
 		cacheEntry->sourcePlan = NULL;
 		cacheEntry->qual = NULL;
@@ -1888,7 +1897,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 		}
 
 		/* Prepare plans if we don't have valid cached ones. */
-		if (cacheEntry->lockPlan == NULL || cacheEntry->refreshPlan == NULL)
+		if (cacheEntry->lockPlan == NULL || cacheEntry->dupPlan == NULL ||
+			cacheEntry->refreshPlan == NULL)
 		{
 			StringInfoData buf;
 			char	   *matview_name;
@@ -1899,6 +1909,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 			Form_pg_index indexStruct;
 			TupleDesc	tupdesc = matviewRel->rd_att;
 			StringInfoData conflict_cols;
+			StringInfoData notnull_cols;
 			StringInfoData set_clause;
 			StringInfoData mv_cols;
 			StringInfoData excluded_cols;
@@ -1937,6 +1948,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 				"IS NOT DISTINCT FROM" : "=";
 
 			initStringInfo(&conflict_cols);
+			initStringInfo(&notnull_cols);
 			initStringInfo(&mv_cols);
 			initStringInfo(&excluded_cols);
 			initStringInfo(&set_clause);
@@ -1954,11 +1966,13 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 				if (!first)
 				{
 					appendStringInfoString(&conflict_cols, ", ");
+					appendStringInfoString(&notnull_cols, " AND ");
 					appendStringInfoString(&join_clause, " AND ");
 				}
 				first = false;
 
 				appendStringInfoString(&conflict_cols, quoted);
+				appendStringInfo(&notnull_cols, "%s IS NOT NULL", quoted);
 				appendStringInfo(&join_clause, "nd.%s %s " MATVIEW_ALIAS ".%s",
 								 quoted, anti_join_op, quoted);
 			}
@@ -2028,6 +2042,39 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 
 			resetStringInfo(&buf);
 
+			/*
+			 * The upsert applies the source rows one at a time against the
+			 * arbiter index, so two source rows sharing a key value cannot
+			 * both be represented: the second silently overwrites the first
+			 * and the matview ends up with fewer rows than the query
+			 * produces.  refresh_by_match_merge() has its own version of this
+			 * check for the same reason, and a partial refresh never reaches
+			 * it.
+			 *
+			 * Group rather than self-join, since the source is a tuplestore
+			 * and has no ctid to tell two equal rows apart.  Which rows
+			 * conflict is the index's question, not GROUP BY's: for an
+			 * ordinary unique index a NULL key never conflicts, so those rows
+			 * are filtered out first, and for NULLS NOT DISTINCT they do,
+			 * which is what grouping already does.
+			 */
+			appendStringInfo(&buf,
+							 "SELECT CAST(ROW(%s) AS pg_catalog.text) FROM "
+							 MATVIEW_SOURCE_ENR_NAME, conflict_cols.data);
+			if (!indexStruct->indnullsnotdistinct)
+				appendStringInfo(&buf, " WHERE %s", notnull_cols.data);
+			appendStringInfo(&buf,
+							 " GROUP BY %s HAVING pg_catalog.count(*) > 1 LIMIT 1",
+							 conflict_cols.data);
+
+			cacheEntry->dupPlan = SPI_prepare(buf.data, 0, NULL);
+			if (cacheEntry->dupPlan == NULL)
+				elog(ERROR, "SPI_prepare failed for duplicate check: %s", buf.data);
+			if (use_cache)
+				SPI_keepplan(cacheEntry->dupPlan);
+
+			resetStringInfo(&buf);
+
 			appendStringInfoString(&buf, "WITH ");
 
 			appendStringInfo(&buf,
@@ -2093,6 +2140,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 			pfree(matview_name);
 			pfree(buf.data);
 			pfree(conflict_cols.data);
+			pfree(notnull_cols.data);
 			pfree(set_clause.data);
 			pfree(mv_cols.data);
 			pfree(excluded_cols.data);
@@ -2137,6 +2185,40 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 									   sourceStore);
 
 			INJECTION_POINT("matview-where-source-materialized", NULL);
+
+			/*
+			 * Refuse before writing anything if the source cannot be applied
+			 * one row at a time.
+			 *
+			 * The duplicated key is named only for a caller who owns the
+			 * matview.  refresh_by_match_merge() prints the offending row
+			 * unconditionally, on the stated grounds that only the owner can
+			 * run REFRESH, and that has not been true since MAINTAIN was
+			 * added; a partial refresh is the path a MAINTAIN-only caller is
+			 * most likely to be on, and the key comes out of a matview they
+			 * may hold no privilege to read.
+			 */
+			if (matview_execute_spi_plan(cacheEntry->dupPlan, NULL,
+										 snapshot, true) < 0)
+				elog(ERROR, "SPI_execute_plan failed during duplicate check");
+
+			if (SPI_processed > 0)
+			{
+				char	   *dupkey = NULL;
+
+				if (object_ownercheck(RelationRelationId, matviewOid, callerId))
+					dupkey = SPI_getvalue(SPI_tuptable->vals[0],
+										  SPI_tuptable->tupdesc, 1);
+
+				ereport(ERROR,
+						(errcode(ERRCODE_CARDINALITY_VIOLATION),
+						 errmsg("new data for materialized view \"%s\" contains duplicate rows",
+								RelationGetRelationName(matviewRel)),
+						 dupkey != NULL
+						 ? errdetail("Key: %s", dupkey)
+						 : errdetail("More than one row of the new data has the same key as another for the unique index a partial refresh applies its changes against."),
+						 errhint("A partial refresh applies its changes one row at a time, so the new data must not contain two rows with the same key.")));
+			}
 
 			if (matview_execute_spi_plan(cacheEntry->refreshPlan, params,
 										 snapshot, false) < 0)

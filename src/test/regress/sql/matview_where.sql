@@ -1099,3 +1099,81 @@ DROP MATERIALIZED VIEW sq_mv;
 DROP TABLE mv, nd, new_data, upsert, pruned;
 DROP TABLE sq_fact;
 DROP TABLE sq_dim;
+
+--
+-- Test 20: the source must be applicable one row at a time
+--
+-- Found by checking this patch against the -hackers thread "Two issues with
+-- REFRESH MATERIALIZED VIEW CONCURRENTLY", which is about the duplicate
+-- precheck in refresh_by_match_merge().  A partial refresh never reaches that
+-- precheck, and it needs one for its own reason: the upsert applies the source
+-- rows one at a time against the arbiter index, so two source rows sharing a
+-- key cannot both be represented.  Without a check the second overwrote the
+-- first and the matview quietly ended up with fewer rows than the query
+-- produces -- including for duplicates with no NULLs anywhere, which a full
+-- refresh has caught all along.
+--
+-- Which rows conflict is the index's question rather than GROUP BY's, and the
+-- last three cases are why that distinction is in the code: a NULL key does
+-- not conflict with another NULL key, unless the index says NULLS NOT
+-- DISTINCT.
+--
+-- The refusal names the duplicated key only for a caller who owns the matview.
+-- A full refresh's version of this error prints the offending row
+-- unconditionally, on the stated grounds that only the owner can run REFRESH,
+-- which stopped being true when MAINTAIN was added.  matview_where_privs
+-- Test 7 covers both sides of that.
+--
+
+CREATE TABLE dup_base (a text, b text);
+INSERT INTO dup_base VALUES ('k', 'v');
+CREATE MATERIALIZED VIEW dup_mv AS SELECT a, b FROM dup_base;
+CREATE UNIQUE INDEX ON dup_mv (a);
+
+-- 20a: identical rows, with a NULL.  The full refresh misses this one; the
+-- partial refresh must not.
+INSERT INTO dup_base VALUES ('k', 'v');
+REFRESH MATERIALIZED VIEW CONCURRENTLY dup_mv WHERE a = 'k';
+SELECT count(*) AS a_rows_unchanged FROM dup_mv;
+
+-- 20b: same key, differing elsewhere.  Nothing here is a duplicate row, but
+-- the arbiter index still cannot hold both.
+UPDATE dup_base SET b = 'w' WHERE ctid = (SELECT max(ctid) FROM dup_base);
+REFRESH MATERIALIZED VIEW CONCURRENTLY dup_mv WHERE a = 'k';
+SELECT count(*) AS b_rows_unchanged FROM dup_mv;
+
+-- 20c: no NULL anywhere, which a full refresh has always rejected
+DELETE FROM dup_base;
+INSERT INTO dup_base VALUES ('k', 'v'), ('k', 'v');
+REFRESH MATERIALIZED VIEW CONCURRENTLY dup_mv WHERE a = 'k';
+
+-- 20d: and the refresh is fine once the source is unambiguous again
+DELETE FROM dup_base;
+INSERT INTO dup_base VALUES ('k', 'v2');
+REFRESH MATERIALIZED VIEW CONCURRENTLY dup_mv WHERE a = 'k';
+SELECT a, b FROM dup_mv ORDER BY a;
+
+DROP MATERIALIZED VIEW dup_mv;
+
+-- 20e: a NULL key does not conflict with another NULL key, so two of them are
+-- not duplicates and the refresh proceeds.
+DELETE FROM dup_base;
+INSERT INTO dup_base VALUES (NULL, 'x');
+CREATE MATERIALIZED VIEW dup_mv AS SELECT a, b FROM dup_base;
+CREATE UNIQUE INDEX ON dup_mv (a);
+INSERT INTO dup_base VALUES (NULL, 'y');
+REFRESH MATERIALIZED VIEW CONCURRENTLY dup_mv WHERE a IS NULL;
+SELECT count(*) AS e_rows FROM dup_mv;
+DROP MATERIALIZED VIEW dup_mv;
+
+-- 20f: NULLS NOT DISTINCT reverses that, and the check has to follow the index
+DELETE FROM dup_base;
+INSERT INTO dup_base VALUES (NULL, 'x');
+CREATE MATERIALIZED VIEW dup_mv AS SELECT a, b FROM dup_base;
+CREATE UNIQUE INDEX ON dup_mv (a) NULLS NOT DISTINCT;
+INSERT INTO dup_base VALUES (NULL, 'y');
+REFRESH MATERIALIZED VIEW CONCURRENTLY dup_mv WHERE a IS NULL;
+SELECT count(*) AS f_rows_unchanged FROM dup_mv;
+
+DROP MATERIALIZED VIEW dup_mv;
+DROP TABLE dup_base;
