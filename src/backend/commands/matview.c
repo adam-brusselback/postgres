@@ -194,13 +194,15 @@ SetMatViewPopulatedState(Relation relation, bool newstate)
 {
 	Relation	pgrel;
 	HeapTuple	tuple;
-	Form_pg_class classForm;
 
 	Assert(relation->rd_rel->relkind == RELKIND_MATVIEW);
 
 	/*
-	 * If the state matches, do nothing. This prevents cache invalidation
-	 * storms when doing frequent partial refreshes via triggers.
+	 * Nothing to do if the state already matches.  A partial refresh always
+	 * passes true, and requires an already populated matview, so without this
+	 * every one of them would rewrite the pg_class row and send the
+	 * invalidation described below, discarding this backend's own cached
+	 * refresh plans on every call.
 	 */
 	if (relation->rd_rel->relispopulated == newstate)
 		return;
@@ -217,13 +219,9 @@ SetMatViewPopulatedState(Relation relation, bool newstate)
 		elog(ERROR, "cache lookup failed for relation %u",
 			 RelationGetRelid(relation));
 
-	classForm = (Form_pg_class) GETSTRUCT(tuple);
+	((Form_pg_class) GETSTRUCT(tuple))->relispopulated = newstate;
 
-	if (classForm->relispopulated != newstate)
-	{
-		classForm->relispopulated = newstate;
-		CatalogTupleUpdate(pgrel, &tuple->t_self, tuple);
-	}
+	CatalogTupleUpdate(pgrel, &tuple->t_self, tuple);
 
 	heap_freetuple(tuple);
 	table_close(pgrel, RowExclusiveLock);
