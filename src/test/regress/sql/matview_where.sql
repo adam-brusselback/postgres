@@ -957,3 +957,145 @@ DROP TABLE mv_sq_partial;
 DROP MATERIALIZED VIEW mv_sq;
 DROP TABLE mv_sq_fact;
 DROP TABLE mv_sq_dim;
+
+--
+-- Test 19: the shapes a subquery predicate can take
+--
+-- Test 18 covers a few spellings in detail.  This covers the space: every way a
+-- subquery can be attached to the predicate, and every name in the generated
+-- SQL that a subquery could collide with.
+--
+-- The property checked is the same for all of them and does not depend on the
+-- spelling.  The predicate names a set of rows; evaluate it directly to learn
+-- which.  Then make EVERY row stale, refresh partially, and require that the
+-- rows in that set match a full refresh while the rows outside it did not move
+-- at all -- same value and same ctid.  A predicate that silently widened would
+-- still converge with a full refresh, so convergence alone cannot see it; the
+-- ctid is what says the refresh stayed inside its scope.
+--
+-- What this is a detector for, measured rather than assumed: with the
+-- predicate deparsed against the matview's name instead of the alias the
+-- generated statements use, 18 of the 29 fail with "missing FROM-clause
+-- entry".  The 11 that survive are exactly the uncorrelated ones, because
+-- ruleutils only qualifies a Var once something else is in scope.  So
+-- correlation is the axis that matters here, and the uncorrelated rows are
+-- carried for the correctness half rather than the aliasing half.
+--
+-- What it is NOT a detector for, also measured: mutation C7, which drops the
+-- predicate from the plan cache key, leaves all 29 green.  Each probe does a
+-- full refresh first, and that invalidates the cache, so no probe ever reuses
+-- another's plans.  matview_where_cache Tests 6 and 7 are where that lives.
+--
+-- Disposition: keep.  The aliasing rows are the only place anything checks
+-- that the generated SQL's own names survive a predicate that uses them, and
+-- the cost is one small fixture.
+--
+
+CREATE TABLE sq_fact (id int PRIMARY KEY, gid int, tag text);
+CREATE TABLE sq_dim  (gid int PRIMARY KEY, nm text);
+INSERT INTO sq_dim  SELECT g, 'n' || g FROM generate_series(1, 4) g;
+INSERT INTO sq_fact SELECT g, (g % 4) + 1, 't' || (g % 3) FROM generate_series(1, 12) g;
+
+-- Relations named after every alias and CTE the generated statements invent.
+CREATE TABLE mv       (id int);  INSERT INTO mv       VALUES (-1);
+CREATE TABLE nd       (id int);  INSERT INTO nd       VALUES (-2);
+CREATE TABLE new_data (id int);  INSERT INTO new_data VALUES (-3);
+CREATE TABLE upsert   (id int);  INSERT INTO upsert   VALUES (-4);
+CREATE TABLE pruned   (id int);  INSERT INTO pruned   VALUES (-5);
+
+CREATE MATERIALIZED VIEW sq_mv AS
+  SELECT f.id, f.gid, f.tag, d.nm
+    FROM public.sq_fact f JOIN public.sq_dim d ON d.gid = f.gid;
+CREATE UNIQUE INDEX ON sq_mv(id);
+CREATE MATERIALIZED VIEW sq_full AS
+  SELECT f.id, f.gid, f.tag, d.nm
+    FROM public.sq_fact f JOIN public.sq_dim d ON d.gid = f.gid;
+CREATE UNIQUE INDEX ON sq_full(id);
+
+CREATE FUNCTION sq_probe(label text, pred text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  scope int[]; wrong int; touched int;
+BEGIN
+  -- Reset both matviews to the same fully refreshed state.
+  UPDATE public.sq_dim SET nm = 'n' || gid;
+  REFRESH MATERIALIZED VIEW public.sq_mv;
+  REFRESH MATERIALIZED VIEW public.sq_full;
+
+  -- The rows the predicate names, evaluated directly.  This is the ground
+  -- truth the refresh is measured against, and it is deliberately not derived
+  -- from anything the refresh does.
+  EXECUTE 'SELECT array_agg(id ORDER BY id) FROM public.sq_mv WHERE ' || pred
+    INTO scope;
+  scope := coalesce(scope, '{}');
+
+  CREATE TEMP TABLE sq_before ON COMMIT DROP AS
+    SELECT id, ctid AS ct, nm FROM public.sq_mv;
+
+  -- Every row is now stale, so an untouched row is visible as such.
+  UPDATE public.sq_dim SET nm = nm || '*';
+  REFRESH MATERIALIZED VIEW public.sq_full;
+
+  EXECUTE 'REFRESH MATERIALIZED VIEW CONCURRENTLY public.sq_mv WHERE ' || pred;
+
+  SELECT count(*) INTO wrong
+    FROM public.sq_mv m JOIN public.sq_full f USING (id)
+   WHERE m.id = ANY(scope)
+     AND (m.nm, m.gid, m.tag) IS DISTINCT FROM (f.nm, f.gid, f.tag);
+
+  SELECT count(*) INTO touched
+    FROM public.sq_mv m JOIN sq_before b USING (id)
+   WHERE NOT (m.id = ANY(scope))
+     AND (m.nm IS DISTINCT FROM b.nm OR m.ctid <> b.ct);
+
+  DROP TABLE sq_before;
+  RETURN format('%-24s scope=%-2s %s', label, coalesce(array_length(scope,1),0),
+                CASE WHEN wrong = 0 AND touched = 0 THEN 'ok'
+                     ELSE format('in_scope_wrong=%s out_of_scope_touched=%s',
+                                 wrong, touched) END);
+END $$;
+
+SELECT sq_probe('correlated EXISTS',    $$EXISTS (SELECT 1 FROM public.sq_fact f WHERE f.id = sq_mv.id AND f.gid = 1)$$);
+SELECT sq_probe('correlated NOT EXISTS',$$NOT EXISTS (SELECT 1 FROM public.sq_fact f WHERE f.id = sq_mv.id AND f.gid = 1)$$);
+SELECT sq_probe('uncorrelated IN',      $$id IN (SELECT f.id FROM public.sq_fact f WHERE f.gid = 2)$$);
+SELECT sq_probe('correlated IN',        $$id IN (SELECT f.id FROM public.sq_fact f WHERE f.gid = sq_mv.gid AND f.gid = 2)$$);
+SELECT sq_probe('NOT IN',               $$id NOT IN (SELECT f.id FROM public.sq_fact f WHERE f.gid = 1)$$);
+SELECT sq_probe('= ANY (subquery)',     $$id = ANY (SELECT f.id FROM public.sq_fact f WHERE f.gid = sq_mv.gid AND f.gid = 3)$$);
+SELECT sq_probe('<> ALL (subquery)',    $$id <> ALL (SELECT f.id FROM public.sq_fact f WHERE f.gid = 1)$$);
+SELECT sq_probe('correlated scalar',    $$id = (SELECT max(f.id) FROM public.sq_fact f WHERE f.gid = sq_mv.gid)$$);
+SELECT sq_probe('ARRAY(subquery)',      $$id = ANY (ARRAY(SELECT f.id FROM public.sq_fact f WHERE f.gid = sq_mv.gid AND f.gid = 2))$$);
+SELECT sq_probe('row-constructor IN',   $$(id, gid) IN (SELECT f.id, f.gid FROM public.sq_fact f WHERE f.gid = 2)$$);
+SELECT sq_probe('GROUP BY + HAVING',    $$gid IN (SELECT f.gid FROM public.sq_fact f GROUP BY f.gid HAVING count(*) > 2)$$);
+SELECT sq_probe('UNION inside',         $$id IN (SELECT f.id FROM public.sq_fact f WHERE f.gid = 1 UNION SELECT f.id FROM public.sq_fact f WHERE f.gid = 2)$$);
+SELECT sq_probe('nested 2 levels',      $$EXISTS (SELECT 1 FROM public.sq_fact o WHERE o.id = sq_mv.id AND EXISTS (SELECT 1 FROM public.sq_dim i WHERE i.gid = o.gid AND i.gid = 2))$$);
+SELECT sq_probe('LATERAL inside',       $$EXISTS (SELECT 1 FROM public.sq_fact f, LATERAL (SELECT d.gid FROM public.sq_dim d WHERE d.gid = f.gid) l WHERE f.id = sq_mv.id AND l.gid = 2)$$);
+SELECT sq_probe('CTE inside',           $$id IN (WITH w AS (SELECT f.id, f.gid FROM public.sq_fact f) SELECT w.id FROM w WHERE w.gid = sq_mv.gid AND w.gid = 3)$$);
+SELECT sq_probe('self-reference',       $$id IN (SELECT s.id FROM public.sq_mv s WHERE s.gid = 2)$$);
+SELECT sq_probe('ORDER BY + LIMIT',     $$id IN (SELECT f.id FROM public.sq_fact f WHERE f.gid = 2 ORDER BY f.id LIMIT 2)$$);
+SELECT sq_probe('window inside',        $$id IN (SELECT x.id FROM (SELECT f.id, row_number() OVER (ORDER BY f.id) rn FROM public.sq_fact f) x WHERE x.rn <= 3)$$);
+SELECT sq_probe('two subqueries AND/OR',$$EXISTS (SELECT 1 FROM public.sq_fact f WHERE f.id = sq_mv.id AND f.gid = 1) OR id IN (SELECT f.id FROM public.sq_fact f WHERE f.gid = 3)$$);
+
+-- The generated statements alias the matview, name two CTEs and an ephemeral
+-- relation, and join against an alias.  A predicate is free to use any of those
+-- names for something else.
+SELECT sq_probe('alias named mv',       $$EXISTS (SELECT 1 FROM public.sq_fact mv WHERE mv.id = sq_mv.id AND mv.gid = 2)$$);
+SELECT sq_probe('alias named nd',       $$EXISTS (SELECT 1 FROM public.sq_fact nd WHERE nd.id = sq_mv.id AND nd.gid = 2)$$);
+SELECT sq_probe('alias named new_data', $$EXISTS (SELECT 1 FROM public.sq_fact new_data WHERE new_data.id = sq_mv.id AND new_data.gid = 2)$$);
+SELECT sq_probe('alias named upsert',   $$EXISTS (SELECT 1 FROM public.sq_fact upsert WHERE upsert.id = sq_mv.id AND upsert.gid = 2)$$);
+SELECT sq_probe('alias named pruned',   $$EXISTS (SELECT 1 FROM public.sq_fact pruned WHERE pruned.id = sq_mv.id AND pruned.gid = 2)$$);
+SELECT sq_probe('alias = matview name', $$EXISTS (SELECT 1 FROM public.sq_fact sq_mv WHERE sq_mv.id = public.sq_mv.id AND sq_mv.gid = 2)$$);
+SELECT sq_probe('real table named mv',  $$id IN (SELECT m.id FROM public.mv m) OR id IN (SELECT f.id FROM public.sq_fact f WHERE f.gid = 2)$$);
+SELECT sq_probe('real table new_data',  $$id IN (SELECT n.id FROM public.new_data n) OR id IN (SELECT f.id FROM public.sq_fact f WHERE f.gid = 3)$$);
+SELECT sq_probe('unqualified inner col',$$EXISTS (SELECT 1 FROM public.sq_fact f WHERE f.id = sq_mv.id AND gid = 2)$$);
+SELECT sq_probe('shadowed 2 levels',    $$EXISTS (SELECT 1 FROM public.sq_fact mv WHERE mv.id = sq_mv.id AND EXISTS (SELECT 1 FROM public.sq_dim mv2 WHERE mv2.gid = mv.gid AND mv2.gid = 2))$$);
+
+-- None of the shadowed tables was read or written.
+SELECT (SELECT count(*) FROM mv) + (SELECT count(*) FROM nd)
+     + (SELECT count(*) FROM new_data) + (SELECT count(*) FROM upsert)
+     + (SELECT count(*) FROM pruned) AS shadowed_rows_intact;
+
+DROP FUNCTION sq_probe(text, text);
+DROP MATERIALIZED VIEW sq_full;
+DROP MATERIALIZED VIEW sq_mv;
+DROP TABLE mv, nd, new_data, upsert, pruned;
+DROP TABLE sq_fact;
+DROP TABLE sq_dim;
