@@ -118,9 +118,7 @@ typedef struct MatViewPartialRefreshCache
 
 	/* what these plans were built for; all of it must match to reuse them */
 	Oid			uniqueIndexOid; /* the index the upsert arbitrates on */
-	Node	   *qual;			/* the predicate, compared with equal().  The
-								 * tree rather than its deparsed text, so a
-								 * hit costs no deparse */
+	Node	   *qual;			/* the predicate, compared with equal() */
 	int			nargs;			/* number of external parameters */
 	Oid		   *argtypes;		/* their types.  Not implied by qual: a caller
 								 * may bind a parameter the predicate never
@@ -142,10 +140,12 @@ static HTAB *MatViewRefreshCache = NULL;
 
 /*
  * Matview maintenance state.  While a refresh is running we must let its own
- * generated statements modify the matview, but the WHERE clause of a partial
- * refresh can contain arbitrary user functions that run inside the same
- * window.  Remember which matview is being maintained so the exemption cannot
- * be used against any other one.
+ * generated statements modify the matview, but a partial refresh evaluates its
+ * WHERE clause inside the same window.  A caller who is not the owner may only
+ * use leakproof functions there, which bounds what they can reach; the owner is
+ * under no such restriction, and neither is bounded to the matview this refresh
+ * is for.  Remember which one that is, so the exemption cannot be used against
+ * any other.
  */
 static int	matview_maintenance_depth = 0;
 static Oid	matview_maintenance_relid = InvalidOid;
@@ -2668,7 +2668,7 @@ is_usable_unique_index(Relation indexRel)
  * the data in referenced relations), they are currently used to allow:
  *
  * - REFRESH CONCURRENTLY without blocking concurrent reads.
- * - REFRESH ... WHERE ... which modifies the matview in-place.
+ * - REFRESH CONCURRENTLY ... WHERE ... which modifies the matview in place.
  */
 bool
 MatViewIncrementalMaintenanceIsEnabled(Oid relid)
