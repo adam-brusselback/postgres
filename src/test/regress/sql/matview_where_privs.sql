@@ -623,6 +623,17 @@ SELECT mvg.try('regress_mvg_maint', '22 an aggregate in a target list',
 SELECT mvg.try('regress_mvg_maint', '23 a window function',
   $$id IN (SELECT w.id FROM (SELECT o.id, row_number() OVER () FROM mvg.open o) w)$$);
 
+-- The whole message for one of them, which mvg.try() cannot show: it reports
+-- SQLERRM, and what makes this refusal usable is the DETAIL.  "Not leakproof"
+-- is not a property anyone can read off the expression they wrote -- almost
+-- nothing is marked leakproof -- so the refusal has to name the function it
+-- stopped at or the caller is left guessing which part of the condition was
+-- the problem.
+SET ROLE regress_mvg_maint;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvg.mv
+  WHERE id = (SELECT min(o.id) FROM mvg.open o);
+RESET ROLE;
+
 --
 -- 6b: the same routes, over a table the caller may not read.  All refused,
 -- and each names mvg.closed rather than blaming a function.
@@ -785,6 +796,63 @@ SELECT mvg.try2('regress_mvg_owner', '64 the owner, no grants',  $$who = 'other'
 GRANT SELECT ON mvg.mv2 TO regress_mvg_maint;
 SELECT mvg.try2('regress_mvg_maint', '65 table-wide SELECT',     $$who = 'other'$$);
 
+--
+-- 6f: which comparisons the leakproof rule actually leaves a non-owner
+--
+-- The reference page states this envelope, and a reader will plan around it,
+-- so it is pinned here rather than left to be rediscovered.  Two separate
+-- reasons a comparison lands outside it, and they want different fixes:
+--
+--   the operator itself is not marked leakproof -- numeric, jsonb, enums,
+--   arrays and row values, while the integer and floating-point types, text,
+--   boolean, uuid and the date and time types are;
+--
+--   or a cast survives into the expression, because the check runs on the
+--   parsed condition and not on a simplified one.  Simplifying first would
+--   mean const-folding the caller's functions with the owner's privileges,
+--   which is the thing being prevented, so this is deliberate -- but it means
+--   a quoted literal is accepted where the same value spelled as a cast is
+--   not.
+--
+-- Disposition: keep.  If any of these operators is ever marked leakproof
+-- upstream, the corresponding case flips and the documentation has to move
+-- with it.  That is the outcome this is for; a silent divergence between the
+-- reference page and the code is not.
+--
+CREATE TYPE mvg.stat AS ENUM ('open', 'closed');
+CREATE TABLE mvg.types (id int PRIMARY KEY, n bigint, d float8, amt numeric,
+                        st mvg.stat, tags text[], doc jsonb, s text);
+INSERT INTO mvg.types
+  VALUES (1, 1, 1.5, 10.5, 'open', ARRAY['a'], '{"k": 1}', 'x');
+ALTER TABLE mvg.types OWNER TO regress_mvg_owner;
+ALTER TYPE mvg.stat OWNER TO regress_mvg_owner;
+GRANT SELECT ON mvg.types TO regress_mvg_maint;
+
+SELECT mvg.try('regress_mvg_maint', '66 integer, bigint, float8',
+  $$id IN (SELECT t.id FROM mvg.types t WHERE t.id = 1 AND t.n > 0 AND t.d > 1)$$);
+SELECT mvg.try('regress_mvg_maint', '67 text',
+  $$id IN (SELECT t.id FROM mvg.types t WHERE t.s = 'x')$$);
+SELECT mvg.try('regress_mvg_maint', '68 numeric',
+  $$id IN (SELECT t.id FROM mvg.types t WHERE t.amt > '1')$$);
+SELECT mvg.try('regress_mvg_maint', '69 an enumerated type',
+  $$id IN (SELECT t.id FROM mvg.types t WHERE t.st = 'open')$$);
+SELECT mvg.try('regress_mvg_maint', '70 an array',
+  $$id IN (SELECT t.id FROM mvg.types t WHERE t.tags = ARRAY['a'])$$);
+SELECT mvg.try('regress_mvg_maint', '71 jsonb',
+  $$id IN (SELECT t.id FROM mvg.types t WHERE t.doc = '{"k": 1}')$$);
+-- the same value, quoted and cast
+SELECT mvg.try('regress_mvg_maint', '72 a quoted literal',
+  $$id IN (SELECT t.id FROM mvg.types t WHERE t.d > '1.0')$$);
+SELECT mvg.try('regress_mvg_maint', '73 the same value, cast',
+  $$id IN (SELECT t.id FROM mvg.types t WHERE t.d > 1.0::float8)$$);
+-- a constant, not a call, so it is reached
+SELECT mvg.try('regress_mvg_maint', '74 CURRENT_TIMESTAMP',
+  $$id IN (SELECT t.id FROM mvg.types t WHERE CURRENT_TIMESTAMP > '2000-01-01')$$);
+SELECT mvg.try('regress_mvg_maint', '75 now()',
+  $$id IN (SELECT t.id FROM mvg.types t WHERE now() > '2000-01-01')$$);
+
+DROP TABLE mvg.types;
+DROP TYPE mvg.stat;
 DROP MATERIALIZED VIEW mvg.mv2;
 DROP MATERIALIZED VIEW mvg.mv;
 DROP VIEW mvg.v_invoker;

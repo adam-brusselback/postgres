@@ -56,6 +56,7 @@
 #include "utils/memutils.h"
 #include "utils/plancache.h"
 #include "utils/queryenvironment.h"
+#include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/rls.h"
 #include "utils/ruleutils.h"
@@ -104,6 +105,7 @@ typedef struct RefreshQualContext
 	Oid			callerId;		/* who issued the REFRESH */
 	RefreshQualVerdict verdict;
 	Oid			relid;			/* the relation that decided it, if any */
+	Oid			funcid;			/* the function that decided it, if any */
 } RefreshQualContext;
 
 typedef struct
@@ -268,12 +270,24 @@ refresh_paramref_hook(ParseState *pstate, ParamRef *pref)
 
 /*
  * check_functions_in_node callback: true if this function is not leakproof.
+ *
+ * The one it stops at is recorded, because "not leakproof" is not a property
+ * anyone can read off the expression they wrote: almost nothing is marked
+ * leakproof, so the answer is usually a function the caller had no reason to
+ * suspect -- count(), an arithmetic operator, lower().  Naming it turns the
+ * refusal into something actionable.
  */
 
 static bool
 non_leakproof_checker(Oid func_id, void *context)
 {
-	return !get_func_leakproof(func_id);
+	RefreshQualContext *ctx = (RefreshQualContext *) context;
+
+	if (get_func_leakproof(func_id))
+		return false;
+
+	ctx->funcid = func_id;
+	return true;
 }
 
 /*
@@ -555,6 +569,15 @@ refresh_qual_permission_error(Relation matviewRel, RefreshQualContext *ctx)
 			break;
 
 		case REFRESH_QUAL_FUNCTION:
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("permission denied to use a non-leakproof expression in the WHERE clause of REFRESH MATERIALIZED VIEW"),
+					 errdetail("Function %s is not leakproof, and the expression is evaluated with the privileges of the owner of materialized view \"%s\".",
+							   format_procedure(ctx->funcid),
+							   RelationGetRelationName(matviewRel)),
+					 errhint("Only the owner may use a WHERE clause containing an expression that is not leakproof.")));
+			break;
+
 		case REFRESH_QUAL_OPAQUE:
 		case REFRESH_QUAL_OK:
 			ereport(ERROR,
@@ -640,6 +663,7 @@ transformRefreshWhereClause(Oid relid, Node *whereClause, ParamListInfo params,
 		qualctx.callerId = callerId;
 		qualctx.verdict = REFRESH_QUAL_OK;
 		qualctx.relid = InvalidOid;
+		qualctx.funcid = InvalidOid;
 
 		/*
 		 * MAINTAIN is what REFRESH itself asks for, and it does not imply

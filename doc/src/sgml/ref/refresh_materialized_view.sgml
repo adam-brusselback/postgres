@@ -222,15 +222,59 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY <replaceable class="parameter">name</repl
      </para>
      <para>
       Because it runs as the owner, a caller who is not the owner is held to
-      what they could have read themselves.  Such a caller may only use
-      expressions whose functions are all leakproof, and may only refer to a
-      relation &mdash; the materialized view itself as much as anything a
-      subquery names &mdash; if they hold <literal>SELECT</literal> on the
-      columns the condition reads of it, are not seeing its rows through <link
-      linkend="ddl-rowsecurity">row-level security</link> that does not also
-      apply to the owner, and are not reaching it through a
-      <literal>security_invoker</literal> view.  The owner is subject to none
-      of this.
+      what they could have done themselves.  Two restrictions apply, and the
+      owner is subject to neither.
+     </para>
+     <para>
+      Every relation the condition reads &mdash; the materialized view itself
+      as much as anything a subquery names &mdash; must be one the caller
+      could have read directly.  They must hold <literal>SELECT</literal> on
+      the columns the condition reads of it, must not be seeing its rows
+      through <link linkend="ddl-rowsecurity">row-level security</link> that
+      does not also apply to the owner, and must not be reaching it through a
+      <literal>security_invoker</literal> view, which is read with the
+      privileges of whoever runs it.  A condition that reads no column of the
+      materialized view requires no <literal>SELECT</literal> privilege on it,
+      just as an unqualified <command>DELETE</command> does not.
+     </para>
+     <para>
+      Every function the condition calls must be marked
+      <literal>LEAKPROOF</literal> (see <xref linkend="sql-createfunction"/>),
+      which is an assertion that it has no side effects and reveals nothing
+      about its arguments beyond its return value.  Being able to read the
+      same rows does not lift this, because the hazard it addresses is a
+      different one: a caller who is not the owner would otherwise be choosing
+      which code runs with the owner's privileges.  Only a superuser may mark
+      a function leakproof, for the same reason.
+     </para>
+     <para>
+      This is a narrow allowance, because few functions carry the marking.  A
+      caller holding only <literal>MAINTAIN</literal> can compare a column to
+      a literal, combine such comparisons with <literal>AND</literal>,
+      <literal>OR</literal> and <literal>NOT</literal>, use
+      <literal>IN</literal>, <literal>BETWEEN</literal> and
+      <literal>IS NULL</literal>, and write subqueries over relations they may
+      read.  The comparison operators are leakproof for the integer and
+      floating-point types, <type>text</type>, <type>boolean</type>,
+      <type>uuid</type> and the date and time types, and are
+      <emphasis>not</emphasis> for <type>numeric</type>, <type>jsonb</type>,
+      enumerated types, arrays and row values.  No other function is, which
+      rules out arithmetic, concatenation, <literal>LIKE</literal> and regular
+      expressions, case folding, <function>now</function> (though
+      <literal>CURRENT_TIMESTAMP</literal> is accepted, being a constant
+      rather than a call), and the aggregate and window functions a subquery
+      might otherwise use.
+     </para>
+     <para>
+      An explicit cast is a function call like any other, so
+      <literal>x &gt; 1.0::double precision</literal> is refused where
+      <literal>x &gt; '1.0'</literal> is accepted: a quoted literal is resolved
+      to a constant while the condition is parsed, and the cast is still a
+      call when the condition is checked.  The condition is deliberately not
+      simplified before being checked, since folding constants would itself
+      mean running the caller's functions with the owner's privileges.  A
+      refusal names the function it stopped at, so which part of the condition
+      is responsible can be read off the error rather than guessed at.
      </para>
     </listitem>
    </varlistentry>
