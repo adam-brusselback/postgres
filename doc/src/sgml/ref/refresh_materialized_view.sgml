@@ -165,9 +165,9 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY <replaceable class="parameter">name</repl
      </para>
 
      <para>
-      If the defining query's result is not a function of the base data alone \&mdash;
+      If the defining query's result is not a function of the base data alone &mdash;
       <literal>DISTINCT ON</literal> or <literal>LIMIT</literal> without an
-      <literal>ORDER BY</literal> that breaks every tie, for instance \&mdash; then a
+      <literal>ORDER BY</literal> that breaks every tie, for instance &mdash; then a
       partial refresh may produce a different, equally valid answer from the one
       a full refresh would produce, because it plans a different query.  Two
       full refreshes may also disagree in that case, but a partial refresh
@@ -187,7 +187,7 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY <replaceable class="parameter">name</repl
      <para>
       The upsert resolves collisions against a single index, so it cannot apply
       a change that would require deleting one row before inserting another to
-      satisfy a <emphasis>second</emphasis> unique index \&mdash; two rows exchanging
+      satisfy a <emphasis>second</emphasis> unique index &mdash; two rows exchanging
       their values on one, for instance.  A <literal>WHERE</literal> clause is
       therefore rejected on a materialized view carrying more than one unique
       index, rather than failing partway through on whichever change it cannot
