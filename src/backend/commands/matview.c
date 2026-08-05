@@ -65,13 +65,6 @@
 #include "utils/tuplestore.h"
 
 /*
- * query_string for the source plansource.  CreateCachedPlan() requires one and
- * this path has no SQL text to give it -- the source is a Query tree.  It shows
- * up in error contexts, so it says what it is rather than being empty.
- */
-#define MATVIEW_SOURCE_QUERY_STRING "REFRESH MATERIALIZED VIEW ... WHERE (source query)"
-
-/*
  * Name the materialised source rows are registered under for the SQL that
  * upserts and prunes.  Both halves read it, and both read the same tuplestore,
  * which is what makes them agree about which rows the view produces (A3).
@@ -169,6 +162,7 @@ static uint64 refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 											 Oid callerId,
 											 int save_sec_context,
 											 Query *dataQuery, Node *qual,
+											 const char *queryString,
 											 ParamListInfo params);
 static void refresh_by_heap_swap(Oid matviewOid, Oid OIDNewHeap, char relpersistence);
 static bool is_usable_unique_index(Relation indexRel);
@@ -179,7 +173,8 @@ static int	matview_execute_spi_plan(SPIPlanPtr plan, ParamListInfo params,
 static void InitMatViewCache(void);
 static void InvalidateMatViewCache(Datum arg, Oid relid);
 static void matview_cache_sweep(void);
-static CachedPlanSource *matview_build_source_plansource(Query *sourceQuery);
+static CachedPlanSource *matview_build_source_plansource(Query *sourceQuery,
+														 const char *queryString);
 static bool refresh_qual_needs_owner_walker(Node *node, void *context);
 static bool refresh_query_reads_unreadable(Query *query,
 										   RefreshQualContext *ctx);
@@ -1188,7 +1183,8 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	{
 		processed = refresh_by_direct_modification(matviewOid, relowner,
 												   save_userid, save_sec_context,
-												   dataQuery, qual, params);
+												   dataQuery, qual, queryString,
+												   params);
 	}
 
 	/*
@@ -1628,16 +1624,23 @@ matview_build_source_query(Relation matviewRel, Query *dataQuery, Node *qual,
 /*
  * Wrap the source query in a CachedPlanSource, so that plancache revalidates
  * it and it survives across refreshes.
+ *
+ * queryString is the REFRESH statement the caller issued.  There is no SQL text
+ * for the source query itself, since it is built as a Query tree, and
+ * CreateCachedPlan() requires a string: it stores it as the plansource's
+ * identifier and prints it in error contexts.  The statement that asked for the
+ * work is the honest answer there, and it is what refresh_matview_datafill()
+ * already hands the planner on the full-refresh path.
  */
 
 static CachedPlanSource *
-matview_build_source_plansource(Query *sourceQuery)
+matview_build_source_plansource(Query *sourceQuery, const char *queryString)
 {
 	CachedPlanSource *plansource;
 	List	   *querytree_list;
 
 	plansource = CreateCachedPlanForQuery(sourceQuery,
-										  MATVIEW_SOURCE_QUERY_STRING,
+										  queryString,
 										  CreateCommandTag((Node *) sourceQuery));
 
 	AcquireRewriteLocks(sourceQuery, true, false);
@@ -1718,7 +1721,8 @@ matview_materialize_source(CachedPlanSource *plansource, ParamListInfo params,
 static uint64
 refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 							   int save_sec_context, Query *dataQuery,
-							   Node *qual, ParamListInfo params)
+							   Node *qual, const char *queryString,
+							   ParamListInfo params)
 {
 	Relation	matviewRel;
 	Oid			uniqueIndexOid = InvalidOid;
@@ -2176,7 +2180,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 														 qual, nkeyatts,
 														 keyattnums);
 				cacheEntry->sourcePlan =
-					matview_build_source_plansource(sourceQuery);
+					matview_build_source_plansource(sourceQuery, queryString);
 				if (use_cache)
 					SaveCachedPlan(cacheEntry->sourcePlan);
 			}
