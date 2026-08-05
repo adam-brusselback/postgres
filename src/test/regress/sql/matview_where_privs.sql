@@ -71,7 +71,7 @@ ALTER MATERIALIZED VIEW matview_priv_mv OWNER TO regress_matview_owner;
 CREATE SCHEMA matview_priv_atk AUTHORIZATION regress_matview_maint;
 -- SELECT as well as MAINTAIN, so that the leakproof rule is the only thing
 -- left that can refuse this: a predicate naming a column the caller may not
--- read is refused for that reason instead (Test 6, case 57), and without the
+-- read is refused for that reason instead (Test 6, case 58), and without the
 -- grant this test would pass on the wrong refusal.
 GRANT MAINTAIN, SELECT ON matview_priv_mv TO regress_matview_maint;
 
@@ -667,28 +667,33 @@ SELECT mvg.try('regress_mvg_maint', '40 a column they may not read',
   $$id IN (SELECT c.id FROM mvg.cols c WHERE c.hidden > 0)$$);
 SELECT mvg.try('regress_mvg_maint', '41 a whole-row reference',
   $$id IN (SELECT 1 FROM mvg.cols c WHERE c::text <> '')$$);
-SELECT mvg.try('regress_mvg_maint', '42 a security_invoker view',
+-- The counterpart to case 19, and the one the row count says the most from:
+-- naming no column is not the same as reading nothing, so it takes what
+-- SELECT count(*) takes, which is SELECT on some column.
+SELECT mvg.try('regress_mvg_maint', '42 no column named',
+  $$id IN (SELECT 1 FROM mvg.closed c)$$);
+SELECT mvg.try('regress_mvg_maint', '43 a security_invoker view',
   $$id IN (SELECT v.id FROM mvg.v_invoker v)$$);
 
 -- A function is refused whatever it reads, so it cannot be the way round 6b.
 -- These say so, and say it with the function's own message.
-SELECT mvg.try('regress_mvg_maint', '43 a function, in FROM',
+SELECT mvg.try('regress_mvg_maint', '44 a function, in FROM',
   $$id IN (SELECT r FROM mvg.read_closed() r)$$);
-SELECT mvg.try('regress_mvg_maint', '44 a function, in an expression',
+SELECT mvg.try('regress_mvg_maint', '45 a function, in an expression',
   $$id IN (SELECT mvg.read_closed())$$);
 
 --
 -- 6c: the owner is asked nothing.  All allowed, including the ones 6b refused.
 --
-SELECT mvg.try('regress_mvg_owner', '45 owner, closed table',
+SELECT mvg.try('regress_mvg_owner', '46 owner, closed table',
   $$id IN (SELECT c.id FROM mvg.closed c)$$);
-SELECT mvg.try('regress_mvg_owner', '46 owner, security_invoker view',
+SELECT mvg.try('regress_mvg_owner', '47 owner, security_invoker view',
   $$id IN (SELECT v.id FROM mvg.v_invoker v)$$);
-SELECT mvg.try('regress_mvg_owner', '47 owner, a function',
+SELECT mvg.try('regress_mvg_owner', '48 owner, a function',
   $$id IN (SELECT mvg.read_closed())$$);
-SELECT mvg.try('regress_mvg_owner', '48 owner, an aggregate',
+SELECT mvg.try('regress_mvg_owner', '49 owner, an aggregate',
   $$id = (SELECT min(o.id) FROM mvg.open o)$$);
-SELECT mvg.try('regress_mvg_super', '49 superuser, closed table',
+SELECT mvg.try('regress_mvg_super', '50 superuser, closed table',
   $$id IN (SELECT c.id FROM mvg.closed c)$$);
 
 --
@@ -709,28 +714,28 @@ SET ROLE regress_mvg_owner;
 SELECT count(*) AS owner_sees FROM mvg.open;
 RESET ROLE;
 
-SELECT mvg.try('regress_mvg_maint',  '50 subject to a policy',
+SELECT mvg.try('regress_mvg_maint',  '51 subject to a policy',
   $$id IN (SELECT o.id FROM mvg.open o)$$);
-SELECT mvg.try('regress_mvg_bypass', '51 BYPASSRLS',
+SELECT mvg.try('regress_mvg_bypass', '52 BYPASSRLS',
   $$id IN (SELECT o.id FROM mvg.open o)$$);
-SELECT mvg.try('regress_mvg_super',  '52 superuser',
+SELECT mvg.try('regress_mvg_super',  '53 superuser',
   $$id IN (SELECT o.id FROM mvg.open o)$$);
-SELECT mvg.try('regress_mvg_owner',  '53 the table owner',
+SELECT mvg.try('regress_mvg_owner',  '54 the table owner',
   $$id IN (SELECT o.id FROM mvg.open o)$$);
 
 -- FORCEd, the owner is subject too -- but they are still the matview's owner,
 -- and the caller is still the one the answer would be leaked to.
 ALTER TABLE mvg.open FORCE ROW LEVEL SECURITY;
-SELECT mvg.try('regress_mvg_maint',  '54 FORCE, subject to a policy',
+SELECT mvg.try('regress_mvg_maint',  '55 FORCE, subject to a policy',
   $$id IN (SELECT o.id FROM mvg.open o)$$);
-SELECT mvg.try('regress_mvg_owner',  '55 FORCE, the table owner',
+SELECT mvg.try('regress_mvg_owner',  '56 FORCE, the table owner',
   $$id IN (SELECT o.id FROM mvg.open o)$$);
 ALTER TABLE mvg.open NO FORCE ROW LEVEL SECURITY;
 
 -- Enabled on a table the caller owns, they are exempt from it themselves, so
 -- there is nothing the refresh could tell them that they could not read.
 ALTER TABLE mvg.theirs ENABLE ROW LEVEL SECURITY;
-SELECT mvg.try('regress_mvg_maint',  '56 RLS on a table they own',
+SELECT mvg.try('regress_mvg_maint',  '57 RLS on a table they own',
   $$id IN (SELECT t.id FROM mvg.theirs t)$$);
 ALTER TABLE mvg.open DISABLE ROW LEVEL SECURITY;
 ALTER TABLE mvg.theirs DISABLE ROW LEVEL SECURITY;
@@ -766,19 +771,19 @@ BEGIN
   END;
 END $$;
 
-SELECT mvg.try2('regress_mvg_maint', '57 MAINTAIN, no SELECT',   $$id = 1$$);
+SELECT mvg.try2('regress_mvg_maint', '58 MAINTAIN, no SELECT',   $$id = 1$$);
 -- A predicate that reads no column asks for nothing extra, as an unqualified
 -- DELETE does not.
-SELECT mvg.try2('regress_mvg_maint', '58 no column read',        $$true$$);
+SELECT mvg.try2('regress_mvg_maint', '59 no column read',        $$true$$);
 GRANT SELECT (id) ON mvg.mv2 TO regress_mvg_maint;
-SELECT mvg.try2('regress_mvg_maint', '59 SELECT on that column', $$id = 1$$);
-SELECT mvg.try2('regress_mvg_maint', '60 SELECT on another',     $$who = 'other'$$);
-SELECT mvg.try2('regress_mvg_maint', '61 in a sublink',
+SELECT mvg.try2('regress_mvg_maint', '60 SELECT on that column', $$id = 1$$);
+SELECT mvg.try2('regress_mvg_maint', '61 SELECT on another',     $$who = 'other'$$);
+SELECT mvg.try2('regress_mvg_maint', '62 in a sublink',
   $$who IN (SELECT o.who FROM mvg.open o)$$);
-SELECT mvg.try2('regress_mvg_maint', '62 a whole-row reference', $$mv2::text <> ''$$);
-SELECT mvg.try2('regress_mvg_owner', '63 the owner, no grants',  $$who = 'other'$$);
+SELECT mvg.try2('regress_mvg_maint', '63 a whole-row reference', $$mv2::text <> ''$$);
+SELECT mvg.try2('regress_mvg_owner', '64 the owner, no grants',  $$who = 'other'$$);
 GRANT SELECT ON mvg.mv2 TO regress_mvg_maint;
-SELECT mvg.try2('regress_mvg_maint', '64 table-wide SELECT',     $$who = 'other'$$);
+SELECT mvg.try2('regress_mvg_maint', '65 table-wide SELECT',     $$who = 'other'$$);
 
 DROP MATERIALIZED VIEW mvg.mv2;
 DROP MATERIALIZED VIEW mvg.mv;
