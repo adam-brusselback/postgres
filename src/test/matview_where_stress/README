@@ -71,10 +71,14 @@ first, and looked exactly like working tests.
 
   mutations.py        Re-introduces known bugs one at a time, defined as edits
                       to `git show HEAD:` rather than to a copy kept
-                      somewhere.  27 mutations; `--check` reports every stale
+                      somewhere.  33 mutations; `--check` reports every stale
                       anchor.  Note what --check does NOT do: it verifies the
                       anchor matches, not that the result compiles.  P1 sat in
-                      the corpus naming two functions that do not exist.
+                      the corpus naming two functions that do not exist, and
+                      then a second time, still naming the walker by the name
+                      it had before the privilege gate renamed it -- caught
+                      only by building it.  P1-P7 take that gate apart one
+                      check at a time (RESULTS.md R52).
 
   rebuild.sh          Rebuilds and then proves the rebuild happened, by asking
                       the running server what it was compiled with.  autodepend
@@ -93,7 +97,8 @@ first, and looked exactly like working tests.
 State against the current code
 ------------------------------
 
-  mutations.py --check           27/27
+  mutations.py --check           33/33, and P1-P7 calibrated by building
+                                 and running each: 7 of 7 CAUGHT
   safety/run.sh                  23 shapes, vector identical to
                                  calibrate.baseline in every cell but one
   fuzz.sh                        PASS on p2, p3, serial and nest

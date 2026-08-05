@@ -457,15 +457,106 @@ MUTATIONS = {
     # exists.  Nothing noticed, because the check only verified that the anchor
     # matched -- applying a mutation and building it are separate steps, and
     # --check does the first.  B23 one level further out.
+    # The privilege gate, taken apart one check at a time.
+    #
+    # It has five independent parts and a single test file, so a matrix with
+    # one row would say nothing about which of them the tests are watching.
+    # Each of these removes exactly one and leaves the rest working.
+    #
+    # P1 is the original denylist restored, which is where the gate started:
+    # flag the functions known to be bad rather than allow the nodes known to
+    # be safe.  Its insertion point is inside the expression switch, below the
+    # Query branch, so a sublink still reaches the range-table checks -- what
+    # escapes now is a node type nobody thought of, which is the actual defect:
+    # a cast to a domain whose CHECK constraint calls a non-leakproof function,
+    # where that function never appears in the expression tree.
     'P1': ('-', 'privs',
-           'leakproof gate flags bad functions instead of allowing known-safe '
-           'nodes (sublinks and domain casts escape)', [
+           'expression gate flags bad functions instead of allowing known-safe '
+           'nodes (a domain cast escapes)', [
                ('\tswitch (nodeTag(node))\n\t{\n\t\t\t/*\n\t\t\t * These cannot call a function or read a relation themselves,\n\t\t\t * though something below them might, so keep walking.\n\t\t\t */',
                 '\tif (check_functions_in_node(node, non_leakproof_checker, context))\n'
+                '\t{\n'
+                '\t\tctx->verdict = REFRESH_QUAL_FUNCTION;\n'
                 '\t\treturn true;\n'
-                '\treturn expression_tree_walker(node, contain_non_leakproof_walker, context);\n'
+                '\t}\n'
+                '\treturn expression_tree_walker(node, refresh_qual_needs_owner_walker,\n'
+                '\t\t\t\t\t\t\t\t  context);\n'
                 '\t/* P1: original denylist reinstated; the switch below is dead */\n'
                 + '\tswitch (nodeTag(node))\n\t{\n\t\t\t/*\n\t\t\t * These cannot call a function or read a relation themselves,\n\t\t\t * though something below them might, so keep walking.\n\t\t\t */'),
+           ]),
+
+    # The SELECT half: any relation a subquery names becomes readable.  This is
+    # the check the whole narrowing rests on -- without it the gate allows
+    # every subquery it used to refuse, and allows them over tables the caller
+    # has no privileges on at all.
+    'P2': ('-', 'privs',
+           'a subquery may read any relation (the caller SELECT check gone)', [
+               ('\tif (pg_class_aclcheck(relid, callerId, ACL_SELECT) == ACLCHECK_OK)\n'
+                '\t\treturn true;',
+                '\treturn true;\t\t\t\t\t/* P2 */\n'
+                '\tif (pg_class_aclcheck(relid, callerId, ACL_SELECT) == ACLCHECK_OK)\n'
+                '\t\treturn true;'),
+           ]),
+
+    # The column half only: table-wide SELECT still required, but a relation
+    # the caller can read no column of passes when the subquery names none of
+    # them.  EXISTS (SELECT 1 FROM secret) is the shape, and it is the one a
+    # rowcount tells you the most from.
+    'P3': ('-', 'privs',
+           'a subquery that names no column may read any relation (the '
+           'any-column rule inverted)', [
+               ('\tif (bms_is_empty(perminfo->selectedCols))\n'
+                '\t\treturn pg_attribute_aclcheck_all(relid, callerId, ACL_SELECT,\n'
+                '\t\t\t\t\t\t\t\t\t\t ACLMASK_ANY) == ACLCHECK_OK;',
+                '\tif (bms_is_empty(perminfo->selectedCols))\n'
+                '\t\treturn true;\t\t\t\t/* P3 */'),
+           ]),
+
+    # Row-level security.  The predicate runs as the owner, who is exempt from
+    # the policies on their own table, so dropping this hands a caller who is
+    # subject to them a row count over the rows the policies hide.
+    'P4': ('-', 'privs',
+           'row-level security on a relation the predicate reads is ignored', [
+               ('\t\tif (check_enable_rls(rte->relid, ctx->callerId, true) == RLS_ENABLED)\n'
+                '\t\t{\n'
+                '\t\t\tctx->verdict = REFRESH_QUAL_RLS;\n'
+                '\t\t\tctx->relid = rte->relid;\n'
+                '\t\t\treturn true;\n'
+                '\t\t}\n',
+                '\t\t/* P4: the RLS check, removed */\n'),
+           ]),
+
+    # The same check asked about the wrong role, which is the accident rather
+    # than the deletion.  transformRefreshWhereClause() runs after the switch
+    # to the owner, so GetUserId() is the owner here -- and an owner is exempt
+    # from their own policies unless FORCEd, so the check silently passes for
+    # every table it is asked about.  Threading callerId through is the only
+    # reason it does not, and nothing about the call site says so.
+    'P5': ('-', 'privs',
+           'RLS asked about whoever is running rather than about the caller '
+           '(the owner, who is exempt)', [
+               ('check_enable_rls(rte->relid, ctx->callerId, true)',
+                'check_enable_rls(rte->relid, GetUserId(), true)'),
+           ]),
+
+    # A security_invoker view is read as whoever runs it, which here is the
+    # owner, so SELECT on the view says nothing about what the caller could
+    # have read through it.
+    'P6': ('-', 'privs',
+           'a security_invoker view in the predicate is treated as an ordinary '
+           'one', [
+               ('\t\t\tif (invoker)\n', '\t\t\tif (false)\t\t\t\t/* P6 */\n'),
+           ]),
+
+    # The matview's own columns.  MAINTAIN does not imply SELECT, so without
+    # this a caller can name a column they cannot read and count the rows that
+    # match it.
+    'P7': ('-', 'privs',
+           'the predicate may read matview columns the caller cannot (MAINTAIN '
+           'treated as implying SELECT)', [
+               ('\t\tif (!bms_is_empty(nsitem->p_perminfo->selectedCols) &&\n'
+                '\t\t\t!refresh_caller_may_select(relid, nsitem->p_perminfo, callerId))',
+                '\t\tif (false)\t\t\t\t\t/* P7 */'),
            ]),
 
     'M1': ('A5', 'concur',
