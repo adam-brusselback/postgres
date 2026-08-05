@@ -1,0 +1,150 @@
+Branch-local material for REFRESH MATERIALIZED VIEW ... WHERE ...
+================================================================
+
+This directory is NOT part of any test schedule and is not wired into either
+build system.  It exists on this branch only; the submission branch deletes it.
+
+It was deleted once, when the feature looked finished, and restored when the
+feature turned out not to be.  What came back is the subset that still has a
+job now that a partial refresh is one algorithm under one spelling.  What did
+not come back is listed at the bottom, with the reason, so nobody goes looking.
+
+  ISSUES.md     Review items, split into those raised on the -hackers thread
+                (A1-A9) and those found separately, each mapped to the test
+                that covers it, plus a third section recording two rejected
+                designs -- per-key advisory locks, built and abandoned on the
+                thread, and MERGE, which was not.  Start here.
+
+  PLAN.md       Seven phases.  Phases 1-3 are the substance; 4-7 carry it to a
+                posted patch.  Written before the bare form was dropped, so
+                read its routing and lock-level passages as history.
+
+  SAFETY.md     Which predicates are safe, established by differential testing
+                rather than by argument.  Five independent failure modes, what
+                the planner's own push-down analysis already decides, and what
+                a static check would cost.  Unaffected by the removal.
+
+  RESULTS.md    Every measured number with the protocol that produced it, and
+                a retractions section.  Its rule -- a figure may not be quoted
+                without its protocol -- is the one thing here worth copying.
+
+  USE-CASES.md  53 use cases across 17 domains against a measured cost model.
+                Its "form S" column is stale: it was written when the bare
+                spelling meant diff/merge, which is gone.
+
+All timings come from a -O2 build with assertions off unless they say
+otherwise.  Do not add one without recording which build produced it.
+
+
+Running any of it
+-----------------
+
+Set PSQL_BIN.  A psql from $PATH is not necessarily this tree's, and a system
+one several majors older connects happily and then differs in ways that read
+as server behaviour.  Both harnesses now check the client against the server
+and refuse a mismatch, which cost a run to learn:
+
+    PSQL_BIN=/home/user/pgsql-opt/bin/psql ./safety/run.sh 5432 postgres
+    PSQL_BIN=/home/user/pgsql-opt/bin/psql ./fuzz.sh 5432 postgres
+
+
+The instruments
+---------------
+
+Every detector here has been shown to fail against a bug it is meant to catch.
+That is the entry requirement, not a nicety.  Several of them did not, at
+first, and looked exactly like working tests.
+
+  safety/run.sh       The single-session differential oracle.  For each (view
+                      shape, predicate, mutation): mutate the base, partial
+                      refresh, snapshot, full refresh, symmetric difference.
+                      23 exhaustive shapes over a 12-row base table, 1636
+                      mutations, plus 42 single-shot triples carrying the
+                      planner-signal measurement.  Answers "is this predicate
+                      safe".
+
+  fuzz.sh             The concurrent fuzzer, and the only thing here that can
+                      see a bug needing two sessions.  Four modes: p2 and p3
+                      for lock ordering over existing and inserted rows,
+                      serial for whether overlapping refreshes actually
+                      serialize, nest for a refresh reached from inside one.
+
+  mutations.py        Re-introduces known bugs one at a time, defined as edits
+                      to `git show HEAD:` rather than to a copy kept
+                      somewhere.  27 mutations; `--check` reports every stale
+                      anchor.  Note what --check does NOT do: it verifies the
+                      anchor matches, not that the result compiles.  P1 sat in
+                      the corpus naming two functions that do not exist.
+
+  rebuild.sh          Rebuilds and then proves the rebuild happened, by asking
+                      the running server what it was compiled with.  autodepend
+                      is empty in this tree, so a configure change relinks
+                      stale objects and exits 0.
+
+  calibrate.sh        Measures which known bugs the oracle detects, against
+  calibrate-fuzz.sh   calibrate.baseline rather than a hand-written list of
+  calibrate-all.sh    shapes.  The list that existed before this did omit the
+                      one shape whose behaviour was unexplained.
+
+  leakcheck.sh        Counts plansources and memory contexts across four
+                      refresh patterns.  Calibrated against L3/L4/L5.
+
+
+State against the current code
+------------------------------
+
+  mutations.py --check           27/27
+  safety/run.sh                  23 shapes, vector identical to
+                                 calibrate.baseline in every cell but one
+  fuzz.sh                        PASS on p2, p3, serial and nest
+
+The one moved cell is `two_ukeys`, which goes from 0 errors to 48: a matview
+with a second unique index refuses a WHERE clause now rather than routing to
+diff/merge.  The baseline is re-recorded with that in it.  Every other shape's
+divergence count is unchanged, which is the evidence that dropping the bare
+form and the diff/merge predicate path changed predicate safety nowhere.
+
+
+What did not come back, and why
+-------------------------------
+
+Recoverable from 26ef606, which is where this directory was pinned before the
+deletion.  Nothing below is lost; it is just not useful against current code.
+
+  bench/              The benchmark suite.  Phase 6 work, not correctness
+                      work, and half its arms are the bare form.
+  profile.py          In-backend INSTR_TIME instrumentation.  Same reason.
+  safety/rundiff.sh   Differential mode: two implementations, diffed against
+                      each other.  There is one implementation now.
+  safety/diff_driver.sql   Its driver.
+  run.sh              The original A5 lock-ordering reproducer, superseded by
+                      fuzz.sh's p2 mode.  Kept for a while because the thread
+                      refers to it; the thread can refer to p2.
+  CACHE.md            The subplan behind PLAN.md 3.7, which is done.
+  SPECIALIZE.md       The Phase 4 specialisation design.  Two of the four
+                      specialisations it chose are gone with the bare form.
+  RESTORE.md          Restore points, whose build recipes predate all of this.
+
+  mutations N1-N4     The prune elision.  Removed with the lock that made it
+                      sound; there is no guard left to mutate.  The cases they
+                      calibrated are still in matview_where Test 17.
+  mutation Q2         diff/merge's identifier quoting on the predicate path.
+                      The call site survives for the full concurrent refresh,
+                      but nothing in this feature's suite reaches it, so the
+                      mutation would sit in the matrix as permanently
+                      UNCAUGHT -- which reads as a gap in the tests rather
+                      than as what it is.
+
+
+Which instrument fits which failure
+-----------------------------------
+
+This is the thing the directory keeps having to relearn, and it comes down to
+one distinction:
+
+    a rate      -> fuzz.sh.  Run it enough times and it happens.
+    a window    -> an injection point.  It is microseconds wide; run it a
+                   million times and it still will not happen by chance.
+
+That was got wrong three times.  The deterministic gates for the windows live
+in src/test/modules/injection_points/specs/, which ships.
