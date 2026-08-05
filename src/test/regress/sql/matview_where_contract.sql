@@ -1,30 +1,12 @@
 --
--- REFRESH MATERIALIZED VIEW ... WHERE ... -- the contract
+-- REFRESH MATERIALIZED VIEW ... WHERE ...: the contract
 --
--- What the feature promises, stated once, in one place, as assertions that
--- name no part of how it is implemented.
+-- What the feature promises, with no reference to how it is implemented.  The
+-- other files in this suite are organised by defect and answer "is this bug
+-- still fixed".  This one answers "does the feature still do what it promises".
 --
--- The rest of the suite is organised by defect: each test is tied to a thread
--- item or an issue number and says what went wrong and when.  That is the right
--- shape for review and the wrong shape for a rewrite, because it answers "is
--- this bug still fixed" rather than "does this still do what it promises".
--- This file answers the second question.  It is the acceptance criterion for
--- replacing the SPI/string implementation with Query trees: if the promises
--- below still hold afterwards, the rewrite preserved the feature, whatever it
--- did to the machinery.
---
--- Rules for anything added here:
---
---   * No plan shapes, no statement text, no lock levels, no physical order.
---     If it would have to change because the implementation changed, it does
---     not belong in this file -- it belongs in the defect-oriented tests, with
---     a Disposition line saying so.
---   * Every promise gets a check that fails when the promise is broken.  A
---     check that passes both ways is worse than nothing; three of those were
---     found in this suite already.
---
--- Two promises are not expressible in a single session and live as isolation
--- specs.  They are listed here so the contract can be read in one place:
+-- Two promises need more than one session and live as isolation specs.  They
+-- are listed here so the contract reads in one place:
 --
 --   readers never block                matview-where-serialize
 --   overlapping refreshes serialize,   matview-where-serialize
@@ -32,9 +14,6 @@
 --   deterministic lock order,          matview-where-lockorder     (existing rows)
 --     so overlapping refreshes         matview-where-insertorder   (inserted rows)
 --     cannot deadlock
---
--- Disposition: keep, and keep it first.  This is the file a reviewer should be
--- able to read to learn what the feature does.
 --
 
 CREATE TABLE ct_base (id int PRIMARY KEY, grp int, val int);
@@ -46,8 +25,8 @@ CREATE UNIQUE INDEX ON ct_mv(id);
 --
 -- Promise 1: a refresh makes its scope match what a full refresh would make it.
 --
--- Stated as a comparison against the view query itself, so it holds for any
--- implementation that produces the right rows by any means.
+-- Compared against the view query itself, so it holds for any implementation
+-- that produces the right rows.
 --
 UPDATE ct_base SET val = val + 1 WHERE id <= 6;
 
@@ -70,12 +49,10 @@ SELECT count(*) AS p1_conc_in_scope_differs_from_view
 --
 -- Promise 2: rows outside the scope are untouched.
 --
--- The base rows 7..12 were changed by neither UPDATE above, so the check is
--- that the matview still holds what it held -- but stating it that way would
--- pass even if the refresh had rewritten them identically.  Change the base
--- outside the scope instead, refresh inside it, and require the matview to
--- still show the OLD values: that fails if the refresh touched anything it
--- should not have.
+-- Checking that the matview still holds what it held would pass even if the
+-- refresh had rewritten those rows identically.  So change the base outside the
+-- scope, refresh inside it, and require the matview to still show the old
+-- values.  That fails if the refresh touched anything it should not have.
 --
 UPDATE ct_base SET val = 999 WHERE id > 6;
 
@@ -93,9 +70,9 @@ SELECT count(*) AS p2_in_scope_wrong
 --
 -- Promise 3: a row that leaves the scope is deleted.
 --
--- Deliberate and documented (B15): the predicate names a region of the
--- matview, and a refresh makes that region match the view.  A row that no
--- longer satisfies the view definition is therefore removed, not left behind.
+-- This is deliberate and it is documented.  The predicate names a region of
+-- the matview and a refresh makes that region match the view, so a row that no
+-- longer satisfies the view definition is removed rather than left behind.
 --
 CREATE TABLE ct_act (id int PRIMARY KEY, state text, val int);
 INSERT INTO ct_act VALUES (1, 'on', 10), (2, 'on', 20), (3, 'off', 30);
@@ -123,41 +100,27 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY ct_act_mv WHERE id = 3;
 SELECT id FROM ct_act_mv ORDER BY id;
 
 --
--- Promise 5 -- the command reports the number of rows it changed -- is not
--- here, and the reason is worth recording rather than quietly working around.
---
--- It was written here first.  It passed, and it could not have done anything
--- else: pg_regress does not echo command tags, so the rowcount never reached
--- the output and three REFRESH statements with three different answers all
--- produced an identical blank.  A check that cannot fail is exactly what the
--- rules at the top of this file forbid, and it took running it to notice --
--- reading it, it looks like a test.
---
--- The rowcount is only observable through pg_stat_statements, so the promise
--- lives with the rows-tracking cases in contrib/pg_stat_statements/sql/
--- utility.sql, which already cover both forms.  That is a different file from
--- the structural block in the same test, which asserts generated SQL text and
--- is to be deleted at the start of Phase 2.
+-- Promise 5, that the command reports the number of rows it changed, is not
+-- here.  pg_regress does not echo command tags, so the rowcount never reaches
+-- the output and a check placed here would pass whatever the answer was.  It
+-- is covered in contrib/pg_stat_statements/sql/utility.sql instead, where the
+-- count is visible.
 --
 
 --
 -- Promise 6: a refresh that changes nothing changes nothing.
 --
--- Weaker than it sounds, and the reason it is here: it is the check that
--- caught B4, where a NULLable unique key made every refresh duplicate the
--- NULL-keyed rows.  Repeating a no-op refresh is the cheapest way to catch a
--- whole class of upsert/anti-join disagreements.
+-- Repeating a no-op refresh is a cheap way to catch the upsert and the
+-- anti-join disagreeing about which rows the view produces.  It is what caught
+-- a NULLable unique key duplicating the NULL-keyed rows on every refresh.
 --
 CREATE TABLE ct_null (id int, val text);
 INSERT INTO ct_null VALUES (NULL, 'x'), (1, 'a'), (NULL, 'y');
 CREATE MATERIALIZED VIEW ct_null_mv AS SELECT id, val FROM ct_null;
 CREATE UNIQUE INDEX ON ct_null_mv(id);
 
--- Count after EACH form, not once at the end.  Written the other way first --
--- three refreshes then one count -- and it passed with the bug present: the
--- two CONCURRENTLY refreshes took the matview from 3 rows to 7, and the bare
--- refresh that followed compares whole rows, so it repaired the damage before
--- anything looked.  A check placed after a repair step measures the repair.
+-- Count after each refresh rather than once at the end.  A count taken only at
+-- the end can be measuring a later refresh repairing what an earlier one broke.
 SELECT count(*) AS p6_before FROM ct_null_mv;
 
 REFRESH MATERIALIZED VIEW CONCURRENTLY ct_null_mv WHERE id IS NULL;
@@ -172,10 +135,9 @@ SELECT count(*) AS p6_after_bare_noop FROM ct_null_mv;
 --
 -- Promise 7: a partial refresh converges with a full one.
 --
--- This is the promise the whole feature rests on, and the one no amount of
--- reading the implementation establishes: whatever a partial refresh does to
--- the rows its predicate names, the result must be what a full refresh would
--- have produced.  Two identical matviews, one refreshed each way.
+-- This is the promise the feature rests on.  Whatever a partial refresh does
+-- to the rows its predicate names, the result has to be what a full refresh
+-- would have produced.  Two identical matviews, one refreshed each way.
 --
 CREATE TABLE ct_agree (id int PRIMARY KEY, grp int, val int);
 INSERT INTO ct_agree SELECT g, g % 3, g FROM generate_series(1, 9) g;
@@ -192,9 +154,9 @@ UPDATE ct_agree SET val = val * 2 WHERE grp = 1;
 REFRESH MATERIALIZED VIEW ct_agree_a;
 REFRESH MATERIALIZED VIEW CONCURRENTLY ct_agree_b WHERE grp = 1;
 
--- Both directions, because EXCEPT ALL is not symmetric: one way finds rows the
--- partial refresh failed to produce, the other finds rows it produced and
--- should not have.  Checking one of them is half a test.
+-- Both directions, because EXCEPT ALL is not symmetric.  One way finds rows
+-- the partial refresh failed to produce, the other finds rows it produced and
+-- should not have.
 SELECT count(*) AS p7_full_has_rows_partial_does_not
   FROM ((SELECT grp, total FROM ct_agree_a)
         EXCEPT ALL
