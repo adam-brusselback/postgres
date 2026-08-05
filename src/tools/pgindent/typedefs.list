@@ -2589,6 +2589,8 @@ RecursiveUnionState
 RefetchForeignRow_function
 RefreshMatViewStmt
 RefreshParamizeContext
+RefreshQualContext
+RefreshQualVerdict
 RegProcedure
 Regis
 RegisNode

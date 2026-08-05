@@ -56,6 +56,9 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY <replaceable class="parameter">name</repl
    A partial refresh modifies rows in place rather than replacing the
    materialized view's contents, so <literal>CONCURRENTLY</literal> is required.
    The <literal>WHERE</literal> clause cannot be used with <literal>WITH NO DATA</literal>.
+   A caller who does not own the materialized view needs
+   <literal>SELECT</literal> as well as <literal>MAINTAIN</literal> on what the
+   condition reads; see <xref linkend="sql-refreshmaterializedview-condition"/>.
   </para>
  </refsect1>
 
@@ -103,7 +106,7 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY <replaceable class="parameter">name</repl
     </listitem>
    </varlistentry>
 
-   <varlistentry>
+   <varlistentry id="sql-refreshmaterializedview-condition">
     <term><literal>WHERE</literal> <replaceable class="parameter">condition</replaceable></term>
     <listitem>
      <para>
@@ -162,9 +165,9 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY <replaceable class="parameter">name</repl
      </para>
 
      <para>
-      If the defining query's result is not a function of the base data alone —
+      If the defining query's result is not a function of the base data alone \&mdash;
       <literal>DISTINCT ON</literal> or <literal>LIMIT</literal> without an
-      <literal>ORDER BY</literal> that breaks every tie, for instance — then a
+      <literal>ORDER BY</literal> that breaks every tie, for instance \&mdash; then a
       partial refresh may produce a different, equally valid answer from the one
       a full refresh would produce, because it plans a different query.  Two
       full refreshes may also disagree in that case, but a partial refresh
@@ -184,7 +187,7 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY <replaceable class="parameter">name</repl
      <para>
       The upsert resolves collisions against a single index, so it cannot apply
       a change that would require deleting one row before inserting another to
-      satisfy a <emphasis>second</emphasis> unique index — two rows exchanging
+      satisfy a <emphasis>second</emphasis> unique index \&mdash; two rows exchanging
       their values on one, for instance.  A <literal>WHERE</literal> clause is
       therefore rejected on a materialized view carrying more than one unique
       index, rather than failing partway through on whichever change it cannot
@@ -213,11 +216,21 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY <replaceable class="parameter">name</repl
      <para>
       The <literal>WHERE</literal> clause cannot contain volatile functions or
       aggregates.  It is evaluated with the privileges of the owner of the
-      materialized view, so a caller who is not the owner may only use
-      expressions whose functions are all leakproof.  For the same reason it is
-      analyzed under the restricted <xref linkend="guc-search-path"/> that
-      applies while the command runs, so any object it names must be
-      schema-qualified.
+      materialized view, and it is analyzed under the restricted <xref
+      linkend="guc-search-path"/> that applies while the command runs, so any
+      object it names must be schema-qualified.
+     </para>
+     <para>
+      Because it runs as the owner, a caller who is not the owner is held to
+      what they could have read themselves.  Such a caller may only use
+      expressions whose functions are all leakproof, and may only refer to a
+      relation &mdash; the materialized view itself as much as anything a
+      subquery names &mdash; if they hold <literal>SELECT</literal> on the
+      columns the condition reads of it, are not seeing its rows through <link
+      linkend="ddl-rowsecurity">row-level security</link> that does not also
+      apply to the owner, and are not reaching it through a
+      <literal>security_invoker</literal> view.  The owner is subject to none
+      of this.
      </para>
     </listitem>
    </varlistentry>

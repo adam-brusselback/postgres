@@ -69,7 +69,11 @@ ALTER TABLE matview_priv_target OWNER TO regress_matview_owner;
 ALTER MATERIALIZED VIEW matview_priv_mv OWNER TO regress_matview_owner;
 
 CREATE SCHEMA matview_priv_atk AUTHORIZATION regress_matview_maint;
-GRANT MAINTAIN ON matview_priv_mv TO regress_matview_maint;
+-- SELECT as well as MAINTAIN, so that the leakproof rule is the only thing
+-- left that can refuse this: a predicate naming a column the caller may not
+-- read is refused for that reason instead (Test 6, case 57), and without the
+-- grant this test would pass on the wrong refusal.
+GRANT MAINTAIN, SELECT ON matview_priv_mv TO regress_matview_maint;
 
 SET ROLE regress_matview_maint;
 
@@ -209,7 +213,12 @@ DROP TABLE matview_mw_base;
 --
 -- The gate is now modelled on contain_leaked_vars_walker() in clauses.c, which
 -- solves the same problem for row-level security: an explicit list of node
--- types that cannot reach a relation, and everything else refused.
+-- types that cannot reach a relation, and everything else refused.  Since
+-- then it also descends into the query levels it finds and asks about the
+-- relations in their range tables (Test 6), which is what lets a subquery
+-- through when the caller could have run it themselves.  These six all still
+-- fail: five read mvlp.secret, which the caller cannot; the sixth reaches no
+-- relation and is refused because generate_series() is not leakproof.
 --
 
 CREATE ROLE regress_mvlp_owner;
@@ -334,30 +343,41 @@ DROP MATERIALIZED VIEW mv_leak;
 DROP TABLE mv_leak_base;
 
 --
--- Test 5: a subquery in the predicate is owner-only
+-- Test 5: a subquery in the predicate, for a caller who is not the owner
 --
--- Found here, not on the -hackers thread.  This is a consequence of Test 1's
--- rule rather than a separate decision, and it is recorded separately because
--- of what it costs: naming the correct scope for a change to a dimension table
--- requires asking the fact table which rows joined to it, which is a subquery,
--- and that is the pattern the documentation's blast-radius warning tells people
--- to write.  So the documented correct usage is available to the owner and to
--- nobody else.
+-- Found here, not on the -hackers thread.  A subquery used to be refused
+-- outright, as a consequence of Test 1's rule rather than a separate decision:
+-- the leakproof gate walks the predicate over an allowed list of node tags and
+-- refuses everything else (Test 3), and SubLink was not on that list.
 --
--- The mechanism is that the leakproof gate walks the predicate over an allowed
--- list of node tags and refuses everything else (Test 3), and SubLink is not on
--- that list.  Refusing is the safe default and it is not obviously wrong: the
--- subquery runs as the owner, so a caller who cannot read the table it names
--- would otherwise learn which of its rows intersect the matview.  But it is
--- indiscriminate -- it refuses the subquery whether or not the caller could
--- have run it themselves.
+-- That was recorded here because of what it cost.  Naming the correct scope
+-- for a change to a dimension table requires asking the fact table which rows
+-- joined to it, which is a subquery, and that is the pattern the
+-- documentation's blast-radius warning tells people to write.  So the
+-- documented correct usage was available to the owner and to nobody else.
 --
--- Note also what the message says.  There is no function anywhere in these
--- predicates, and the hint still blames one.
+-- Refusing was the safe default and it was not obviously wrong -- the subquery
+-- runs as the owner, so a caller who cannot read the table it names would
+-- otherwise learn which of its rows intersect the matview -- but it was
+-- indiscriminate: it refused the subquery whether or not the caller could have
+-- run it themselves.  The rule is now the narrower one, and the note this test
+-- used to carry said what that would look like: "the first two would start
+-- succeeding and the last must not".  That is what it now checks.
 --
--- Disposition: keep.  If the rule is ever narrowed to "the caller may read
--- everything the subquery reads", these cases are what says so: the first two
--- would start succeeding and the last must not.
+-- Disposition: keep.  Test 6 covers the rule exhaustively; this stays as the
+-- worked example of the use case, with the tables named after what they are.
+--
+
+--
+-- The rule, once, in one place.  A caller who does not own the matview may use
+-- a predicate that reads a relation only if reading it tells them nothing they
+-- could not have read directly: they must hold SELECT on the columns it reads,
+-- of the matview as much as of anything a subquery names, and must not be
+-- reaching the rows through row-level security or a security_invoker view that
+-- the owner is not reaching them through.  Functions are separate and unchanged
+-- (Test 1): a predicate that is not leakproof is owner-only however readable
+-- its tables are, because the escalation there is running the caller's code as
+-- the owner rather than reading the owner's rows.
 --
 
 CREATE ROLE regress_mvsq_owner;
@@ -380,7 +400,7 @@ ALTER TABLE mvsq.fact OWNER TO regress_mvsq_owner;
 ALTER TABLE mvsq.dim OWNER TO regress_mvsq_owner;
 ALTER TABLE mvsq.secret OWNER TO regress_mvsq_owner;
 ALTER MATERIALIZED VIEW mvsq.mv OWNER TO regress_mvsq_owner;
-GRANT MAINTAIN ON mvsq.mv TO regress_mvsq_maint;
+GRANT MAINTAIN, SELECT ON mvsq.mv TO regress_mvsq_maint;
 -- The maintainer may read the fact and dimension tables, and not the secret.
 GRANT SELECT ON mvsq.fact, mvsq.dim TO regress_mvsq_maint;
 
@@ -390,28 +410,34 @@ UPDATE mvsq.dim SET nm = 'ONE' WHERE id = 1;
 SET ROLE regress_mvsq_maint;
 REFRESH MATERIALIZED VIEW CONCURRENTLY mvsq.mv WHERE id = 3;
 
--- Refused, though the maintainer has SELECT on every table the subquery names
--- and could run it themselves.
+-- Allowed: the maintainer has SELECT on every table the subquery names and
+-- could have run it themselves.
 REFRESH MATERIALIZED VIEW CONCURRENTLY mvsq.mv
   WHERE id IN (SELECT f.id FROM mvsq.fact f WHERE f.did = 1);
 
--- Refused, correlated form of the same thing.
+-- Allowed, correlated form of the same thing.  This is the shape the
+-- documentation recommends for a dimension-table change, and the one that was
+-- available to the owner alone.
 REFRESH MATERIALIZED VIEW CONCURRENTLY mvsq.mv
   WHERE EXISTS (SELECT 1 FROM mvsq.fact f WHERE f.id = mvsq.mv.id AND f.did = 1);
 
--- Refused, and this one must stay refused however the rule is narrowed: the
--- maintainer cannot read mvsq.secret, so the answer would tell them which of
--- its rows exist.
+-- Refused: the maintainer cannot read mvsq.secret, so the rows the refresh
+-- touched would tell them which of its rows exist.
 SELECT count(*) FROM mvsq.secret;
 REFRESH MATERIALIZED VIEW CONCURRENTLY mvsq.mv
   WHERE id IN (SELECT s.id FROM mvsq.secret s);
 RESET ROLE;
 
--- The owner may use all three.
+-- The owner may use all three, including the one over mvsq.secret.
 SET ROLE regress_mvsq_owner;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mvsq.mv
+  WHERE id IN (SELECT s.id FROM mvsq.secret s);
 REFRESH MATERIALIZED VIEW CONCURRENTLY mvsq.mv
   WHERE EXISTS (SELECT 1 FROM mvsq.fact f WHERE f.id = mvsq.mv.id AND f.did = 1);
 RESET ROLE;
+
+-- The dimension change reached the two rows that join to it, and no others:
+-- what the maintainer's own correlated refresh above was for.
 SELECT id, did, nm FROM mvsq.mv ORDER BY id;
 
 DROP MATERIALIZED VIEW mvsq.mv;
@@ -421,3 +447,352 @@ DROP TABLE mvsq.dim;
 DROP SCHEMA mvsq;
 DROP ROLE regress_mvsq_owner;
 DROP ROLE regress_mvsq_maint;
+
+--
+-- Test 6: the rule, case by case
+--
+-- Test 5 is the use case; this is the boundary.  Every case here is a way a
+-- predicate can reach a relation, asked twice: once against a table the caller
+-- may read, where it must be allowed, and once against one they may not, where
+-- it must be refused.  The pairing is the point.  A gate that refuses
+-- everything passes the second half of this test and fails the first, and the
+-- version of this feature that shipped before the rule was narrowed would have
+-- done exactly that.
+--
+-- The routes are not decoration.  The check walks the parsed predicate and
+-- inspects the range table of every query level it finds, so each of these is a
+-- different way for a relation to appear in a range table -- a sublink, a
+-- FROM-clause subquery, a CTE, a set-operation arm, a LATERAL item, a
+-- recursive term -- and each was tried against a table the caller cannot read
+-- before it was written down here.
+--
+-- Disposition: keep.  This is the file's most direct security check and the
+-- cheapest thing to break: the allowed list of node tags in
+-- refresh_qual_needs_owner_walker() gains a tag, or a query level stops being
+-- visited, and one of these silently starts succeeding.
+--
+
+CREATE ROLE regress_mvg_owner;
+CREATE ROLE regress_mvg_maint;
+CREATE ROLE regress_mvg_bypass BYPASSRLS;
+CREATE ROLE regress_mvg_super SUPERUSER;
+CREATE SCHEMA mvg;
+GRANT USAGE ON SCHEMA mvg
+  TO regress_mvg_owner, regress_mvg_maint, regress_mvg_bypass, regress_mvg_super;
+
+-- open: the maintainer may read it.  closed: they may not.  cols: they may
+-- read two of its three columns.  theirs: they own it, and the matview's owner
+-- may read it.
+CREATE TABLE mvg.open   (id int PRIMARY KEY, gid int, who name);
+CREATE TABLE mvg.closed (id int PRIMARY KEY, s text);
+CREATE TABLE mvg.cols   (id int PRIMARY KEY, ok int, hidden int);
+CREATE TABLE mvg.theirs (id int PRIMARY KEY, gid int);
+INSERT INTO mvg.open SELECT g, (g % 2) + 1,
+       CASE WHEN g <= 2 THEN 'regress_mvg_maint' ELSE 'other' END
+  FROM generate_series(1, 4) g;
+INSERT INTO mvg.closed VALUES (1, 'x');
+INSERT INTO mvg.cols   SELECT g, g, g * 100 FROM generate_series(1, 4) g;
+INSERT INTO mvg.theirs SELECT g, (g % 2) + 1 FROM generate_series(1, 4) g;
+
+CREATE MATERIALIZED VIEW mvg.mv AS SELECT id, gid, who FROM mvg.open;
+CREATE UNIQUE INDEX ON mvg.mv (id);
+
+-- Two views over the closed table.  An ordinary view is read with its own
+-- owner's privileges whoever runs it, so the caller learns nothing from the
+-- refresh they could not learn by selecting from the view; a security_invoker
+-- view is read as whoever runs it, which here is the matview's owner.
+CREATE VIEW mvg.v_plain   AS SELECT id FROM mvg.closed;
+CREATE VIEW mvg.v_invoker WITH (security_invoker = true) AS SELECT id FROM mvg.closed;
+
+-- A function that reads the closed table, to check that a function cannot be
+-- used to get at what a subquery may not.
+CREATE FUNCTION mvg.read_closed() RETURNS SETOF int LANGUAGE sql STABLE
+  AS $$SELECT id FROM mvg.closed$$;
+
+ALTER TABLE mvg.open   OWNER TO regress_mvg_owner;
+ALTER TABLE mvg.closed OWNER TO regress_mvg_owner;
+ALTER TABLE mvg.cols   OWNER TO regress_mvg_owner;
+ALTER TABLE mvg.theirs OWNER TO regress_mvg_maint;
+ALTER VIEW  mvg.v_plain   OWNER TO regress_mvg_owner;
+ALTER VIEW  mvg.v_invoker OWNER TO regress_mvg_owner;
+ALTER FUNCTION mvg.read_closed() OWNER TO regress_mvg_owner;
+ALTER MATERIALIZED VIEW mvg.mv OWNER TO regress_mvg_owner;
+
+GRANT MAINTAIN, SELECT ON mvg.mv TO regress_mvg_maint, regress_mvg_bypass;
+GRANT SELECT ON mvg.open TO regress_mvg_maint, regress_mvg_bypass;
+GRANT SELECT (id, ok) ON mvg.cols TO regress_mvg_maint;
+GRANT SELECT ON mvg.v_plain, mvg.v_invoker TO regress_mvg_maint;
+GRANT SELECT ON mvg.theirs TO regress_mvg_owner;
+
+-- Report the verdict rather than let the message through, so that one line of
+-- output covers one case.  A refusal is reported with its message: the
+-- messages name which of the reasons it was, and a case moving between them is
+-- as much a change as a case moving between allowed and refused.  The context
+-- tells a refusal by the check apart from one raised by running the generated
+-- SQL, which happens for its own reasons and would otherwise read the same.
+CREATE FUNCTION mvg.try(who text, label text, pred text) RETURNS text
+  LANGUAGE plpgsql AS $$
+DECLARE ctx text;
+BEGIN
+  EXECUTE format('SET LOCAL ROLE %I', who);
+  BEGIN
+    EXECUTE 'REFRESH MATERIALIZED VIEW CONCURRENTLY mvg.mv WHERE ' || pred;
+    RESET ROLE;
+    RETURN format('%-32s allowed', label);
+  EXCEPTION WHEN others THEN
+    RESET ROLE;
+    GET STACKED DIAGNOSTICS ctx = PG_EXCEPTION_CONTEXT;
+    RETURN format('%-32s %s: %s', label,
+                  CASE WHEN ctx LIKE '%mvg.mv mv%' THEN 'refused when run'
+                       ELSE 'refused' END,
+                  SQLERRM);
+  END;
+END $$;
+
+--
+-- 6a: the routes, over a table the caller may read.  All allowed.
+--
+SELECT mvg.try('regress_mvg_maint', '1  plain column',
+  $$id = 1$$);
+SELECT mvg.try('regress_mvg_maint', '2  sublink',
+  $$id IN (SELECT o.id FROM mvg.open o WHERE o.gid = 1)$$);
+SELECT mvg.try('regress_mvg_maint', '3  correlated sublink',
+  $$EXISTS (SELECT 1 FROM mvg.open o WHERE o.id = mvg.mv.id)$$);
+SELECT mvg.try('regress_mvg_maint', '4  NOT EXISTS',
+  $$NOT EXISTS (SELECT 1 FROM mvg.open o WHERE o.id = mvg.mv.id AND o.gid = 9)$$);
+SELECT mvg.try('regress_mvg_maint', '5  FROM-clause subquery',
+  $$id IN (SELECT x.id FROM (SELECT o.id FROM mvg.open o) x)$$);
+SELECT mvg.try('regress_mvg_maint', '6  CTE',
+  $$id IN (WITH c AS (SELECT o.id FROM mvg.open o) SELECT c.id FROM c)$$);
+SELECT mvg.try('regress_mvg_maint', '7  recursive CTE',
+  $$id IN (WITH RECURSIVE c(n) AS (SELECT o.id FROM mvg.open o WHERE o.id = 1
+                                   UNION ALL SELECT n FROM c WHERE n < 0)
+           SELECT n FROM c)$$);
+SELECT mvg.try('regress_mvg_maint', '8  UNION arm',
+  $$id IN (SELECT o.id FROM mvg.open o UNION SELECT o2.id FROM mvg.open o2)$$);
+SELECT mvg.try('regress_mvg_maint', '9  EXCEPT arm',
+  $$id IN (SELECT o.id FROM mvg.open o
+           EXCEPT SELECT o2.id FROM mvg.open o2 WHERE o2.id > 99)$$);
+SELECT mvg.try('regress_mvg_maint', '10 LATERAL',
+  $$id IN (SELECT l.id FROM mvg.open o,
+             LATERAL (SELECT o2.id FROM mvg.open o2 WHERE o2.id = o.id) l)$$);
+SELECT mvg.try('regress_mvg_maint', '11 ARRAY sublink',
+  $$id = ANY (ARRAY(SELECT o.id FROM mvg.open o))$$);
+SELECT mvg.try('regress_mvg_maint', '12 scalar subquery in CASE',
+  $$id = CASE WHEN true
+              THEN (SELECT o.id FROM mvg.open o ORDER BY o.id LIMIT 1)
+              ELSE 0 END$$);
+SELECT mvg.try('regress_mvg_maint', '13 row-comparison sublink',
+  $$(id, id) = (SELECT o.id, o.id FROM mvg.open o ORDER BY o.id LIMIT 1)$$);
+SELECT mvg.try('regress_mvg_maint', '14 DISTINCT ON, ORDER BY',
+  $$id IN (SELECT DISTINCT ON (o.id) o.id FROM mvg.open o ORDER BY o.id)$$);
+SELECT mvg.try('regress_mvg_maint', '15 sublink under a sublink',
+  $$id IN (SELECT o.id FROM mvg.open o
+           WHERE o.id = ANY (ARRAY(SELECT o2.id FROM mvg.open o2)))$$);
+SELECT mvg.try('regress_mvg_maint', '16 the matview itself',
+  $$id IN (SELECT m.id FROM mvg.mv m WHERE m.gid = 1)$$);
+SELECT mvg.try('regress_mvg_maint', '17 an ordinary view',
+  $$id IN (SELECT v.id FROM mvg.v_plain v)$$);
+SELECT mvg.try('regress_mvg_maint', '18 columns they may read',
+  $$id IN (SELECT c.id FROM mvg.cols c WHERE c.ok > 0)$$);
+SELECT mvg.try('regress_mvg_maint', '19 no column named',
+  $$id IN (SELECT 1 FROM mvg.cols c)$$);
+SELECT mvg.try('regress_mvg_maint', '20 a table they own',
+  $$id IN (SELECT t.id FROM mvg.theirs t)$$);
+
+--
+-- 6a-2: where the readable-table rule stops and Test 1's function rule starts.
+--
+-- These read nothing the caller could not read, and are refused anyway.  An
+-- aggregate and a window function are functions, and count(), min() and
+-- row_number() are not marked leakproof -- almost nothing is -- so the rule
+-- that a non-owner's predicate must be leakproof catches them.  That rule is
+-- unchanged and deliberate: what it prevents is not reading the owner's rows
+-- but running the caller's code as the owner, which a readable range table
+-- says nothing about.
+--
+-- Recorded because the line is a surprising place for it to fall and because
+-- these are the cases to revisit first if it is ever moved.  Anyone marking
+-- more functions leakproof upstream will flip them, which is the correct
+-- outcome and should be visible here rather than silent.
+--
+SELECT mvg.try('regress_mvg_maint', '21 an aggregate in HAVING',
+  $$id IN (SELECT o.id FROM mvg.open o GROUP BY o.id HAVING count(*) > 0)$$);
+SELECT mvg.try('regress_mvg_maint', '22 an aggregate in a target list',
+  $$id = (SELECT min(o.id) FROM mvg.open o)$$);
+SELECT mvg.try('regress_mvg_maint', '23 a window function',
+  $$id IN (SELECT w.id FROM (SELECT o.id, row_number() OVER () FROM mvg.open o) w)$$);
+
+--
+-- 6b: the same routes, over a table the caller may not read.  All refused,
+-- and each names mvg.closed rather than blaming a function.
+--
+SELECT mvg.try('regress_mvg_maint', '24 sublink',
+  $$id IN (SELECT c.id FROM mvg.closed c)$$);
+SELECT mvg.try('regress_mvg_maint', '25 correlated sublink',
+  $$EXISTS (SELECT 1 FROM mvg.closed c WHERE c.id = mvg.mv.id)$$);
+SELECT mvg.try('regress_mvg_maint', '26 NOT EXISTS',
+  $$NOT EXISTS (SELECT 1 FROM mvg.closed c WHERE c.id = mvg.mv.id)$$);
+SELECT mvg.try('regress_mvg_maint', '27 FROM-clause subquery',
+  $$id IN (SELECT x.id FROM (SELECT c.id FROM mvg.closed c) x)$$);
+SELECT mvg.try('regress_mvg_maint', '28 CTE',
+  $$id IN (WITH c AS (SELECT cl.id FROM mvg.closed cl) SELECT c.id FROM c)$$);
+SELECT mvg.try('regress_mvg_maint', '29 recursive CTE',
+  $$id IN (WITH RECURSIVE c(n) AS (SELECT cl.id FROM mvg.closed cl
+                                   UNION ALL SELECT n FROM c WHERE n < 0)
+           SELECT n FROM c)$$);
+SELECT mvg.try('regress_mvg_maint', '30 UNION arm',
+  $$id IN (SELECT o.id FROM mvg.open o UNION SELECT c.id FROM mvg.closed c)$$);
+SELECT mvg.try('regress_mvg_maint', '31 EXCEPT arm',
+  $$id IN (SELECT o.id FROM mvg.open o EXCEPT SELECT c.id FROM mvg.closed c)$$);
+SELECT mvg.try('regress_mvg_maint', '32 LATERAL',
+  $$id IN (SELECT l.id FROM mvg.open o,
+             LATERAL (SELECT c.id FROM mvg.closed c WHERE c.id = o.id) l)$$);
+SELECT mvg.try('regress_mvg_maint', '33 ARRAY sublink',
+  $$id = ANY (ARRAY(SELECT c.id FROM mvg.closed c))$$);
+SELECT mvg.try('regress_mvg_maint', '34 scalar subquery in CASE',
+  $$id = CASE WHEN true THEN (SELECT c.id FROM mvg.closed c LIMIT 1) ELSE 0 END$$);
+SELECT mvg.try('regress_mvg_maint', '35 row-comparison sublink',
+  $$(id, id) = (SELECT c.id, c.id FROM mvg.closed c LIMIT 1)$$);
+SELECT mvg.try('regress_mvg_maint', '36 subquery in a target list',
+  $$id IN (SELECT (SELECT c.id FROM mvg.closed c LIMIT 1))$$);
+SELECT mvg.try('regress_mvg_maint', '37 DISTINCT ON, ORDER BY',
+  $$id IN (SELECT DISTINCT ON (c.id) c.id FROM mvg.closed c ORDER BY c.id)$$);
+SELECT mvg.try('regress_mvg_maint', '38 sublink under a sublink',
+  $$id IN (SELECT o.id FROM mvg.open o
+           WHERE o.id = ANY (ARRAY(SELECT c.id FROM mvg.closed c)))$$);
+SELECT mvg.try('regress_mvg_maint', '39 join, one side closed',
+  $$id IN (SELECT o.id FROM mvg.open o JOIN mvg.closed c ON c.id = o.id)$$);
+SELECT mvg.try('regress_mvg_maint', '40 a column they may not read',
+  $$id IN (SELECT c.id FROM mvg.cols c WHERE c.hidden > 0)$$);
+SELECT mvg.try('regress_mvg_maint', '41 a whole-row reference',
+  $$id IN (SELECT 1 FROM mvg.cols c WHERE c::text <> '')$$);
+SELECT mvg.try('regress_mvg_maint', '42 a security_invoker view',
+  $$id IN (SELECT v.id FROM mvg.v_invoker v)$$);
+
+-- A function is refused whatever it reads, so it cannot be the way round 6b.
+-- These say so, and say it with the function's own message.
+SELECT mvg.try('regress_mvg_maint', '43 a function, in FROM',
+  $$id IN (SELECT r FROM mvg.read_closed() r)$$);
+SELECT mvg.try('regress_mvg_maint', '44 a function, in an expression',
+  $$id IN (SELECT mvg.read_closed())$$);
+
+--
+-- 6c: the owner is asked nothing.  All allowed, including the ones 6b refused.
+--
+SELECT mvg.try('regress_mvg_owner', '45 owner, closed table',
+  $$id IN (SELECT c.id FROM mvg.closed c)$$);
+SELECT mvg.try('regress_mvg_owner', '46 owner, security_invoker view',
+  $$id IN (SELECT v.id FROM mvg.v_invoker v)$$);
+SELECT mvg.try('regress_mvg_owner', '47 owner, a function',
+  $$id IN (SELECT mvg.read_closed())$$);
+SELECT mvg.try('regress_mvg_owner', '48 owner, an aggregate',
+  $$id = (SELECT min(o.id) FROM mvg.open o)$$);
+SELECT mvg.try('regress_mvg_super', '49 superuser, closed table',
+  $$id IN (SELECT c.id FROM mvg.closed c)$$);
+
+--
+-- 6d: row-level security.  The predicate runs as the owner, who is exempt from
+-- the policies on their own table unless they are FORCEd, so a caller who is
+-- subject to them would learn from the refresh about rows the policies exist to
+-- hide.  The test is therefore whether the policies apply to the caller, not
+-- whether any policy exists.
+--
+ALTER TABLE mvg.open ENABLE ROW LEVEL SECURITY;
+CREATE POLICY mine ON mvg.open USING (who = current_user);
+
+-- What the two of them see, so that the refusal below has something to be
+-- about: the maintainer is shown two of the four rows, the owner all four.
+SET ROLE regress_mvg_maint;
+SELECT count(*) AS maint_sees FROM mvg.open;
+SET ROLE regress_mvg_owner;
+SELECT count(*) AS owner_sees FROM mvg.open;
+RESET ROLE;
+
+SELECT mvg.try('regress_mvg_maint',  '50 subject to a policy',
+  $$id IN (SELECT o.id FROM mvg.open o)$$);
+SELECT mvg.try('regress_mvg_bypass', '51 BYPASSRLS',
+  $$id IN (SELECT o.id FROM mvg.open o)$$);
+SELECT mvg.try('regress_mvg_super',  '52 superuser',
+  $$id IN (SELECT o.id FROM mvg.open o)$$);
+SELECT mvg.try('regress_mvg_owner',  '53 the table owner',
+  $$id IN (SELECT o.id FROM mvg.open o)$$);
+
+-- FORCEd, the owner is subject too -- but they are still the matview's owner,
+-- and the caller is still the one the answer would be leaked to.
+ALTER TABLE mvg.open FORCE ROW LEVEL SECURITY;
+SELECT mvg.try('regress_mvg_maint',  '54 FORCE, subject to a policy',
+  $$id IN (SELECT o.id FROM mvg.open o)$$);
+SELECT mvg.try('regress_mvg_owner',  '55 FORCE, the table owner',
+  $$id IN (SELECT o.id FROM mvg.open o)$$);
+ALTER TABLE mvg.open NO FORCE ROW LEVEL SECURITY;
+
+-- Enabled on a table the caller owns, they are exempt from it themselves, so
+-- there is nothing the refresh could tell them that they could not read.
+ALTER TABLE mvg.theirs ENABLE ROW LEVEL SECURITY;
+SELECT mvg.try('regress_mvg_maint',  '56 RLS on a table they own',
+  $$id IN (SELECT t.id FROM mvg.theirs t)$$);
+ALTER TABLE mvg.open DISABLE ROW LEVEL SECURITY;
+ALTER TABLE mvg.theirs DISABLE ROW LEVEL SECURITY;
+
+--
+-- 6e: the matview's own columns.  MAINTAIN is what REFRESH asks for and does
+-- not imply SELECT, so a caller holding only MAINTAIN could otherwise name a
+-- column they cannot read and learn from the row count how many rows match.
+-- The rule is the one DELETE and UPDATE state for the columns their WHERE
+-- clause reads.
+--
+CREATE MATERIALIZED VIEW mvg.mv2 AS SELECT id, gid, who FROM mvg.open;
+CREATE UNIQUE INDEX ON mvg.mv2 (id);
+ALTER MATERIALIZED VIEW mvg.mv2 OWNER TO regress_mvg_owner;
+GRANT MAINTAIN ON mvg.mv2 TO regress_mvg_maint;
+
+CREATE FUNCTION mvg.try2(who text, label text, pred text) RETURNS text
+  LANGUAGE plpgsql AS $$
+DECLARE ctx text;
+BEGIN
+  EXECUTE format('SET LOCAL ROLE %I', who);
+  BEGIN
+    EXECUTE 'REFRESH MATERIALIZED VIEW CONCURRENTLY mvg.mv2 WHERE ' || pred;
+    RESET ROLE;
+    RETURN format('%-32s allowed', label);
+  EXCEPTION WHEN others THEN
+    RESET ROLE;
+    GET STACKED DIAGNOSTICS ctx = PG_EXCEPTION_CONTEXT;
+    RETURN format('%-32s %s: %s', label,
+                  CASE WHEN ctx LIKE '%mvg.mv2 mv%' THEN 'refused when run'
+                       ELSE 'refused' END,
+                  SQLERRM);
+  END;
+END $$;
+
+SELECT mvg.try2('regress_mvg_maint', '57 MAINTAIN, no SELECT',   $$id = 1$$);
+-- A predicate that reads no column asks for nothing extra, as an unqualified
+-- DELETE does not.
+SELECT mvg.try2('regress_mvg_maint', '58 no column read',        $$true$$);
+GRANT SELECT (id) ON mvg.mv2 TO regress_mvg_maint;
+SELECT mvg.try2('regress_mvg_maint', '59 SELECT on that column', $$id = 1$$);
+SELECT mvg.try2('regress_mvg_maint', '60 SELECT on another',     $$who = 'other'$$);
+SELECT mvg.try2('regress_mvg_maint', '61 in a sublink',
+  $$who IN (SELECT o.who FROM mvg.open o)$$);
+SELECT mvg.try2('regress_mvg_maint', '62 a whole-row reference', $$mv2::text <> ''$$);
+SELECT mvg.try2('regress_mvg_owner', '63 the owner, no grants',  $$who = 'other'$$);
+GRANT SELECT ON mvg.mv2 TO regress_mvg_maint;
+SELECT mvg.try2('regress_mvg_maint', '64 table-wide SELECT',     $$who = 'other'$$);
+
+DROP MATERIALIZED VIEW mvg.mv2;
+DROP MATERIALIZED VIEW mvg.mv;
+DROP VIEW mvg.v_invoker;
+DROP VIEW mvg.v_plain;
+DROP FUNCTION mvg.read_closed();
+DROP FUNCTION mvg.try2(text, text, text);
+DROP FUNCTION mvg.try(text, text, text);
+DROP TABLE mvg.theirs;
+DROP TABLE mvg.cols;
+DROP TABLE mvg.closed;
+DROP TABLE mvg.open;
+DROP SCHEMA mvg;
+DROP ROLE regress_mvg_owner;
+DROP ROLE regress_mvg_maint;
+DROP ROLE regress_mvg_bypass;
+DROP ROLE regress_mvg_super;

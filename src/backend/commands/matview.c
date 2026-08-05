@@ -57,6 +57,7 @@
 #include "utils/plancache.h"
 #include "utils/queryenvironment.h"
 #include "utils/rel.h"
+#include "utils/rls.h"
 #include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -81,6 +82,29 @@
  * predicate must be deparsed against.  See deparseRefreshWhereClause().
  */
 #define MATVIEW_ALIAS			"mv"
+
+/*
+ * Why a predicate requires the caller to own the matview.  Recorded as the
+ * walk finds it, so the refusal can say which of the reasons it is rather than
+ * blaming a function when there is no function anywhere in the expression.
+ */
+typedef enum RefreshQualVerdict
+{
+	REFRESH_QUAL_OK = 0,
+	REFRESH_QUAL_OPAQUE,		/* a node that could reach a relation */
+	REFRESH_QUAL_FUNCTION,		/* a function that is not leakproof */
+	REFRESH_QUAL_NO_SELECT,		/* reads a relation the caller cannot */
+	REFRESH_QUAL_RLS,			/* reads rows the caller sees through RLS */
+	REFRESH_QUAL_SECURITY_INVOKER,	/* reads a security_invoker view */
+	REFRESH_QUAL_MATVIEW_COLS,	/* reads matview columns the caller cannot */
+} RefreshQualVerdict;
+
+typedef struct RefreshQualContext
+{
+	Oid			callerId;		/* who issued the REFRESH */
+	RefreshQualVerdict verdict;
+	Oid			relid;			/* the relation that decided it, if any */
+} RefreshQualContext;
 
 typedef struct
 {
@@ -152,7 +176,11 @@ static void InitMatViewCache(void);
 static void InvalidateMatViewCache(Datum arg, Oid relid);
 static void matview_cache_sweep(void);
 static CachedPlanSource *matview_build_source_plansource(Query *sourceQuery);
-static bool refresh_where_clause_is_leakproof(Node *qual);
+static bool refresh_qual_needs_owner_walker(Node *node, void *context);
+static bool refresh_query_reads_unreadable(Query *query,
+										   RefreshQualContext *ctx);
+static void refresh_qual_permission_error(Relation matviewRel,
+										  RefreshQualContext *ctx);
 static bool matview_argtypes_match(MatViewPartialRefreshCache *entry,
 								   ParamListInfo params);
 
@@ -239,9 +267,6 @@ refresh_paramref_hook(ParseState *pstate, ParamRef *pref)
 }
 
 /*
- * Transform the WHERE clause for REFRESH MATERIALIZED VIEW.
- */
-/*
  * check_functions_in_node callback: true if this function is not leakproof.
  */
 
@@ -252,17 +277,153 @@ non_leakproof_checker(Oid func_id, void *context)
 }
 
 /*
- * Does this expression call anything that is not leakproof?
+ * May the caller read this relation, for the columns that are read of it?
  *
- * Only node types that cannot reach a relation are accepted; anything able to
- * read one is treated as non-leakproof whether or not its functions are.
+ * This is the SELECT half of ExecCheckOneRelPerms(), asked about the caller
+ * rather than about whoever is running, and it is deliberately the same rule
+ * down to the corner cases: table-wide SELECT settles it, a query that names
+ * no column needs SELECT on some column, a whole-row reference needs SELECT on
+ * every column, and anything else needs each column it reads.
  */
 
 static bool
-contain_non_leakproof_walker(Node *node, void *context)
+refresh_caller_may_select(Oid relid, RTEPermissionInfo *perminfo, Oid callerId)
 {
+	int			col;
+
+	if (pg_class_aclcheck(relid, callerId, ACL_SELECT) == ACLCHECK_OK)
+		return true;
+
+	/* no perminfo means nothing established the caller may read it */
+	if (perminfo == NULL)
+		return false;
+
+	if (bms_is_empty(perminfo->selectedCols))
+		return pg_attribute_aclcheck_all(relid, callerId, ACL_SELECT,
+										 ACLMASK_ANY) == ACLCHECK_OK;
+
+	col = -1;
+	while ((col = bms_next_member(perminfo->selectedCols, col)) >= 0)
+	{
+		/* bit #s are offset by FirstLowInvalidHeapAttributeNumber */
+		AttrNumber	attno = col + FirstLowInvalidHeapAttributeNumber;
+
+		if (attno == InvalidAttrNumber)
+		{
+			/* whole-row reference, must have the privilege on all columns */
+			if (pg_attribute_aclcheck_all(relid, callerId, ACL_SELECT,
+										  ACLMASK_ALL) != ACLCHECK_OK)
+				return false;
+		}
+		else if (pg_attribute_aclcheck(relid, attno, callerId,
+									   ACL_SELECT) != ACLCHECK_OK)
+			return false;
+	}
+
+	return true;
+}
+
+/*
+ * Does this query level read something the caller could not read itself?
+ *
+ * Reading the same rows is the question, not holding the same privilege, and
+ * the two come apart under row-level security: the predicate runs as the
+ * owner, who is exempt from the policies on their own table unless it is
+ * FORCEd, so a caller who is subject to them would otherwise learn from the
+ * rowcount about rows the policies exist to hide.  A caller with BYPASSRLS, or
+ * who owns the table, is not subject to them and reaches the same rows the
+ * owner does, which is why the test is check_enable_rls() for the caller
+ * rather than the presence of a policy.
+ */
+
+static bool
+refresh_query_reads_unreadable(Query *query, RefreshQualContext *ctx)
+{
+	ListCell   *lc;
+
+	foreach(lc, query->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+		RTEPermissionInfo *perminfo;
+
+		if (rte->rtekind != RTE_RELATION)
+			continue;
+
+		/*
+		 * A security_invoker view is read with the privileges of whoever is
+		 * running, which here is the owner, so SELECT on the view says
+		 * nothing about whether the caller could have read what it selects
+		 * from.  An ordinary view is fine: it is read with its own owner's
+		 * privileges either way.
+		 */
+		if (rte->relkind == RELKIND_VIEW)
+		{
+			Relation	viewrel = relation_open(rte->relid, AccessShareLock);
+			bool		invoker = RelationHasSecurityInvoker(viewrel);
+
+			relation_close(viewrel, AccessShareLock);
+			if (invoker)
+			{
+				ctx->verdict = REFRESH_QUAL_SECURITY_INVOKER;
+				ctx->relid = rte->relid;
+				return true;
+			}
+		}
+
+		perminfo = rte->perminfoindex > 0 ?
+			getRTEPermissionInfo(query->rteperminfos, rte) : NULL;
+
+		if (!refresh_caller_may_select(rte->relid, perminfo, ctx->callerId))
+		{
+			ctx->verdict = REFRESH_QUAL_NO_SELECT;
+			ctx->relid = rte->relid;
+			return true;
+		}
+
+		if (check_enable_rls(rte->relid, ctx->callerId, true) == RLS_ENABLED)
+		{
+			ctx->verdict = REFRESH_QUAL_RLS;
+			ctx->relid = rte->relid;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+/*
+ * Does this predicate require the caller to own the matview?
+ *
+ * The predicate is evaluated with the owner's privileges, so anything it can
+ * reach, it reaches as the owner.  For a function that is the whole difficulty:
+ * a function is opaque, nothing here can see which relations its body reads,
+ * and leakproofness is the only handle there is.  A subquery is not opaque --
+ * it declares exactly what it touches in its range table -- so it is judged on
+ * that instead, and refusing a class we can fully inspect is the part that
+ * would be hard to defend.
+ *
+ * Only node types that cannot reach a relation on their own are accepted;
+ * anything else requires ownership.  That is an allowlist on purpose: the
+ * denylist this replaced let every node type it did not recognise through.
+ */
+
+static bool
+refresh_qual_needs_owner_walker(Node *node, void *context)
+{
+	RefreshQualContext *ctx = (RefreshQualContext *) context;
+
 	if (node == NULL)
 		return false;
+
+	if (IsA(node, Query))
+	{
+		Query	   *query = (Query *) node;
+
+		if (refresh_query_reads_unreadable(query, ctx))
+			return true;
+		return query_tree_walker(query, refresh_qual_needs_owner_walker,
+								 context, 0);
+	}
 
 	switch (nodeTag(node))
 	{
@@ -290,6 +451,34 @@ contain_non_leakproof_walker(Node *node, void *context)
 		case T_List:
 			break;
 
+			/*
+			 * Query structure rather than expressions.  These arrive once the
+			 * walk has descended into a subquery, and none of them reaches a
+			 * relation by itself: the relations a query level reads are its
+			 * range table, which refresh_query_reads_unreadable() has already
+			 * checked by the time any of these is visited.
+			 */
+		case T_TargetEntry:
+		case T_FromExpr:
+		case T_JoinExpr:
+		case T_RangeTblRef:
+		case T_SetOperationStmt:
+		case T_CommonTableExpr:
+		case T_SortGroupClause:
+		case T_CaseWhen:
+			break;
+
+			/*
+			 * A sublink is walked rather than refused.
+			 * expression_tree_walker() visits its testexpr and then its
+			 * subselect, and the Query branch above decides whether the
+			 * caller may read what that names -- which includes every level
+			 * below it, since query_tree_walker() descends into subqueries,
+			 * CTEs and further sublinks.
+			 */
+		case T_SubLink:
+			break;
+
 		case T_FuncExpr:
 		case T_OpExpr:
 		case T_DistinctExpr:
@@ -298,26 +487,86 @@ contain_non_leakproof_walker(Node *node, void *context)
 		case T_CoerceViaIO:
 		case T_ArrayCoerceExpr:
 		case T_RowCompareExpr:
+		case T_Aggref:
+		case T_WindowFunc:
+		case T_GroupingFunc:
 			if (check_functions_in_node(node, non_leakproof_checker, context))
+			{
+				ctx->verdict = REFRESH_QUAL_FUNCTION;
 				return true;
+			}
 			break;
 
 		default:
+			ctx->verdict = REFRESH_QUAL_OPAQUE;
 			return true;
 	}
 
-	return expression_tree_walker(node, contain_non_leakproof_walker, context);
+	return expression_tree_walker(node, refresh_qual_needs_owner_walker,
+								  context);
 }
 
 /*
- * May a caller who is not the matview's owner use this predicate?
+ * Refuse a predicate the caller may not use, saying which of the reasons it is.
  */
 
-static bool
-refresh_where_clause_is_leakproof(Node *qual)
+static void
+refresh_qual_permission_error(Relation matviewRel, RefreshQualContext *ctx)
 {
-	return !contain_non_leakproof_walker(qual, NULL);
+	const char *relname = ctx->relid != InvalidOid ?
+		get_rel_name(ctx->relid) : NULL;
+
+	switch (ctx->verdict)
+	{
+		case REFRESH_QUAL_NO_SELECT:
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("permission denied for table %s", relname),
+					 errdetail("The WHERE clause of REFRESH MATERIALIZED VIEW is evaluated with the privileges of the owner of materialized view \"%s\".",
+							   RelationGetRelationName(matviewRel)),
+					 errhint("Only the owner may use a WHERE clause that reads a relation the caller cannot read.")));
+			break;
+
+		case REFRESH_QUAL_RLS:
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("permission denied for table %s", relname),
+					 errdetail("Row-level security applies to the caller on this table but not to the owner of materialized view \"%s\", with whose privileges the WHERE clause is evaluated.",
+							   RelationGetRelationName(matviewRel)),
+					 errhint("Only the owner may use a WHERE clause that reads a relation whose rows the caller sees through row-level security.")));
+			break;
+
+		case REFRESH_QUAL_SECURITY_INVOKER:
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("permission denied for view %s", relname),
+					 errdetail("The view has the security_invoker option, so it is read with the privileges of the owner of materialized view \"%s\", with whose privileges the WHERE clause is evaluated.",
+							   RelationGetRelationName(matviewRel)),
+					 errhint("Only the owner may use a WHERE clause that reads a security_invoker view.")));
+			break;
+
+		case REFRESH_QUAL_MATVIEW_COLS:
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("permission denied for materialized view %s",
+							RelationGetRelationName(matviewRel)),
+					 errdetail("The WHERE clause reads columns of the materialized view."),
+					 errhint("SELECT privilege is required on any column whose values are read by the WHERE clause.")));
+			break;
+
+		case REFRESH_QUAL_FUNCTION:
+		case REFRESH_QUAL_OPAQUE:
+		case REFRESH_QUAL_OK:
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("permission denied to use a non-leakproof expression in the WHERE clause of REFRESH MATERIALIZED VIEW"),
+					 errdetail("The expression is evaluated with the privileges of the owner of materialized view \"%s\".",
+							   RelationGetRelationName(matviewRel)),
+					 errhint("Only the owner may use a WHERE clause containing an expression that is not leakproof.")));
+			break;
+	}
 }
+
 
 /*
  * Say where a parse-analysis error came from, and why a name may not have
@@ -379,14 +628,41 @@ transformRefreshWhereClause(Oid relid, Node *whereClause, ParamListInfo params,
 
 	assign_expr_collations(pstate, result);
 
-	if (!refresh_where_clause_is_leakproof(result) &&
-		!object_ownercheck(RelationRelationId, relid, callerId))
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("permission denied to use a non-leakproof expression in the WHERE clause of REFRESH MATERIALIZED VIEW"),
-				 errdetail("The expression is evaluated with the privileges of the owner of materialized view \"%s\".",
-						   RelationGetRelationName(rel)),
-				 errhint("Only the owner may use a WHERE clause containing functions that are not leakproof.")));
+	/*
+	 * The owner is asked first: for the owner the predicate runs with the
+	 * privileges it already has, so there is nothing to escalate and nothing
+	 * to walk.
+	 */
+	if (!object_ownercheck(RelationRelationId, relid, callerId))
+	{
+		RefreshQualContext qualctx;
+
+		qualctx.callerId = callerId;
+		qualctx.verdict = REFRESH_QUAL_OK;
+		qualctx.relid = InvalidOid;
+
+		/*
+		 * MAINTAIN is what REFRESH itself asks for, and it does not imply
+		 * SELECT.  A predicate reads the matview's own columns and reports
+		 * through the row count how many rows matched, so it takes the
+		 * privilege reading those columns takes -- the rule DELETE and UPDATE
+		 * already state for the columns their WHERE clause reads.
+		 *
+		 * As there, a predicate that reads no column asks for nothing extra:
+		 * transformExpr() has marked exactly the columns the predicate reads,
+		 * and if there are none the statement is no more a read of the
+		 * matview than an unqualified DELETE is.
+		 */
+		if (!bms_is_empty(nsitem->p_perminfo->selectedCols) &&
+			!refresh_caller_may_select(relid, nsitem->p_perminfo, callerId))
+		{
+			qualctx.verdict = REFRESH_QUAL_MATVIEW_COLS;
+			refresh_qual_permission_error(rel, &qualctx);
+		}
+
+		if (refresh_qual_needs_owner_walker(result, &qualctx))
+			refresh_qual_permission_error(rel, &qualctx);
+	}
 
 	if (contain_volatile_functions(result))
 		ereport(ERROR,
