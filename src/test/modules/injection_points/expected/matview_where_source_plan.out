@@ -1,48 +1,40 @@
 --
--- REFRESH MATERIALIZED VIEW ... WHERE ... : is the source plan reused?
+-- REFRESH MATERIALIZED VIEW ... WHERE ...: is the source plan reused?
 --
 -- Rewriting and planning the source query on every refresh cost about a sixth
 -- of a warm scope-1 refresh, almost all of it the planning.  The plan is
--- therefore cached, and this is the gate on whether that cache does what it
--- claims.
+-- cached for that reason, and this is the gate on whether the cache does what
+-- it claims.
 --
--- It cannot be a timing test.  The effect is a few microseconds on a ~60 us
--- cell and this protocol's noise floor is not established, so a benchmark
--- would answer "probably" -- and a cache that silently re-plans every call is
--- indistinguishable from one that works, at that resolution, in exactly the
--- direction that would let a broken implementation ship.
+-- It cannot be a timing test.  The effect is a few microseconds on a cell of
+-- about 60, which a benchmark cannot resolve, and a cache that silently
+-- re-plans every call would look the same as one that works.
 --
 -- Nor can it hook "we reused the cache entry", which is what the obvious
 -- injection point would observe.  That is true even when GetCachedPlan()
 -- re-plans underneath it, so it would be green against the bug it exists to
 -- catch.
 --
--- What it watches instead is plansource->gplan changing, which is a new
+-- What it watches instead is plansource->gplan changing, which means a new
 -- generic plan, plus num_custom_plans, which is a genuine build counter.  Not
--- num_generic_plans: that one is incremented in the `else` arm of
--- GetCachedPlan's custom-or-not branch, so it counts every call that *returns*
--- a generic plan, reused or built.  A probe reading it can never go green --
--- the mirror image of a test that cannot fail -- and the first version of this
--- file did exactly that.
+-- num_generic_plans.  That one is incremented in the else arm of
+-- GetCachedPlan's custom-or-not branch, so it counts every call that returns a
+-- generic plan whether or not one was built, and a probe reading it can never
+-- go green.  The first version of this file did exactly that.
 --
--- Verified as a detector rather than assumed: against a build where the
+-- Checked as a detector rather than assumed.  Against a build where the
 -- plansource is created and dropped on every refresh, every refresh below
 -- reports "notice triggered for injection point matview-where-source-planned"
 -- and this file is red.
 --
--- The probe is attached only after a warm-up, and that is a deliberate change
--- from the first version of this file.  A partial refresh now replaces the
--- predicate's constants with parameters before deparsing it, so `params` is
+-- The probe is attached only after a warm-up.  A partial refresh replaces the
+-- predicate's constants with parameters before deparsing it, so params is
 -- never NULL here and choose_custom_plan() no longer short-circuits: plancache
 -- builds five custom plans and one generic before it compares them and
 -- settles.  Those builds are real and the probe correctly reports them.  So
--- "the plan is reused" is an assertion about the steady state, and the way to
--- assert it without also asserting the number 5 in choose_custom_plan() is to
--- let the comparison finish unwatched and then demand silence.
---
--- Disposition: keep.  "The source plan is reused, and a base-table change
--- invalidates it" is the contract of the cache, not of its current shape, and
--- it holds however the plan comes to be stored.
+-- "the plan is reused" is a claim about the steady state, and asserting it
+-- without also asserting the number 5 in choose_custom_plan() means letting
+-- the comparison finish unwatched and then demanding silence.
 --
 CREATE EXTENSION injection_points;
 -- debug_discard_caches calls InvalidateSystemCachesExtended() at every

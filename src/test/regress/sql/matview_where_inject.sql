@@ -1,31 +1,22 @@
 --
--- REFRESH MATERIALIZED VIEW ... WHERE ... : SQL injection
+-- REFRESH MATERIALIZED VIEW ... WHERE ...: SQL injection
 --
 -- A partial refresh builds SQL text and runs it.  Everything interpolated into
--- that text is attacker-influenced in the sense that matters: object names are
--- chosen by whoever created the matview, and the predicate is chosen by whoever
--- issues the REFRESH.  Neither is a string the server may take on trust, and
--- each reaches the statement by a different route -- identifiers through
--- quote_identifier(), the predicate through a deparse of its parse tree.
+-- that text comes from somewhere the server may not take on trust.  Object
+-- names are chosen by whoever created the matview, and the predicate by
+-- whoever issues the REFRESH.  The two reach the statement by different
+-- routes, identifiers through quote_identifier() and the predicate through a
+-- deparse of its parse tree.
 --
--- There is one generator: refresh_by_direct_modification() builds a locking
--- SELECT and a fused upsert/prune around a source tuplestore.  The view body
--- does not appear in either, because the source rows come from the matview's
--- own Query tree rather than from pg_get_viewdef().  Each case runs twice, for
--- the reason given at refresh_twice() below.
+-- There is one generator.  refresh_by_direct_modification() builds a locking
+-- SELECT and a fused upsert and prune around a source tuplestore.  The view
+-- body appears in neither, because the source rows come from the matview's own
+-- Query tree rather than from pg_get_viewdef().  Each case runs twice, for the
+-- reason given at refresh_twice() below.
 --
--- Nothing here should be able to fail.  That is the point: these are the tests
--- that stay green while the generated SQL is removed, and each one names the
--- escape it would take if a quoting call were dropped or a new string were
--- concatenated in without one.  A refresh that generates no SQL at all cannot
--- fail them, which is the argument for the rewrite stated as a test rather
--- than as a claim.
---
--- Disposition: keep.  The cases outlive the implementation they were written
--- against -- an identifier-quoting regression is exactly what a later refactor
--- reintroduces.
---
--- Found here, not on the -hackers thread.
+-- Nothing here should be able to fail.  Each case names the escape it would
+-- take if a quoting call were dropped or a new string were concatenated in
+-- without one, which is what a later refactor is most likely to reintroduce.
 
 CREATE SCHEMA mvinj;
 SET search_path = mvinj, public;
@@ -204,7 +195,7 @@ SELECT * FROM refresh_twice(
 -- The generator invents five names: the CTEs upsert and pruned, the ephemeral
 -- named relation new_data, and the aliases mv and nd.  Each is a perfectly
 -- legal table name, and a user who has one in the search path must be
--- unaffected -- each statement's own names have to win inside it and lose
+-- unaffected.  Each statement's own names have to win inside it and lose
 -- outside it.  The remaining two, _mv_q and newdata, belong to the full
 -- concurrent refresh's diff/merge and are shadowed here as well, since a
 -- partial refresh must not reach them either.
