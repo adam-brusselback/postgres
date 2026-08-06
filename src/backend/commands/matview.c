@@ -104,7 +104,7 @@ typedef struct MatViewPartialRefreshCache
 {
 	Oid			matviewOid;		/* hash key */
 
-	/* what these plans were built for; all of it must match to reuse them */
+	/* what these plans were built for, and all must match to reuse them */
 	Oid			uniqueIndexOid; /* the index the upsert arbitrates on */
 	Node	   *qual;			/* the predicate, compared with equal() */
 	int			nargs;			/* number of external parameters */
@@ -189,9 +189,9 @@ SetMatViewPopulatedState(Relation relation, bool newstate)
 
 	/*
 	 * Nothing to do if the state already matches.  A partial refresh always
-	 * passes true on an already populated matview, so without this it would
-	 * send the invalidation described below on every call, discarding this
-	 * backend's own cached refresh plans each time.
+	 * passes true on an already populated matview.  Without this it would send
+	 * the invalidation below on every call, discarding this backend's own
+	 * cached refresh plans each time.
 	 */
 	if (relation->rd_rel->relispopulated == newstate)
 		return;
@@ -227,8 +227,8 @@ SetMatViewPopulatedState(Relation relation, bool newstate)
  *
  * REFRESH takes no parameters of its own, so a caller who wants to bind one
  * issues the command through EXECUTE ... USING or SPI.  Those pass their
- * ParamListInfo down to us, and parse analysis of the WHERE clause needs this
- * hook to find the type of each $n in it; without it "WHERE id = $1" cannot be
+ * ParamListInfo down to us.  Parse analysis of the WHERE clause needs this
+ * hook to find the type of each $n.  Without it "WHERE id = $1" cannot be
  * analyzed at all.
  */
 
@@ -262,9 +262,9 @@ refresh_paramref_hook(ParseState *pstate, ParamRef *pref)
  * leakproof.
  *
  * We save the OID of the first one we find, so the error can name it.  Few
- * functions are marked leakproof, and the one that stops a given expression is
- * often not the one the caller would guess, so a refusal that does not name it
- * leaves them nothing to act on.
+ * functions are marked leakproof, and the one that stops a given expression
+ * is often not the one the caller would guess.  A refusal that does not name
+ * it leaves the caller nothing to act on.
  */
 
 static bool
@@ -285,9 +285,9 @@ non_leakproof_checker(Oid func_id, void *context)
  * relid is whatever the predicate named: the matview itself, or a relation a
  * subquery in the predicate reads.  This is the SELECT half of
  * ExecCheckOneRelPerms() asked about the caller rather than about whoever is
- * running, and we follow it down to the corner cases: table-wide SELECT
- * settles it, a query naming no column needs SELECT on some column, a
- * whole-row reference needs it on every column, and anything else needs it on
+ * running, and we follow it down to the corner cases.  Table-wide SELECT
+ * settles it.  A query naming no column needs SELECT on some column.  A
+ * whole-row reference needs it on every column.  Anything else needs it on
  * each column read.
  */
 
@@ -353,7 +353,7 @@ refresh_query_reads_unreadable(Query *query, RefreshQualContext *ctx)
 
 		/*
 		 * A security_invoker view is read with the privileges of whoever is
-		 * running, which here is the owner, so SELECT on the view says
+		 * running, which here is the owner.  So SELECT on the view says
 		 * nothing about whether the caller could have read what it selects
 		 * from.  An ordinary view is fine, since it is read with its own
 		 * owner's privileges either way.
@@ -687,11 +687,13 @@ transformRefreshWhereClause(Oid relid, Node *whereClause, ParamListInfo params,
 }
 
 /*
- * Names the SQL that refresh_by_direct_modification() generates gives to the
- * two relations it reads.  MATVIEW_ALIAS is also what we must deparse the
- * predicate against, so that the deparse and the statements agree; both halves
- * of the fused statement read MATVIEW_SOURCE_ENR_NAME, and both get the same
- * tuplestore, so they cannot disagree about which rows the view produces.
+ * Names that the SQL from refresh_by_direct_modification() gives to the two
+ * relations it reads.
+ *
+ * MATVIEW_ALIAS is also what we deparse the predicate against, so the deparse
+ * and the statements agree.  Both halves of the fused statement read
+ * MATVIEW_SOURCE_ENR_NAME and both get the same tuplestore, so they cannot
+ * disagree about which rows the view produces.
  */
 #define MATVIEW_SOURCE_ENR_NAME	"new_data"
 #define MATVIEW_ALIAS			"mv"
@@ -702,9 +704,9 @@ transformRefreshWhereClause(Oid relid, Node *whereClause, ParamListInfo params,
  * We must name the matview the way those statements do, which is
  * MATVIEW_ALIAS.  pg_get_expr() would use the matview's own name instead, and
  * that only works while the predicate is simple enough that ruleutils never
- * qualifies anything.  Once a second relation is in scope, which any subquery
- * does, it qualifies the matview's Vars with a name the statement never
- * defines and the refresh fails with "missing FROM-clause entry".
+ * qualifies anything.  Once a second relation is in scope, and any subquery
+ * puts one there, it qualifies the matview's Vars with a name the statement
+ * never defines.  The refresh then fails with "missing FROM-clause entry".
  */
 
 static char *
@@ -784,9 +786,9 @@ paramize_refresh_consts_mutator(Node *node, void *context)
  * Replace the constants in an analyzed WHERE clause with parameters, extending
  * *params with their values.
  *
- * The plan cache is keyed on the predicate, so without this a caller who
- * varies a literal from call to call misses the cache every time and pays for
- * parse analysis and planning on each refresh.
+ * The plan cache is keyed on the predicate.  Without this, a caller who
+ * varies a literal from call to call misses the cache every time.  Each
+ * refresh then pays for parse analysis and planning.
  */
 static Node *
 parameterizeRefreshWhereClause(Node *qual, ParamListInfo *params)
@@ -942,7 +944,7 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
  *
  * 2. Full concurrent refresh (CONCURRENTLY).  Computes the new contents into a
  * temporary table, diffs that against the matview and applies the difference,
- * under ExclusiveLock.  Readers are not blocked; writers are.
+ * under ExclusiveLock.  Readers are not blocked, but writers are.
  *
  * 3. Partial refresh (CONCURRENTLY with a WHERE clause).  Modifies in place
  * only the rows the clause selects, under RowExclusiveLock.  See
@@ -1112,8 +1114,8 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 
 		/*
 		 * A partial refresh applies its changes with ON CONFLICT against one
-		 * arbiter index, a row at a time, and each row must satisfy every
-		 * unique index as we write it.  Two rows exchanging their values on a
+		 * arbiter index, a row at a time.  Each row must satisfy every unique
+		 * index as we write it.  Two rows exchanging their values on a
 		 * second unique index would need one deleted before the other is
 		 * inserted, which ON CONFLICT cannot do.  No choice of arbiter helps,
 		 * since whichever index arbitrates, the exchange collides on the
@@ -1160,8 +1162,8 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	 * A predicate selects direct modification, which is the only algorithm
 	 * that can apply a change without rewriting rows the predicate does not
 	 * name.  We measured diff/merge against it across scopes from a small
-	 * fraction of the matview up to nearly all of it, and it was slower at
-	 * every point, with the margin widening as the scope grew.
+	 * fraction of the matview up to nearly all of it.  It was slower at every
+	 * point, and the margin widened as the scope grew.
 	 *
 	 * (WITH NO DATA is rejected together with a WHERE clause long before
 	 * here, so !skipData is belt and braces.)
@@ -1476,7 +1478,7 @@ matview_argtypes_match(MatViewPartialRefreshCache *entry, ParamListInfo params)
  * Relcache callback.  Marks every cached entry stale.
  *
  * We only set a flag here.  A callback runs at points where an enclosing
- * refresh may be executing a plan out of one of these entries, so freeing now
+ * refresh may be executing a plan out of one of these entries.  Freeing now
  * would pull the ground out from under it.  matview_cache_sweep() does the
  * freeing at a point where that cannot be true.  plancache.c and ri_triggers.c
  * both work this way.
@@ -1724,9 +1726,9 @@ matview_materialize_source(CachedPlanSource *plansource, ParamListInfo params,
 /*
  * refresh_by_direct_modification
  *
- * Refresh the rows of a materialized view that a WHERE clause selects, leaving
- * the rest alone, while allowing concurrent reads and concurrent refreshes of
- * scopes that do not overlap.
+ * Refresh the rows of a materialized view that a WHERE clause selects,
+ * leaving the rest alone.  Readers are never blocked, and refreshes over
+ * scopes that do not overlap run concurrently.
  *
  * We hold RowExclusiveLock on the matview, so we serialize against another
  * partial refresh only where the two touch the same rows.  The work is four
@@ -1846,15 +1848,15 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 	 * parameter the predicate never names.
 	 *
 	 * The plans must also still be valid, and that is not belt and braces.  A
-	 * qual tree names a function or operator by OID, so renaming one leaves the
-	 * tree equal() to the cached one while the statements built from it still
+	 * qual tree names a function or operator by OID.  Renaming one leaves the
+	 * tree equal() to the cached one, while the statements built from it still
 	 * spell the old name.  plancache invalidates those statements and
 	 * re-analyzes their text, binding the old name to whatever holds it now, a
 	 * different object or none at all.  The tree would then drive the source
 	 * while the stale text drives the pre-lock and the prune, over different
-	 * rows.  So we ask plancache whether its plan is still good and rebuild
-	 * from a fresh deparse when it is not, which is what
-	 * ri_FetchPreparedPlan() does and for the same reason.
+	 * rows.  So we ask plancache whether its plan is still good, and rebuild
+	 * from a fresh deparse when it is not.  ri_FetchPreparedPlan() does the
+	 * same thing for the same reason.
 	 */
 	if (found &&
 		cacheEntry->uniqueIndexOid == uniqueIndexOid &&
@@ -1929,10 +1931,10 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 			 * we fill the tuplestore after the pre-lock below.  We cannot
 			 * supply the true count and cannot correct this later.  Parse
 			 * analysis copies the value into the range table entry, so
-			 * SPI_prepare captures it and it travels inside the cached plan,
-			 * which then serves refreshes whose scopes differ by orders of
-			 * magnitude.  The matview's own row count is the right order of
-			 * magnitude and errs high, which is the safe direction, since an
+			 * SPI_prepare captures it and it travels inside the cached plan.
+			 * That plan then serves refreshes whose scopes differ by orders
+			 * of magnitude.  The matview's own row count is the right order
+			 * of magnitude and errs high, which is the safe direction.  An
 			 * overestimate biases the prune's anti-join towards a hash join.
 			 */
 			enr->md.enrtuples = Max(matviewRel->rd_rel->reltuples, 0);
@@ -2101,8 +2103,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 			 * and has no ctid to tell two equal rows apart.  Which rows
 			 * conflict is the index's question, not GROUP BY's.  For an
 			 * ordinary unique index a NULL key never conflicts, so those rows
-			 * are filtered out first, and for NULLS NOT DISTINCT they do,
-			 * which is what grouping already does.
+			 * are filtered out first.  For NULLS NOT DISTINCT they do
+			 * conflict, which is what grouping already does.
 			 */
 			appendStringInfo(&buf,
 							 "SELECT CAST(ROW(%s) AS pg_catalog.text) FROM "
@@ -2240,8 +2242,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 			 * unconditionally, on the stated grounds that only the owner can
 			 * run REFRESH, which has not been true since MAINTAIN was added.
 			 * A partial refresh is the path a MAINTAIN-only caller is most
-			 * likely to be on, and the key comes out of a matview they may
-			 * hold no privilege to read.
+			 * likely to be on.  The key comes out of a matview they may hold
+			 * no privilege to read.
 			 */
 			if (matview_execute_spi_plan(cacheEntry->dupPlan, NULL,
 										 snapshot, true) < 0)
