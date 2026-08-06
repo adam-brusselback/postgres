@@ -66,9 +66,9 @@
 
 /*
  * Why we refused a caller's predicate.  We record this as the check that
- * rejected it runs, so the error can name the actual reason: some of these
- * are missing SELECT privilege, others admit no fix short of owning the
- * matview.
+ * rejected it runs, so the error can name the actual reason.  Some of these
+ * are a missing SELECT privilege, and others admit no fix short of owning
+ * the matview.
  */
 typedef enum RefreshQualVerdict
 {
@@ -256,7 +256,8 @@ refresh_paramref_hook(ParseState *pstate, ParamRef *pref)
 }
 
 /*
- * check_functions_in_node callback: true if this function is not leakproof.
+ * check_functions_in_node() callback.  Returns true if this function is not
+ * leakproof.
  *
  * We save the OID of the first one we find, so the error can name it.  Few
  * functions are marked leakproof, and the one that stops a given expression is
@@ -326,13 +327,13 @@ refresh_caller_may_select(Oid relid, RTEPermissionInfo *perminfo, Oid callerId)
 }
 
 /*
- * Does this query level read something the caller could not read itself?
+ * Check the relations a query level of the predicate reads against the caller.
  *
  * We ask whether the caller could reach the same rows, not whether they hold
- * the same privilege, because row-level security separates the two.  Hence
- * check_enable_rls() for the caller rather than a test for the presence of a
- * policy: a caller with BYPASSRLS, or who owns the table, reaches the same rows
- * the owner does.
+ * the same privilege, because row-level security separates the two.  So we ask
+ * check_enable_rls() about the caller rather than test for the presence of a
+ * policy.  A caller who holds BYPASSRLS, or who owns the relation the subquery
+ * names, reaches the same rows the owner does.
  */
 
 static bool
@@ -352,8 +353,8 @@ refresh_query_reads_unreadable(Query *query, RefreshQualContext *ctx)
 		 * A security_invoker view is read with the privileges of whoever is
 		 * running, which here is the owner, so SELECT on the view says
 		 * nothing about whether the caller could have read what it selects
-		 * from.  An ordinary view is fine: it is read with its own owner's
-		 * privileges either way.
+		 * from.  An ordinary view is fine, since it is read with its own
+		 * owner's privileges either way.
 		 */
 		if (rte->relkind == RELKIND_VIEW)
 		{
@@ -398,8 +399,8 @@ refresh_query_reads_unreadable(Query *query, RefreshQualContext *ctx)
  * range table, so we check those relations against the caller.  A function does
  * not, so leakproofness is the only handle we have on it.
  *
- * The node types we accept are an allowlist, not a denylist: anything we do not
- * recognize might reach a relation, so we refuse it.
+ * The node types we accept are an allowlist, not a denylist.  Anything we do
+ * not recognize might reach a relation, so we refuse it.
  */
 
 static bool
@@ -449,7 +450,7 @@ refresh_qual_needs_owner_walker(Node *node, void *context)
 			/*
 			 * Query structure rather than expressions.  These arrive once the
 			 * walk has descended into a subquery, and none of them reaches a
-			 * relation by itself: the relations a query level reads are its
+			 * relation by itself.  The relations a query level reads are its
 			 * range table, which refresh_query_reads_unreadable() has already
 			 * checked by the time any of these is visited.
 			 */
@@ -592,7 +593,8 @@ refresh_where_clause_error_callback(void *arg)
 	if (sqlerrcode == ERRCODE_UNDEFINED_TABLE ||
 		sqlerrcode == ERRCODE_UNDEFINED_FUNCTION ||
 		sqlerrcode == ERRCODE_UNDEFINED_OBJECT)
-		errhint("The condition is analyzed with search_path set to \"pg_catalog, pg_temp\", so it must schema-qualify the objects it names.");
+		errhint("The condition is analyzed with search_path set to \"%s\", so it must schema-qualify the objects it names.",
+				GetConfigOption("search_path", false, false));
 }
 
 /*
@@ -617,8 +619,8 @@ transformRefreshWhereClause(Oid relid, Node *whereClause, ParamListInfo params,
 	addNSItemToQuery(pstate, nsitem, false, true, true);
 
 	/*
-	 * Only around the analysis: the rejections below say plainly what is
-	 * wrong with the expression and need nothing added.
+	 * The callback covers the analysis and nothing after it.  The rejections
+	 * below already say what is wrong with the expression.
 	 */
 	errcallback.callback = refresh_where_clause_error_callback;
 	errcallback.arg = NULL;
@@ -633,8 +635,8 @@ transformRefreshWhereClause(Oid relid, Node *whereClause, ParamListInfo params,
 	assign_expr_collations(pstate, result);
 
 	/*
-	 * Nothing to check for the owner.  The predicate runs with the owner's
-	 * privileges, which for them is no more than they already have.
+	 * The predicate runs with the owner's privileges, so the owner needs no
+	 * check.
 	 */
 	if (!object_ownercheck(RelationRelationId, relid, callerId))
 	{
@@ -646,16 +648,14 @@ transformRefreshWhereClause(Oid relid, Node *whereClause, ParamListInfo params,
 		qualctx.funcid = InvalidOid;
 
 		/*
-		 * REFRESH asks for MAINTAIN, which does not imply SELECT.  A predicate
-		 * reads the matview's own columns and reports through the row count how
-		 * many rows matched, so we require what reading those columns requires.
-		 * That is the rule DELETE and UPDATE already apply to the columns their
-		 * WHERE clause reads.
+		 * DELETE and UPDATE require SELECT on the columns their WHERE clause
+		 * reads, and we follow them.  MAINTAIN does not imply SELECT, and a
+		 * predicate reads the matview's own columns and reports through the
+		 * row count how many matched.
 		 *
-		 * As there, a predicate that reads no column asks for nothing extra.
-		 * transformExpr() has marked exactly the columns the predicate reads,
-		 * and if there are none the statement is no more a read of the matview
-		 * than an unqualified DELETE is.
+		 * A predicate that reads no column asks for nothing extra, as with an
+		 * unqualified DELETE.  transformExpr() has marked exactly the columns
+		 * the predicate reads.
 		 */
 		if (!bms_is_empty(nsitem->p_perminfo->selectedCols) &&
 			!refresh_caller_may_select(relid, nsitem->p_perminfo, callerId))
@@ -885,7 +885,7 @@ matview_execute_spi_plan(SPIPlanPtr plan, ParamListInfo params,
 /*
  * ExecRefreshMatView -- execute a REFRESH MATERIALIZED VIEW command
  *
- * This is the entry point for REFRESH MATERIALIZED VIEW.  Four spellings reach
+ * This is the entry point for REFRESH MATERIALIZED VIEW.  Four forms reach
  * it:
  *
  * - no options: full rebuild via heap swap.
@@ -905,10 +905,8 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
 	LOCKMODE	lockmode;
 
 	/*
-	 * Determine strength of lock needed.  A partial refresh takes only
-	 * RowExclusiveLock, because it modifies rows in place and relies on the row
-	 * locks it takes over its own scope to serialize against another one.  Two
-	 * refreshes over scopes that do not overlap therefore run in parallel.
+	 * Determine strength of lock needed.  A partial refresh modifies rows in
+	 * place and serializes on its own row locks.  RowExclusiveLock is enough.
 	 */
 	if (stmt->whereClause)
 		lockmode = RowExclusiveLock;
@@ -1061,7 +1059,7 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 
 	/*
 	 * The grammar rejects a predicate without CONCURRENTLY, and the checks
-	 * below rely on it: the unique-index count that a partial refresh needs is
+	 * below rely on that.  The unique-index count a partial refresh needs is
 	 * only taken under "concurrent".
 	 */
 	Assert(!qual || concurrent);
@@ -1070,8 +1068,8 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	 * Check that there is a unique index with no WHERE clause on one or more
 	 * columns of the materialized view if CONCURRENTLY is specified.
 	 *
-	 * Count them too: a partial refresh requires there to be exactly one, for
-	 * the reason given at the check below.
+	 * Count them too, since a partial refresh requires there to be exactly
+	 * one.  The reason is given at the check below.
 	 */
 	if (concurrent)
 	{
@@ -1115,8 +1113,8 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 		 * arbiter index, a row at a time, and each row must satisfy every
 		 * unique index as we write it.  Two rows exchanging their values on a
 		 * second unique index would need one deleted before the other is
-		 * inserted, which ON CONFLICT cannot do, and no choice of arbiter
-		 * helps: whichever index arbitrates, the exchange collides on the
+		 * inserted, which ON CONFLICT cannot do.  No choice of arbiter helps,
+		 * since whichever index arbitrates, the exchange collides on the
 		 * other.  A full refresh is unaffected, since it rewrites the whole
 		 * matview and never reconciles a new row against one it is not
 		 * replacing.
@@ -1473,13 +1471,13 @@ matview_argtypes_match(MatViewPartialRefreshCache *entry, ParamListInfo params)
 }
 
 /*
- * Relcache callback: mark every cached entry stale.
+ * Relcache callback.  Marks every cached entry stale.
  *
  * We only set a flag here.  A callback runs at points where an enclosing
  * refresh may be executing a plan out of one of these entries, so freeing now
- * would pull the ground out from under it; matview_cache_sweep() does the
- * freeing at a point where that cannot be true.  This is the rule plancache.c
- * and ri_triggers.c both follow.
+ * would pull the ground out from under it.  matview_cache_sweep() does the
+ * freeing at a point where that cannot be true.  plancache.c and ri_triggers.c
+ * both work this way.
  *
  * We ignore relid and mark everything, since an entry's plans can name any
  * relation the view definition reaches, not just the matview itself.
@@ -1559,9 +1557,10 @@ InitMatViewCache(void)
 }
 
 /*
- * Build the query that produces a partial refresh's source rows: the matview's
- * own defining query, wrapped in a subquery so the predicate filters its
- * output, ordered by the arbiter key.
+ * Build the query that produces a partial refresh's source rows.
+ *
+ * The matview's own defining query goes in a subquery, so the predicate
+ * filters its output.  The result is ordered by the arbiter key.
  */
 
 static Query *
@@ -1625,12 +1624,11 @@ matview_build_source_query(Relation matviewRel, Query *dataQuery, Node *qual,
  * Wrap the source query in a CachedPlanSource, so that plancache revalidates it
  * and it survives across refreshes.
  *
- * queryString is the REFRESH statement the caller issued.  We have no SQL text
- * for the source query itself, since we build it as a Query tree, and
- * CreateCachedPlan() requires a string: it keeps it as the plansource's
- * identifier and prints it in error contexts.  The statement that asked for the
- * work is the honest answer there, and it is what refresh_matview_datafill()
- * already hands the planner on the full-refresh path.
+ * CreateCachedPlan() requires a query string, which it keeps as the
+ * plansource's identifier and prints in error contexts.  We build the source
+ * query as a Query tree and have no text of our own for it, so we pass the
+ * REFRESH statement the caller issued.  refresh_matview_datafill() hands the
+ * planner the same thing on the full-refresh path.
  */
 
 static CachedPlanSource *
@@ -1738,9 +1736,9 @@ matview_materialize_source(CachedPlanSource *plansource, ParamListInfo params,
  *    than deadlock.  We hold these locks until the transaction ends.
  *
  * 2. Take the snapshot the rest of the work runs under.  We do this after the
- *    lock rather than before it: a refresh that queued behind another must not
- *    evaluate its source from before that one committed, or it would write
- *    stale values back over it.
+ *    lock rather than before it.  A refresh that queued behind another must
+ *    not evaluate its source from before that one committed, or it would
+ *    write stale values back over it.
  *
  * 3. Evaluate the matview's defining query under the predicate, collecting the
  *    rows into a tuplestore that we register as an ephemeral named relation.
@@ -1840,7 +1838,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 	}
 
 	/*
-	 * Same predicate means an equal() tree: the plans were built by deparsing
+	 * Same predicate means an equal() tree.  The plans were built by deparsing
 	 * this tree, so two trees that compare equal deparse to the same
 	 * statement.  argtypes is still checked, since a caller may bind a
 	 * parameter the predicate never names.
@@ -1927,7 +1925,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 			/*
 			 * A row estimate for new_data, which is empty at this point, since
 			 * we fill the tuplestore after the pre-lock below.  We cannot
-			 * supply the true count and cannot correct this later: parse
+			 * supply the true count and cannot correct this later.  Parse
 			 * analysis copies the value into the range table entry, so
 			 * SPI_prepare captures it and it travels inside the cached plan,
 			 * which then serves refreshes whose scopes differ by orders of
@@ -2092,14 +2090,14 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 			/*
 			 * We apply the source rows one at a time against the arbiter
 			 * index, so we cannot represent two source rows sharing a key
-			 * value: the second would silently overwrite the first and leave
+			 * value.  The second would silently overwrite the first and leave
 			 * the matview with fewer rows than the query produces.
 			 * refresh_by_match_merge() has its own version of this check for
 			 * the same reason, and a partial refresh never reaches it.
 			 *
 			 * We group rather than self-join, since the source is a tuplestore
 			 * and has no ctid to tell two equal rows apart.  Which rows
-			 * conflict is the index's question, not GROUP BY's: for an
+			 * conflict is the index's question, not GROUP BY's.  For an
 			 * ordinary unique index a NULL key never conflicts, so those rows
 			 * are filtered out first, and for NULLS NOT DISTINCT they do,
 			 * which is what grouping already does.
@@ -2197,7 +2195,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 		/*
 		 * We lock the matview rows in scope before evaluating the source, and
 		 * take the snapshot the source runs under only afterwards.  The order
-		 * matters: a refresh that queued behind another must not evaluate its
+		 * matters.  A refresh that queued behind another must not evaluate its
 		 * source from before that one committed, or it writes stale values
 		 * back over it.
 		 */

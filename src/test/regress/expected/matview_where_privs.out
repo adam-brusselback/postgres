@@ -173,7 +173,7 @@ DROP TABLE matview_mw_base;
 -- arguments; it says nothing about which RELATIONS an expression may read.  A
 -- sublink reads relations as the matview owner, so a caller holding only
 -- MAINTAIN could read anything the owner could, and then learn the value by
--- observing which row the refresh touched.  Every sublink spelling reached it,
+-- observing which row the refresh touched.  Every sublink form reached it,
 -- and so did a cast to a domain whose CHECK constraint calls a non-leakproof
 -- function, because that function never appears in the expression tree.
 --

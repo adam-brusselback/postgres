@@ -72,7 +72,7 @@ SELECT * FROM mv_test_a ORDER BY id;
 --
 -- Test 3: a later refresh of the same rows picks up the newer values
 --
--- The pair used to be the two spellings, before a WHERE clause required
+-- The pair used to be the two forms, before a WHERE clause required
 -- CONCURRENTLY.  Kept as a second round rather than deleted: it is the only
 -- case that refreshes a scope twice from one session with different data both
 -- times, which is what a cached plan serving a stale answer would break.
@@ -1181,12 +1181,12 @@ DROP TABLE mv_sq_dim;
 --
 -- Test 19: the shapes a subquery predicate can take
 --
--- Test 18 covers a few spellings in detail.  This covers the space: every way a
+-- Test 18 covers a few forms in detail.  This covers the space: every way a
 -- subquery can be attached to the predicate, and every name in the generated
 -- SQL that a subquery could collide with.
 --
 -- The property checked is the same for all of them and does not depend on the
--- spelling.  The predicate names a set of rows; evaluate it directly to learn
+-- form.  The predicate names a set of rows; evaluate it directly to learn
 -- which.  Then make EVERY row stale, refresh partially, and require that the
 -- rows in that set match a full refresh while the rows outside it did not move
 -- at all, with the same value and the same ctid.  A predicate that silently widened would
