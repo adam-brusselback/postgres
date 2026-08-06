@@ -889,17 +889,9 @@ matview_execute_spi_plan(SPIPlanPtr plan, ParamListInfo params,
 /*
  * ExecRefreshMatView -- execute a REFRESH MATERIALIZED VIEW command
  *
- * This is the entry point for REFRESH MATERIALIZED VIEW.  Four forms reach
- * it:
- *
- * - no options: full rebuild via heap swap.
- * - CONCURRENTLY: full refresh, computed into a temporary table and applied as
- *   a diff, so that readers are not blocked.
- * - CONCURRENTLY with a WHERE clause: partial refresh, which modifies in place
- *   only the rows the clause selects.  The grammar requires CONCURRENTLY here.
- * - WITH NO DATA: effectively like a TRUNCATE.
- *
- * The statement node's skipData field shows whether WITH NO DATA was used.
+ * Takes the lock the statement needs and hands off to RefreshMatViewByOid(),
+ * which chooses the refresh strategy.  The statement node's skipData field
+ * shows whether WITH NO DATA was used.
  */
 ObjectAddress
 ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
@@ -935,20 +927,21 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
 /*
  * RefreshMatViewByOid -- refresh materialized view by OID
  *
- * This refreshes a materialized view using one of three strategies:
+ * This refreshes a materialized view using one of three strategies, numbered
+ * below as the code tests for them:
  *
- * 1. Full rebuild (no options).  Creates a new heap, populates it, and swaps
- * relfilenumbers under AccessExclusiveLock.  The OID of the original
- * materialized view is preserved, so we do not lose GRANT nor references to
- * this materialized view.
+ * 1. Partial refresh (CONCURRENTLY with a WHERE clause).  Modifies in place
+ * only the rows the clause selects, under RowExclusiveLock.  See
+ * refresh_by_direct_modification().
  *
  * 2. Full concurrent refresh (CONCURRENTLY).  Computes the new contents into a
  * temporary table, diffs that against the matview and applies the difference,
  * under ExclusiveLock.  Readers are not blocked, but writers are.
  *
- * 3. Partial refresh (CONCURRENTLY with a WHERE clause).  Modifies in place
- * only the rows the clause selects, under RowExclusiveLock.  See
- * refresh_by_direct_modification().
+ * 3. Full rebuild (no options).  Creates a new heap, populates it, and swaps
+ * relfilenumbers under AccessExclusiveLock.  The OID of the original
+ * materialized view is preserved, so we do not lose GRANT nor references to
+ * this materialized view.
  *
  * If skipData is true, this is effectively like a TRUNCATE; otherwise it is
  * like a TRUNCATE followed by an INSERT using the SELECT statement associated
@@ -1669,8 +1662,10 @@ matview_build_source_plansource(Query *sourceQuery, const char *queryString)
  * Run the source query under the given snapshot, collecting its rows into the
  * tuplestore the fused statement reads.  Returns the number of rows collected.
  *
- * This is the sequence the full refresh uses in refresh_matview_datafill().
- * The only difference is where we put the rows.
+ * This runs the same executor sequence as refresh_matview_datafill() on the
+ * full-refresh path.  It differs in three ways.  The plan comes from the
+ * cache rather than being rewritten and planned here, the snapshot is the
+ * caller's rather than one we push, and the rows go to a tuplestore.
  */
 
 static double
@@ -2128,7 +2123,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 			appendStringInfo(&buf,
 							 "upsert AS ( "
 							 "  INSERT INTO %s AS " MATVIEW_ALIAS
-							 "  SELECT * FROM new_data "
+							 "  SELECT * FROM " MATVIEW_SOURCE_ENR_NAME " "
 							 "  ON CONFLICT (%s) DO ",
 							 matview_name, conflict_cols.data);
 
@@ -2148,7 +2143,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 							 "), "
 							 "pruned AS ( "
 							 "  DELETE FROM %s " MATVIEW_ALIAS " WHERE (%s) AND NOT EXISTS ( "
-							 "    SELECT 1 FROM new_data nd WHERE %s"
+							 "    SELECT 1 FROM " MATVIEW_SOURCE_ENR_NAME
+							 " nd WHERE %s"
 							 "  ) RETURNING 1 "
 							 ") "
 							 "SELECT (SELECT pg_catalog.count(*) FROM upsert) "
