@@ -33,20 +33,20 @@
 #include "executor/spi.h"
 #include "executor/tstoreReceiver.h"
 #include "miscadmin.h"
-#include "pgstat.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
 #include "parser/parse_clause.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_collate.h"
 #include "parser/parse_expr.h"
 #include "parser/parse_relation.h"
+#include "pgstat.h"
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
 #include "storage/lmgr.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
-#include "nodes/makefuncs.h"
-#include "nodes/nodeFuncs.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
@@ -997,7 +997,7 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 				 errmsg("\"%s\" is not a materialized view",
 						RelationGetRelationName(matviewRel))));
 
-	/* Check that conflicting options have not been specified. */
+	/* Check that CONCURRENTLY is not specified if not populated. */
 	if (concurrent && !RelationIsPopulated(matviewRel))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1008,6 +1008,7 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("WHERE clause cannot be used when the materialized view is not populated")));
 
+	/* Check that conflicting options have not been specified. */
 	if (concurrent && skipData)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
@@ -1180,6 +1181,10 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 		int			old_depth = matview_maintenance_depth;
 		Oid			old_relid = matview_maintenance_relid;
 
+		/*
+		 * Concurrent refresh builds new data in temp tablespace, and does
+		 * diff.
+		 */
 		tableSpace = GetDefaultTablespace(RELPERSISTENCE_TEMP, false);
 		relpersistence = RELPERSISTENCE_TEMP;
 
@@ -1191,7 +1196,8 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 		OIDNewHeap = make_new_heap(matviewOid, tableSpace,
 								   matviewRel->rd_rel->relam,
 								   relpersistence, ExclusiveLock);
-		Assert(CheckRelationOidLockedByMe(OIDNewHeap, AccessExclusiveLock, false));
+		Assert(CheckRelationOidLockedByMe(OIDNewHeap, AccessExclusiveLock,
+		                                    false));
 
 		/* Generate the data, if wanted. */
 		if (!skipData)
@@ -1230,9 +1236,16 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 		tableSpace = matviewRel->rd_rel->reltablespace;
 		relpersistence = matviewRel->rd_rel->relpersistence;
 
+		/*
+		 * Create the transient table that will receive the regenerated data.
+		 * Lock it against access by any other process until commit (by which
+		 * time it will be gone).
+		 */
 		OIDNewHeap = make_new_heap(matviewOid, tableSpace,
 								   matviewRel->rd_rel->relam,
-								   relpersistence, AccessExclusiveLock);
+								   relpersistence, ExclusiveLock);
+		Assert(CheckRelationOidLockedByMe(OIDNewHeap, AccessExclusiveLock,
+		                                    false));
 
 		if (!skipData)
 		{
