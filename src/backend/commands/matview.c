@@ -65,22 +65,10 @@
 #include "utils/tuplestore.h"
 
 /*
- * Name we register the materialized source rows under for the SQL that upserts
- * and prunes.  Both halves read it, and both read the same tuplestore, so they
- * cannot disagree about which rows the view produces.
- */
-#define MATVIEW_SOURCE_ENR_NAME	"new_data"
-
-/*
- * Alias we give the matview in the generated SQL, and therefore the name we
- * must deparse the predicate against.  See deparseRefreshWhereClause().
- */
-#define MATVIEW_ALIAS			"mv"
-
-/*
- * Why a predicate requires the caller to own the matview.  We record this as
- * the walk finds it, so that the refusal can say which of the reasons applies
- * rather than blaming a function when the expression contains none.
+ * Why we refused a caller's predicate.  We record this as the check that
+ * rejected it runs, so the error can name the actual reason: some of these
+ * are missing SELECT privilege, others admit no fix short of owning the
+ * matview.
  */
 typedef enum RefreshQualVerdict
 {
@@ -96,9 +84,9 @@ typedef enum RefreshQualVerdict
 typedef struct RefreshQualContext
 {
 	Oid			callerId;		/* who issued the REFRESH */
-	RefreshQualVerdict verdict;
-	Oid			relid;			/* the relation that decided it, if any */
-	Oid			funcid;			/* the function that decided it, if any */
+	RefreshQualVerdict verdict; /* why we refused, once we have */
+	Oid			relid;			/* relation named in the error, if any */
+	Oid			funcid;			/* function named in the error, if any */
 } RefreshQualContext;
 
 typedef struct
@@ -199,10 +187,9 @@ SetMatViewPopulatedState(Relation relation, bool newstate)
 
 	/*
 	 * Nothing to do if the state already matches.  A partial refresh always
-	 * passes true, and requires an already populated matview, so without this
-	 * every one of them would rewrite the pg_class row and send the
-	 * invalidation described below, discarding this backend's own cached
-	 * refresh plans on every call.
+	 * passes true on an already populated matview, so without this it would
+	 * send the invalidation described below on every call, discarding this
+	 * backend's own cached refresh plans each time.
 	 */
 	if (relation->rd_rel->relispopulated == newstate)
 		return;
@@ -234,8 +221,13 @@ SetMatViewPopulatedState(Relation relation, bool newstate)
 }
 
 /*
- * Resolve a $n in a partial refresh's WHERE clause against the parameters the
- * caller supplied, so that "REFRESH ... WHERE id = $1" can be prepared.
+ * Resolve a $n in a partial refresh's WHERE clause.
+ *
+ * REFRESH takes no parameters of its own, so a caller who wants to bind one
+ * issues the command through EXECUTE ... USING or SPI.  Those pass their
+ * ParamListInfo down to us, and parse analysis of the WHERE clause needs this
+ * hook to find the type of each $n in it; without it "WHERE id = $1" cannot be
+ * analyzed at all.
  */
 
 static Node *
@@ -266,10 +258,10 @@ refresh_paramref_hook(ParseState *pstate, ParamRef *pref)
 /*
  * check_functions_in_node callback: true if this function is not leakproof.
  *
- * We record the one we stop at.  "Not leakproof" is not a property anyone can
- * read off the expression they wrote, since almost nothing is marked, so the
- * answer is usually a function the caller had no reason to suspect: count(),
- * an arithmetic operator, lower().  Naming it makes the refusal actionable.
+ * We save the OID of the first one we find, so the error can name it.  Few
+ * functions are marked leakproof, and the one that stops a given expression is
+ * often not the one the caller would guess, so a refusal that does not name it
+ * leaves them nothing to act on.
  */
 
 static bool
@@ -285,13 +277,15 @@ non_leakproof_checker(Oid func_id, void *context)
 }
 
 /*
- * May the caller read this relation, for the columns that are read of it?
+ * May the caller read relid, given the columns perminfo says are read of it?
  *
- * This is the SELECT half of ExecCheckOneRelPerms(), asked about the caller
- * rather than about whoever is running.  We follow it down to the corner
- * cases: table-wide SELECT settles it, a query naming no column needs SELECT
- * on some column, a whole-row reference needs it on every column, and anything
- * else needs it on each column read.
+ * relid is whatever the predicate named: the matview itself, or a relation a
+ * subquery in the predicate reads.  This is the SELECT half of
+ * ExecCheckOneRelPerms() asked about the caller rather than about whoever is
+ * running, and we follow it down to the corner cases: table-wide SELECT
+ * settles it, a query naming no column needs SELECT on some column, a
+ * whole-row reference needs it on every column, and anything else needs it on
+ * each column read.
  */
 
 static bool
@@ -334,14 +328,11 @@ refresh_caller_may_select(Oid relid, RTEPermissionInfo *perminfo, Oid callerId)
 /*
  * Does this query level read something the caller could not read itself?
  *
- * We are asking whether the caller could reach the same rows, not whether they
- * hold the same privilege.  The two come apart under row-level security: the
- * predicate runs as the owner, who is exempt from the policies on their own
- * table unless it is FORCEd, so a caller subject to them could otherwise learn
- * from the rowcount about rows the policies exist to hide.  A caller with
- * BYPASSRLS, or who owns the table, is not subject to them and reaches the same
- * rows the owner does.  That is why we ask check_enable_rls() about the caller
- * rather than looking for a policy.
+ * We ask whether the caller could reach the same rows, not whether they hold
+ * the same privilege, because row-level security separates the two.  Hence
+ * check_enable_rls() for the caller rather than a test for the presence of a
+ * policy: a caller with BYPASSRLS, or who owns the table, reaches the same rows
+ * the owner does.
  */
 
 static bool
@@ -400,17 +391,15 @@ refresh_query_reads_unreadable(Query *query, RefreshQualContext *ctx)
 }
 
 /*
- * Does this predicate require the caller to own the matview?
+ * May this caller use this predicate?
  *
- * We evaluate the predicate with the owner's privileges, so anything it can
- * reach, it reaches as the owner.  A function is the hard case: it is opaque,
- * we cannot see which relations its body reads, and leakproofness is the only
- * handle we have.  A subquery is not opaque, since it declares what it touches
- * in its range table, so we judge it on that instead.
+ * We evaluate the predicate with the owner's privileges, so anything it
+ * reaches, it reaches as the owner.  A subquery declares what it touches in its
+ * range table, so we check those relations against the caller.  A function does
+ * not, so leakproofness is the only handle we have on it.
  *
- * We accept only node types that cannot reach a relation on their own, and
- * require ownership for anything else.  The allowlist is deliberate: the
- * denylist it replaced let through every node type it did not recognize.
+ * The node types we accept are an allowlist, not a denylist: anything we do not
+ * recognize might reach a relation, so we refuse it.
  */
 
 static bool
@@ -644,9 +633,8 @@ transformRefreshWhereClause(Oid relid, Node *whereClause, ParamListInfo params,
 	assign_expr_collations(pstate, result);
 
 	/*
-	 * The owner is asked first: for the owner the predicate runs with the
-	 * privileges it already has, so there is nothing to escalate and nothing
-	 * to walk.
+	 * Nothing to check for the owner.  The predicate runs with the owner's
+	 * privileges, which for them is no more than they already have.
 	 */
 	if (!object_ownercheck(RelationRelationId, relid, callerId))
 	{
@@ -695,6 +683,16 @@ transformRefreshWhereClause(Oid relid, Node *whereClause, ParamListInfo params,
 
 	return result;
 }
+
+/*
+ * Names the SQL that refresh_by_direct_modification() generates gives to the
+ * two relations it reads.  MATVIEW_ALIAS is also what we must deparse the
+ * predicate against, so that the deparse and the statements agree; both halves
+ * of the fused statement read MATVIEW_SOURCE_ENR_NAME, and both get the same
+ * tuplestore, so they cannot disagree about which rows the view produces.
+ */
+#define MATVIEW_SOURCE_ENR_NAME	"new_data"
+#define MATVIEW_ALIAS			"mv"
 
 /*
  * Render an analyzed WHERE clause back to text, for the statements SPI builds.
