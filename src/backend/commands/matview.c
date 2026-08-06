@@ -1197,7 +1197,7 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 								   matviewRel->rd_rel->relam,
 								   relpersistence, ExclusiveLock);
 		Assert(CheckRelationOidLockedByMe(OIDNewHeap, AccessExclusiveLock,
-		                                    false));
+										  false));
 
 		/* Generate the data, if wanted. */
 		if (!skipData)
@@ -1245,7 +1245,7 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 								   matviewRel->rd_rel->relam,
 								   relpersistence, ExclusiveLock);
 		Assert(CheckRelationOidLockedByMe(OIDNewHeap, AccessExclusiveLock,
-		                                    false));
+										  false));
 
 		if (!skipData)
 		{
