@@ -1166,7 +1166,7 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	 * point, and the margin widened as the scope grew.
 	 *
 	 * (WITH NO DATA is rejected together with a WHERE clause long before
-	 * here, so !skipData is belt and braces.)
+	 * here, so the !skipData test is redundant.)
 	 */
 	if (qual && !skipData)
 	{
@@ -1479,7 +1479,7 @@ matview_argtypes_match(MatViewPartialRefreshCache *entry, ParamListInfo params)
  *
  * We only set a flag here.  A callback runs at points where an enclosing
  * refresh may be executing a plan out of one of these entries.  Freeing now
- * would pull the ground out from under it.  matview_cache_sweep() does the
+ * could release a plan that is still running.  matview_cache_sweep() does the
  * freeing at a point where that cannot be true.  plancache.c and ri_triggers.c
  * both work this way.
  *
@@ -1847,7 +1847,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 	 * statement.  argtypes is still checked, since a caller may bind a
 	 * parameter the predicate never names.
 	 *
-	 * The plans must also still be valid, and that is not belt and braces.  A
+	 * The plans must also still be valid, and that check is not redundant.  A
 	 * qual tree names a function or operator by OID.  Renaming one leaves the
 	 * tree equal() to the cached one, while the statements built from it still
 	 * spell the old name.  plancache invalidates those statements and
