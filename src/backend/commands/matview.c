@@ -127,13 +127,15 @@ typedef struct MatViewPartialRefreshCache
 static HTAB *MatViewRefreshCache = NULL;
 
 /*
- * Matview maintenance state.  While a refresh is running we must let its own
- * generated statements modify the matview, but a partial refresh evaluates its
- * WHERE clause inside the same window.  A caller who does not own the matview
- * may only use leakproof functions there, which bounds what they can reach, but
- * the owner is under no such restriction and neither is confined to the matview
- * being refreshed.  So we remember which one that is, and grant the exemption
- * for no other.
+ * Matview maintenance state.
+ *
+ * A refresh has to be able to modify the matview it is refreshing, and the
+ * depth counter is what permits that.  A partial refresh also runs the
+ * caller's WHERE clause while that permission is open, so a function called
+ * from there could write to some other matview.  A non-owner may only call
+ * leakproof functions in a WHERE clause, but the owner may call anything.  So
+ * we record which matview is being refreshed, and permit writes to that one
+ * only.
  */
 static int	matview_maintenance_depth = 0;
 static Oid	matview_maintenance_relid = InvalidOid;
