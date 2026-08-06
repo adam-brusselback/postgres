@@ -1,54 +1,24 @@
 --
--- REFRESH MATERIALIZED VIEW ... WHERE ... : privileges and session state
+-- REFRESH MATERIALIZED VIEW ... WHERE ...: privileges and session state
 --
--- These tests exercise the security boundary of the WHERE clause and the
--- session-level matview maintenance flag.  Each one says whether it came from
--- the -hackers thread "[Patch] Add WHERE clause support to REFRESH MATERIALIZED
--- VIEW" or was found separately, so that review items can be checked off
--- against it.
+-- These cases cover the security boundary of the WHERE clause and the
+-- session-level matview maintenance flag.
 --
--- Every case covers a live defect.  The expected output describes what the
--- command should do, so they fail until the defect is fixed.  All of them are
--- now fixed; where the pre-fix behaviour says what the test is for, the comment
--- on the case records it.
+-- Where the correct outcome is that the statement is rejected, it is wrapped in
+-- a block reporting the SQLSTATE rather than the message text, so a reworded
+-- error does not churn the expected file.
 --
--- Where the correct outcome is "the statement is rejected", the statement is
--- wrapped in a block that reports the SQLSTATE instead of letting the message
--- text through.  The fix that produces the rejection has not been written yet,
--- so its wording is not knowable here; the SQLSTATE that a correct rejection
--- must carry is.
---
--- Disposition: keep, all of them.  These are security regressions, and the
--- classes they cover -- a caller reaching objects through a predicate it could
--- not reach directly, a predicate modifying a matview, and an error leaving the
--- maintenance flag raised -- are all easy to reintroduce.  They should stay in
--- the tree after the fixes land.
---
--- One qualification, for Test 1 specifically.  It asserts the RULE -- a
--- non-leakproof predicate requires ownership -- rather than the property the
--- rule exists to deliver, which is that a predicate cannot read across a
--- privilege boundary.  The rule is needed because SPI runs the whole statement
--- under one userid, so the predicate necessarily runs as the owner.
---
--- If the Query-tree work lets the predicate be evaluated as the invoker, the
--- leak stops being possible instead of being forbidden, and the right expected
--- output for this test becomes "succeeds".  At that point the test does not
--- merely stop applying, it INVERTS: it would report a strictly better
--- implementation as a security regression.  Rewrite it then to assert that the
--- leak cannot happen rather than that the rejection does -- do not simply
--- regenerate the expected output, which would silently retire the check.
---
--- Test 4 used to leave the session unable to protect any matview from direct
--- DML, so nothing could follow it.  That was the defect it exists to catch;
--- with the flag restored on error, the ordering constraint is gone with it.
+-- Each case covered a live defect when it was written, and the expected output
+-- describes what the command should do, so each one failed until its defect was
+-- fixed.  Where the pre-fix behaviour says what the case is for, the comment on
+-- the case records it.
 --
 --
 -- Test 1: The predicate must not run with the matview owner's privileges
 --
--- Reported on -hackers by Zsolt Parragi: "The patch in its current form has a
--- security escalation bug, WHERE functions are executed with the privileges of
--- the owner, not the maintainer."  Acknowledged by Adam Brusselback, who
--- proposed allowing MAINTAIN callers only when every function in the predicate
+-- Reported by Zsolt Parragi: a caller holding only MAINTAIN could get their
+-- own function run with the matview owner's privileges.  The fix allows a
+-- MAINTAIN caller only when every function in the predicate
 -- is leakproof and requiring ownership otherwise.  This is Zsolt's repro.
 --
 -- RefreshMatViewByOid() switches to the owner before analyzing or executing
@@ -119,17 +89,17 @@ DROP ROLE regress_matview_owner;
 --
 -- Test 2: The predicate must not run inside the matview maintenance window
 --
--- Not reported on -hackers.  Related to Zsolt Parragi's escalation report
--- above, but distinct from it and not covered by the leakproof gating proposed
--- in reply: the predicate runs not only as the owner but with matview write
+-- Related to Zsolt Parragi's report above but distinct from it, and not
+-- covered by the leakproof rule: the predicate runs not only as the owner but
+-- with matview write
 -- protection switched off, which is exposure the full and concurrent refresh
 -- paths do not have, since the statements they run inside that window contain
 -- no user-supplied expressions.
 --
 -- OpenMatViewIncrementalMaintenance() is called before the SPI statements that
 -- evaluate the predicate, so a predicate function is exempt from the "cannot
--- change materialized view" check -- and that exemption is global, not scoped
--- to the matview being refreshed.
+-- change materialized view" check, and that exemption was global rather than
+-- scoped to the matview being refreshed.
 --
 -- Everything here is owned by the role running the test, so that no ACL
 -- failure can mask the behaviour under test.
@@ -193,8 +163,8 @@ DROP TABLE matview_mw_base;
 --
 -- Test 3: The leakproof gate must be an allowlist, not a denylist
 --
--- Not reported on -hackers.  Found by auditing the gate added in reply to
--- Zsolt Parragi's report above: that gate refuses a predicate whose functions
+-- Found by auditing the gate added for Zsolt Parragi's report above.  That
+-- gate refuses a predicate whose functions
 -- are not all leakproof, but it was written as a walker that flagged known-bad
 -- FUNCTIONS and let through every node type it did not recognise.
 --
@@ -202,7 +172,7 @@ DROP TABLE matview_mw_base;
 -- answered wrongly.  It constrains what a function may reveal about its
 -- arguments; it says nothing about which RELATIONS an expression may read.  A
 -- sublink reads relations as the matview owner, so a caller holding only
--- MAINTAIN could read anything the owner could -- and then learn the value by
+-- MAINTAIN could read anything the owner could, and then learn the value by
 -- observing which row the refresh touched.  Every sublink spelling reached it,
 -- and so did a cast to a domain whose CHECK constraint calls a non-leakproof
 -- function, because that function never appears in the expression tree.
@@ -286,9 +256,9 @@ DROP ROLE regress_mvlp_owner;
 --
 -- Test 4: matview_maintenance_depth must not leak when a refresh fails
 --
--- Reported on -hackers by Zsolt Parragi: "There's also another issue where an
--- error during refresh removes the modification restrictions."  Diagnosed by
--- Adam Brusselback as "a missing PG_TRY around the
+-- Reported by Zsolt Parragi: an error during a refresh removed the matview
+-- modification restrictions for the rest of the session.  The cause was a
+-- missing PG_TRY around the
 -- OpenMatViewIncrementalMaintenance()/Close pair in the direct-modification
 -- path (the match/merge site already handles it)", with "Will fix".  This is
 -- Zsolt's repro, extended to show that the exemption is not scoped to the
@@ -352,8 +322,7 @@ DROP TABLE mv_leak_base;
 --
 -- Test 5: a subquery in the predicate, for a caller who is not the owner
 --
--- Found here, not on the -hackers thread.  A subquery used to be refused
--- outright, as a consequence of Test 1's rule rather than a separate decision:
+-- A subquery used to be refused outright, as a consequence of Test 1's rule rather than a separate decision:
 -- the leakproof gate walks the predicate over an allowed list of node tags and
 -- refuses everything else (Test 3), and SubLink was not on that list.
 --
@@ -363,16 +332,16 @@ DROP TABLE mv_leak_base;
 -- documentation's blast-radius warning tells people to write.  So the
 -- documented correct usage was available to the owner and to nobody else.
 --
--- Refusing was the safe default and it was not obviously wrong -- the subquery
+-- Refusing was the safe default and it was not obviously wrong.  The subquery
 -- runs as the owner, so a caller who cannot read the table it names would
--- otherwise learn which of its rows intersect the matview -- but it was
+-- otherwise learn which of its rows intersect the matview.  But it was
 -- indiscriminate: it refused the subquery whether or not the caller could have
 -- run it themselves.  The rule is now the narrower one, and the note this test
 -- used to carry said what that would look like: "the first two would start
 -- succeeding and the last must not".  That is what it now checks.
 --
--- Disposition: keep.  Test 6 covers the rule exhaustively; this stays as the
--- worked example of the use case, with the tables named after what they are.
+-- Test 6 covers the rule exhaustively.  This one is the worked example of the
+-- use case, with the tables named after what they are.
 --
 --
 -- The rule, once, in one place.  A caller who does not own the matview may use
@@ -466,15 +435,14 @@ DROP ROLE regress_mvsq_maint;
 --
 -- The routes are not decoration.  The check walks the parsed predicate and
 -- inspects the range table of every query level it finds, so each of these is a
--- different way for a relation to appear in a range table -- a sublink, a
--- FROM-clause subquery, a CTE, a set-operation arm, a LATERAL item, a
--- recursive term -- and each was tried against a table the caller cannot read
+-- different way for a relation to appear in a range table: a sublink, a
+-- FROM-clause subquery, a CTE, a set-operation arm, a LATERAL item and a
+-- recursive term.  Each was tried against a table the caller cannot read
 -- before it was written down here.
 --
--- Disposition: keep.  This is the file's most direct security check and the
--- cheapest thing to break: the allowed list of node tags in
--- refresh_qual_needs_owner_walker() gains a tag, or a query level stops being
--- visited, and one of these silently starts succeeding.
+-- This is the cheapest check in the file to break.  The allowed list of node
+-- tags in refresh_qual_needs_owner_walker() gains a tag, or a query level stops
+-- being visited, and one of these silently starts succeeding.
 --
 CREATE ROLE regress_mvg_owner;
 CREATE ROLE regress_mvg_maint;
@@ -700,7 +668,7 @@ SELECT mvg.try('regress_mvg_maint', '20 a table they own',
 --
 -- These read nothing the caller could not read, and are refused anyway.  An
 -- aggregate and a window function are functions, and count(), min() and
--- row_number() are not marked leakproof -- almost nothing is -- so the rule
+-- row_number() are not marked leakproof, and almost nothing is, so the rule
 -- that a non-owner's predicate must be leakproof catches them.  That rule is
 -- unchanged and deliberate: what it prevents is not reading the owner's rows
 -- but running the caller's code as the owner, which a readable range table
@@ -734,8 +702,8 @@ SELECT mvg.try('regress_mvg_maint', '23 a window function',
 
 -- The whole message for one of them, which mvg.try() cannot show: it reports
 -- SQLERRM, and what makes this refusal usable is the DETAIL.  "Not leakproof"
--- is not a property anyone can read off the expression they wrote -- almost
--- nothing is marked leakproof -- so the refusal has to name the function it
+-- is not a property anyone can read off the expression they wrote, since
+-- almost nothing is marked leakproof, so the refusal has to name the function it
 -- stopped at or the caller is left guessing which part of the condition was
 -- the problem.
 SET ROLE regress_mvg_maint;
@@ -1004,7 +972,7 @@ SELECT mvg.try('regress_mvg_owner',  '54 the table owner',
  54 the table owner               allowed
 (1 row)
 
--- FORCEd, the owner is subject too -- but they are still the matview's owner,
+-- FORCEd, the owner is subject too, but they are still the matview's owner,
 -- and the caller is still the one the answer would be leaked to.
 ALTER TABLE mvg.open FORCE ROW LEVEL SECURITY;
 SELECT mvg.try('regress_mvg_maint',  '55 FORCE, subject to a policy',
@@ -1123,21 +1091,21 @@ SELECT mvg.try2('regress_mvg_maint', '65 table-wide SELECT',     $$who = 'other'
 -- so it is pinned here rather than left to be rediscovered.  Two separate
 -- reasons a comparison lands outside it, and they want different fixes:
 --
---   the operator itself is not marked leakproof -- numeric, jsonb, enums,
+--   the operator itself is not marked leakproof: numeric, jsonb, enums,
 --   arrays and row values, while the integer and floating-point types, text,
 --   boolean, uuid and the date and time types are;
 --
 --   or a cast survives into the expression, because the check runs on the
 --   parsed condition and not on a simplified one.  Simplifying first would
 --   mean const-folding the caller's functions with the owner's privileges,
---   which is the thing being prevented, so this is deliberate -- but it means
+--   which is the thing being prevented, so this is deliberate, but it means
 --   a quoted literal is accepted where the same value spelled as a cast is
 --   not.
 --
--- Disposition: keep.  If any of these operators is ever marked leakproof
--- upstream, the corresponding case flips and the documentation has to move
--- with it.  That is the outcome this is for; a silent divergence between the
--- reference page and the code is not.
+-- If any of these operators is ever marked leakproof upstream, the
+-- corresponding case flips and the reference page has to move with it.  That is
+-- what this case is for.  A silent divergence between the page and the code is
+-- the thing it prevents.
 --
 CREATE TYPE mvg.stat AS ENUM ('open', 'closed');
 CREATE TABLE mvg.types (id int PRIMARY KEY, n bigint, d float8, amt numeric,
@@ -1252,8 +1220,8 @@ DROP ROLE regress_mvg_super;
 -- WHERE true is that predicate, and it is also the one a caller would reach
 -- for if they were fishing.
 --
--- Disposition: keep.  The interesting half is the caller who gets no key, and
--- nothing else in the suite covers an error message that has to be redacted.
+-- The interesting half is the caller who gets no key.  Nothing else in the
+-- suite covers an error message that has to be redacted.
 --
 CREATE ROLE regress_mvd_owner;
 CREATE ROLE regress_mvd_maint;
