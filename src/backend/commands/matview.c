@@ -175,7 +175,7 @@ static bool matview_argtypes_match(MatViewPartialRefreshCache *entry,
 static Node *refresh_paramref_hook(ParseState *pstate, ParamRef *pref);
 static bool non_leakproof_checker(Oid func_id, void *context);
 static bool refresh_caller_may_select(Oid relid, RTEPermissionInfo *perminfo,
-									 Oid callerId);
+									  Oid callerId);
 static void refresh_where_clause_error_callback(void *arg);
 static Node *transformRefreshWhereClause(Oid relid, Node *whereClause,
 										 ParamListInfo params, Oid callerId);
@@ -207,9 +207,9 @@ SetMatViewPopulatedState(Relation relation, bool newstate)
 
 	/*
 	 * Nothing to do if the state already matches.  A partial refresh always
-	 * passes true on an already populated matview.  Without this it would send
-	 * the invalidation below on every call, discarding this backend's own
-	 * cached refresh plans each time.
+	 * passes true on an already populated matview.  Without this it would
+	 * send the invalidation below on every call, discarding this backend's
+	 * own cached refresh plans each time.
 	 */
 	if (relation->rd_rel->relispopulated == newstate)
 		return;
@@ -467,13 +467,12 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 		/*
 		 * A partial refresh applies its changes with ON CONFLICT against one
 		 * arbiter index, a row at a time.  Each row must satisfy every unique
-		 * index as we write it.  Two rows exchanging their values on a
-		 * second unique index would need one deleted before the other is
-		 * inserted, which ON CONFLICT cannot do.  No choice of arbiter helps,
-		 * since whichever index arbitrates, the exchange collides on the
-		 * other.  A full refresh is unaffected, since it rewrites the whole
-		 * matview and never reconciles a new row against one it is not
-		 * replacing.
+		 * index as we write it.  Two rows exchanging their values on a second
+		 * unique index would need one deleted before the other is inserted,
+		 * which ON CONFLICT cannot do.  No choice of arbiter helps, since
+		 * whichever index arbitrates, the exchange collides on the other.  A
+		 * full refresh is unaffected, since it rewrites the whole matview and
+		 * never reconciles a new row against one it is not replacing.
 		 */
 		if (qual && nUniqueIndexes > 1)
 			ereport(ERROR,
@@ -516,13 +515,16 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	if (qual)
 	{
 		processed = refresh_by_direct_modification(matviewOid, relowner,
-												  save_userid, save_sec_context,
-												  dataQuery, qual, queryString,
-												  params);
+												   save_userid, save_sec_context,
+												   dataQuery, qual, queryString,
+												   params);
 	}
 	else
 	{
-		/* Concurrent refresh builds new data in temp tablespace, and does diff. */
+		/*
+		 * Concurrent refresh builds new data in temp tablespace, and does
+		 * diff.
+		 */
 		if (concurrent)
 		{
 			tableSpace = GetDefaultTablespace(RELPERSISTENCE_TEMP, false);
@@ -535,9 +537,9 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 		}
 
 		/*
-		 * Create the transient table that will receive the regenerated data. Lock
-		 * it against access by any other process until commit (by which time it
-		 * will be gone).
+		 * Create the transient table that will receive the regenerated data.
+		 * Lock it against access by any other process until commit (by which
+		 * time it will be gone).
 		 */
 		OIDNewHeap = make_new_heap(matviewOid, tableSpace,
 								   matviewRel->rd_rel->relam,
@@ -579,10 +581,11 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 			refresh_by_heap_swap(matviewOid, OIDNewHeap, relpersistence);
 
 			/*
-			 * Inform cumulative stats system about our activity: basically, we
-			 * truncated the matview and inserted some new data.  (The concurrent
-			 * code path above doesn't need to worry about this because the
-			 * inserts and deletes it issues get counted by lower-level code.)
+			 * Inform cumulative stats system about our activity: basically,
+			 * we truncated the matview and inserted some new data.  (The
+			 * concurrent code path above doesn't need to worry about this
+			 * because the inserts and deletes it issues get counted by
+			 * lower-level code.)
 			 */
 			pgstat_count_truncate(matviewRel);
 			if (!skipData)
@@ -791,7 +794,6 @@ transientrel_destroy(DestReceiver *self)
  * hook to find the type of each $n.  Without it "WHERE id = $1" cannot be
  * analyzed at all.
  */
-
 static Node *
 refresh_paramref_hook(ParseState *pstate, ParamRef *pref)
 {
@@ -826,7 +828,6 @@ refresh_paramref_hook(ParseState *pstate, ParamRef *pref)
  * is often not the one the caller would guess.  A refusal that does not name
  * it leaves the caller nothing to act on.
  */
-
 static bool
 non_leakproof_checker(Oid func_id, void *context)
 {
@@ -850,7 +851,6 @@ non_leakproof_checker(Oid func_id, void *context)
  * whole-row reference needs it on every column.  Anything else needs it on
  * each column read.
  */
-
 static bool
 refresh_caller_may_select(Oid relid, RTEPermissionInfo *perminfo, Oid callerId)
 {
@@ -897,7 +897,6 @@ refresh_caller_may_select(Oid relid, RTEPermissionInfo *perminfo, Oid callerId)
  * policy.  A caller who holds BYPASSRLS, or who owns the relation the subquery
  * names, reaches the same rows the owner does.
  */
-
 static bool
 refresh_query_reads_unreadable(Query *query, RefreshQualContext *ctx)
 {
@@ -964,7 +963,6 @@ refresh_query_reads_unreadable(Query *query, RefreshQualContext *ctx)
  * The node types we accept are an allowlist, not a denylist.  Anything we do
  * not recognize might reach a relation, so we refuse it.
  */
-
 static bool
 refresh_qual_needs_owner_walker(Node *node, void *context)
 {
@@ -1029,10 +1027,10 @@ refresh_qual_needs_owner_walker(Node *node, void *context)
 			/*
 			 * We walk a sublink rather than refusing it.
 			 * expression_tree_walker() visits its testexpr and then its
-			 * subselect, and the Query branch above decides whether the caller
-			 * may read what that names.  That covers every level below it too,
-			 * since query_tree_walker() descends into subqueries, CTEs and
-			 * further sublinks.
+			 * subselect, and the Query branch above decides whether the
+			 * caller may read what that names.  That covers every level below
+			 * it too, since query_tree_walker() descends into subqueries,
+			 * CTEs and further sublinks.
 			 */
 		case T_SubLink:
 			break;
@@ -1067,7 +1065,6 @@ refresh_qual_needs_owner_walker(Node *node, void *context)
 /*
  * Refuse a predicate the caller may not use, saying which of the reasons it is.
  */
-
 static void
 refresh_qual_permission_error(Relation matviewRel, RefreshQualContext *ctx)
 {
@@ -1163,7 +1160,6 @@ refresh_where_clause_error_callback(void *arg)
  * Parse-analyse a partial refresh's WHERE clause against the matview, and
  * reject the expressions that cannot be allowed there.
  */
-
 static Node *
 transformRefreshWhereClause(Oid relid, Node *whereClause, ParamListInfo params,
 							Oid callerId)
@@ -1268,7 +1264,6 @@ transformRefreshWhereClause(Oid relid, Node *whereClause, ParamListInfo params,
  * puts one there, it qualifies the matview's Vars with a name the statement
  * never defines.  The refresh then fails with "missing FROM-clause entry".
  */
-
 static char *
 deparseRefreshWhereClause(Oid relid, Node *whereClause)
 {
@@ -1293,7 +1288,6 @@ typedef struct RefreshParamizeContext
  * type must travel beside it in the argtypes array given to SPI_prepare.  A
  * constant with no type to declare cannot make that trip.
  */
-
 static bool
 refresh_const_is_paramizable(Const *con)
 {
@@ -1309,7 +1303,6 @@ refresh_const_is_paramizable(Const *con)
 /*
  * Mutator for parameterizeRefreshWhereClause().
  */
-
 static Node *
 paramize_refresh_consts_mutator(Node *node, void *context)
 {
@@ -1406,7 +1399,6 @@ parameterizeRefreshWhereClause(Node *qual, ParamListInfo *params)
 /*
  * Execute a prepared SPI plan, optionally under a caller-supplied snapshot.
  */
-
 static int
 matview_execute_spi_plan(SPIPlanPtr plan, ParamListInfo params,
 						 Snapshot snapshot, bool read_only)
@@ -1449,7 +1441,6 @@ matview_execute_spi_plan(SPIPlanPtr plan, ParamListInfo params,
 /*
  * Were these plans prepared for the same parameter types the caller now has?
  */
-
 static bool
 matview_argtypes_match(MatViewPartialRefreshCache *entry, ParamListInfo params)
 {
@@ -1558,7 +1549,6 @@ InitMatViewCache(void)
  * The matview's own defining query goes in a subquery, so the predicate
  * filters its output.  The result is ordered by the arbiter key.
  */
-
 static Query *
 matview_build_source_query(Relation matviewRel, Query *dataQuery, Node *qual,
 						   int nkeyatts, const int16 *keyattnums)
@@ -1626,7 +1616,6 @@ matview_build_source_query(Relation matviewRel, Query *dataQuery, Node *qual,
  * REFRESH statement the caller issued.  refresh_matview_datafill() hands the
  * planner the same thing on the full-refresh path.
  */
-
 static CachedPlanSource *
 matview_build_source_plansource(Query *sourceQuery, const char *queryString)
 {
@@ -1666,7 +1655,6 @@ matview_build_source_plansource(Query *sourceQuery, const char *queryString)
  * cache rather than being rewritten and planned here, the snapshot is the
  * caller's rather than one we push, and the rows go to a tuplestore.
  */
-
 static double
 matview_materialize_source(CachedPlanSource *plansource, ParamListInfo params,
 						   Snapshot snapshot, Tuplestorestate *tupstore)
@@ -1769,6 +1757,7 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 	MatViewPartialRefreshCache *cacheEntry;
 	MatViewPartialRefreshCache localEntry;
 	bool		use_cache;
+	bool		reuse;
 	bool		found;
 	uint64		result_processed = 0;
 	int			old_depth;
@@ -1836,37 +1825,36 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 	}
 
 	/*
-	 * Same predicate means an equal() tree.  The plans were built by deparsing
-	 * this tree, so two trees that compare equal deparse to the same
-	 * statement.  argtypes is still checked, since a caller may bind a
+	 * Same predicate means an equal() tree.  The plans were built by
+	 * deparsing this tree, so two trees that compare equal deparse to the
+	 * same statement.  argtypes is still checked, since a caller may bind a
 	 * parameter the predicate never names.
 	 *
 	 * The plans must also still be valid, and that check is not redundant.  A
 	 * qual tree names a function or operator by OID.  Renaming one leaves the
-	 * tree equal() to the cached one, while the statements built from it still
-	 * spell the old name.  plancache invalidates those statements and
-	 * re-analyzes their text, binding the old name to whatever holds it now, a
-	 * different object or none at all.  The tree would then drive the source
-	 * while the stale text drives the pre-lock and the prune, over different
-	 * rows.  So we ask plancache whether its plan is still good, and rebuild
-	 * from a fresh deparse when it is not.  ri_FetchPreparedPlan() does the
-	 * same thing for the same reason.
+	 * tree equal() to the cached one, while the statements built from it
+	 * still spell the old name.  plancache invalidates those statements and
+	 * re-analyzes their text, binding the old name to whatever holds it now,
+	 * a different object or none at all.  The tree would then drive the
+	 * source while the stale text drives the pre-lock and the prune, over
+	 * different rows.  So we ask plancache whether its plan is still good,
+	 * and rebuild from a fresh deparse when it is not.
+	 * ri_FetchPreparedPlan() does the same thing for the same reason.
 	 */
-	if (found &&
-		cacheEntry->uniqueIndexOid == uniqueIndexOid &&
-		cacheEntry->qual != NULL &&
-		equal(cacheEntry->qual, qual) &&
-		cacheEntry->nargs == (params ? params->numParams : 0) &&
-		matview_argtypes_match(cacheEntry, params) &&
-		cacheEntry->lockPlan != NULL &&
-		cacheEntry->dupPlan != NULL &&
-		cacheEntry->refreshPlan != NULL &&
-		SPI_plan_is_valid(cacheEntry->lockPlan) &&
-		SPI_plan_is_valid(cacheEntry->dupPlan) &&
-		SPI_plan_is_valid(cacheEntry->refreshPlan))
-	{
-	}
-	else
+	reuse = (found &&
+			 cacheEntry->uniqueIndexOid == uniqueIndexOid &&
+			 cacheEntry->qual != NULL &&
+			 equal(cacheEntry->qual, qual) &&
+			 cacheEntry->nargs == (params ? params->numParams : 0) &&
+			 matview_argtypes_match(cacheEntry, params) &&
+			 cacheEntry->lockPlan != NULL &&
+			 cacheEntry->dupPlan != NULL &&
+			 cacheEntry->refreshPlan != NULL &&
+			 SPI_plan_is_valid(cacheEntry->lockPlan) &&
+			 SPI_plan_is_valid(cacheEntry->dupPlan) &&
+			 SPI_plan_is_valid(cacheEntry->refreshPlan));
+
+	if (!reuse)
 	{
 		if (found)
 		{
@@ -1921,10 +1909,10 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 			enr->md.enrtype = ENR_NAMED_TUPLESTORE;
 
 			/*
-			 * A row estimate for new_data, which is empty at this point, since
-			 * we fill the tuplestore after the pre-lock below.  We cannot
-			 * supply the true count and cannot correct this later.  Parse
-			 * analysis copies the value into the range table entry, so
+			 * A row estimate for new_data, which is empty at this point,
+			 * since we fill the tuplestore after the pre-lock below.  We
+			 * cannot supply the true count and cannot correct this later.
+			 * Parse analysis copies the value into the range table entry, so
 			 * SPI_prepare captures it and it travels inside the cached plan.
 			 * That plan then serves refreshes whose scopes differ by orders
 			 * of magnitude.  The matview's own row count is the right order
@@ -2093,9 +2081,9 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 			 * refresh_by_match_merge() has its own version of this check for
 			 * the same reason, and a partial refresh never reaches it.
 			 *
-			 * We group rather than self-join, since the source is a tuplestore
-			 * and has no ctid to tell two equal rows apart.  Which rows
-			 * conflict is the index's question, not GROUP BY's.  For an
+			 * We group rather than self-join, since the source is a
+			 * tuplestore and has no ctid to tell two equal rows apart.  Which
+			 * rows conflict is the index's question, not GROUP BY's.  For an
 			 * ordinary unique index a NULL key never conflicts, so those rows
 			 * are filtered out first.  For NULLS NOT DISTINCT they do
 			 * conflict, which is what grouping already does.
@@ -2134,8 +2122,9 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 				appendStringInfoString(&buf, "NOTHING ");
 
 			/*
-			 * Both halves RETURN a row apiece, so the statement's own result is
-			 * the number of rows it wrote, which is what the command reports.
+			 * Both halves RETURN a row apiece, so the statement's own result
+			 * is the number of rows it wrote, which is what the command
+			 * reports.
 			 */
 			appendStringInfo(&buf,
 							 "  RETURNING 1 "
@@ -2194,9 +2183,9 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 		/*
 		 * We lock the matview rows in scope before evaluating the source, and
 		 * take the snapshot the source runs under only afterwards.  The order
-		 * matters.  A refresh that queued behind another must not evaluate its
-		 * source from before that one committed, or it writes stale values
-		 * back over it.
+		 * matters.  A refresh that queued behind another must not evaluate
+		 * its source from before that one committed, or it writes stale
+		 * values back over it.
 		 */
 		if (matview_execute_spi_plan(cacheEntry->lockPlan, params,
 									 InvalidSnapshot, false) < 0)
@@ -2229,8 +2218,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 			INJECTION_POINT("matview-where-source-materialized", NULL);
 
 			/*
-			 * Refuse before writing anything if we cannot apply the source one
-			 * row at a time.
+			 * Refuse before writing anything if we cannot apply the source
+			 * one row at a time.
 			 *
 			 * We name the duplicated key only for a caller who owns the
 			 * matview.  refresh_by_match_merge() prints the offending row
