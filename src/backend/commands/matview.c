@@ -786,13 +786,7 @@ paramize_refresh_consts_mutator(Node *node, void *context)
  *
  * The plan cache is keyed on the predicate, so without this a caller who
  * varies a literal from call to call misses the cache every time and pays for
- * parse analysis and planning on each refresh.  We set PARAM_FLAG_CONST, so
- * eval_const_expressions() folds the value back in when plancache builds a
- * custom plan and that plan is the one the literal would have got.
- *
- * This must run before the deparse, since the deparsed text is what the
- * generated statements carry: rewriting one and not the other would leave them
- * disagreeing about which rows the predicate selects.
+ * parse analysis and planning on each refresh.
  */
 static Node *
 parameterizeRefreshWhereClause(Node *qual, ParamListInfo *params)
@@ -833,8 +827,10 @@ parameterizeRefreshWhereClause(Node *qual, ParamListInfo *params)
 		prm->isnull = con->constisnull;
 
 		/*
-		 * PARAM_FLAG_CONST is what keeps a custom plan as good as the literal
-		 * plan it replaces: eval_const_expressions() folds the value back in.
+		 * PARAM_FLAG_CONST tells the planner this value cannot change for the
+		 * life of the plan, which lets eval_const_expressions() substitute it
+		 * as a Const.  Without it the planner must treat the Param as opaque,
+		 * and a custom plan would be worse than the one the literal got.
 		 */
 		prm->pflags = PARAM_FLAG_CONST;
 		prm->ptype = con->consttype;
@@ -891,12 +887,15 @@ matview_execute_spi_plan(SPIPlanPtr plan, ParamListInfo params,
 /*
  * ExecRefreshMatView -- execute a REFRESH MATERIALIZED VIEW command
  *
- * This is the entry point for REFRESH MATERIALIZED VIEW.  It handles:
+ * This is the entry point for REFRESH MATERIALIZED VIEW.  Four spellings reach
+ * it:
  *
+ * - no options: full rebuild via heap swap.
+ * - CONCURRENTLY: full refresh, computed into a temporary table and applied as
+ *   a diff, so that readers are not blocked.
+ * - CONCURRENTLY with a WHERE clause: partial refresh, which modifies in place
+ *   only the rows the clause selects.  The grammar requires CONCURRENTLY here.
  * - WITH NO DATA: effectively like a TRUNCATE.
- * - CONCURRENTLY: diff-based refresh allowing concurrent reads.
- * - WHERE clause: partial refresh of a subset of rows.
- * - Default: full rebuild via heap swap.
  *
  * The statement node's skipData field shows whether WITH NO DATA was used.
  */
@@ -907,13 +906,11 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
 	Oid			matviewOid;
 	LOCKMODE	lockmode;
 
-	/* Determine strength of lock needed. */
-
 	/*
-	 * A partial refresh modifies rows in place, so it is spelled CONCURRENTLY,
-	 * which the grammar enforces, and we take RowExclusiveLock.  Refreshes over
-	 * disjoint scopes therefore run in parallel, and overlapping ones are
-	 * ordered by the row locks each takes over its own scope.
+	 * Determine strength of lock needed.  A partial refresh takes only
+	 * RowExclusiveLock, because it modifies rows in place and relies on the row
+	 * locks it takes over its own scope to serialize against another one.  Two
+	 * refreshes over scopes that do not overlap therefore run in parallel.
 	 */
 	if (stmt->whereClause)
 		lockmode = RowExclusiveLock;
@@ -940,23 +937,18 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
  *
  * This refreshes a materialized view using one of three strategies:
  *
- * 1. Partial refresh (CONCURRENTLY with a WHERE clause):
- * Directly modifies the matview in place using a two-step approach
- * (SELECT ... FOR NO KEY UPDATE followed by a CTE upsert/delete).
- * Uses RowExclusiveLock, allowing concurrent reads and concurrent writes
- * to non-overlapping rows. Overlapping writes are serialized by row locks.
+ * 1. Full rebuild (no options).  Creates a new heap, populates it, and swaps
+ * relfilenumbers under AccessExclusiveLock.  The OID of the original
+ * materialized view is preserved, so we do not lose GRANT nor references to
+ * this materialized view.
  *
- * 2. Full concurrent refresh (CONCURRENTLY, no WHERE clause):
- * Creates a temporary table with new data, computes a diff against
- * the existing matview, and applies changes. Uses ExclusiveLock,
- * allowing concurrent reads throughout the operation but blocking all
- * concurrent writes.
+ * 2. Full concurrent refresh (CONCURRENTLY).  Computes the new contents into a
+ * temporary table, diffs that against the matview and applies the difference,
+ * under ExclusiveLock.  Readers are not blocked; writers are.
  *
- * 3. Full rebuild (default, no WHERE, no CONCURRENTLY):
- * Creates a new heap, populates it, and swaps relfilenumbers.
- * Uses AccessExclusiveLock, blocking all concurrent access.
- * The OID of the original materialized view is preserved, so we
- * do not lose GRANT nor references to this materialized view.
+ * 3. Partial refresh (CONCURRENTLY with a WHERE clause).  Modifies in place
+ * only the rows the clause selects, under RowExclusiveLock.  See
+ * refresh_by_direct_modification().
  *
  * If skipData is true, this is effectively like a TRUNCATE; otherwise it is
  * like a TRUNCATE followed by an INSERT using the SELECT statement associated
@@ -1012,7 +1004,7 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 				 errmsg("\"%s\" is not a materialized view",
 						RelationGetRelationName(matviewRel))));
 
-	/* Check that CONCURRENTLY is not specified if not populated. */
+	/* Check that conflicting options have not been specified. */
 	if (concurrent && !RelationIsPopulated(matviewRel))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1062,42 +1054,26 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 										   save_userid);
 
 		/*
-		 * Every consumer of the predicate reads it from here down, so this is
-		 * the one place the substitution has to happen: the source query
-		 * executes this tree, the plan cache keys on it, and both generated
-		 * statements are deparsed from it.  Rewriting it for one and not the
-		 * others would leave them disagreeing about which rows are selected.
+		 * Substitute here, before anything reads the predicate.  The source
+		 * query, the plan cache key and both generated statements all come
+		 * from this tree, and they must not disagree about it.
 		 */
 		qual = parameterizeRefreshWhereClause(qual, &params);
 	}
 
-	/* The grammar rejects a predicate without CONCURRENTLY. */
-	Assert(!qual || concurrent);
-
 	/*
-	 * The predicate is deliberately not deparsed here.  The only consumer of
-	 * the text is refresh_by_direct_modification(), and only when it is
-	 * building plans.  Deparsing up front would charge every refresh for
-	 * something a cached one throws away.
+	 * The grammar rejects a predicate without CONCURRENTLY, and the checks
+	 * below rely on it: the unique-index count that a partial refresh needs is
+	 * only taken under "concurrent".
 	 */
+	Assert(!qual || concurrent);
 
 	/*
 	 * Check that there is a unique index with no WHERE clause on one or more
 	 * columns of the materialized view if CONCURRENTLY is specified.
 	 *
-	 * We count the unique indexes as well, because a partial refresh needs that
-	 * index to be the only one.  We apply changes with ON CONFLICT against a
-	 * single arbiter index, one row at a time, and every row written must
-	 * satisfy every unique index the moment we write it.  We cannot express a
-	 * change that needs one row deleted before another can be inserted, such as
-	 * two rows swapping their values on a unique index that is not the arbiter,
-	 * and no choice of arbiter helps: whichever index arbitrates, the swap
-	 * collides on the other one.
-	 *
-	 * With exactly one unique index the collision is impossible rather than
-	 * unlikely, and that covers the overwhelming majority of matviews.  We
-	 * count partial and expression unique indexes too, even though they cannot
-	 * arbitrate, because a write still has to satisfy them.
+	 * Count them too: a partial refresh requires there to be exactly one, for
+	 * the reason given at the check below.
 	 */
 	if (concurrent)
 	{
@@ -1116,7 +1092,7 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 			indexRel = index_open(indexoid, AccessShareLock);
 			indexStruct = indexRel->rd_index;
 
-			/* Anything unique and enforced constrains what the upsert writes. */
+			/* Count every unique index the upsert would have to satisfy. */
 			if (indexStruct->indisunique && indexStruct->indisvalid &&
 				indexStruct->indimmediate)
 				nUniqueIndexes++;
@@ -1137,10 +1113,15 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 					 errhint("Create a unique index with no WHERE clause on one or more columns of the materialized view.")));
 
 		/*
-		 * Lifting this needs the upsert to delete before it inserts, which ON
-		 * CONFLICT cannot do.  A full refresh has no such limit, since it
-		 * rewrites the whole matview and never has to reconcile a new row
-		 * against one it is not replacing.
+		 * A partial refresh applies its changes with ON CONFLICT against one
+		 * arbiter index, a row at a time, and each row must satisfy every
+		 * unique index as we write it.  Two rows exchanging their values on a
+		 * second unique index would need one deleted before the other is
+		 * inserted, which ON CONFLICT cannot do, and no choice of arbiter
+		 * helps: whichever index arbitrates, the exchange collides on the
+		 * other.  A full refresh is unaffected, since it rewrites the whole
+		 * matview and never reconciles a new row against one it is not
+		 * replacing.
 		 */
 		if (qual && nUniqueIndexes > 1)
 			ereport(ERROR,
