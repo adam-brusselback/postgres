@@ -124,6 +124,27 @@ typedef struct MatViewPartialRefreshCache
 
 } MatViewPartialRefreshCache;
 
+/*
+ * Working state for parameterizeRefreshWhereClause().
+ */
+typedef struct RefreshParamizeContext
+{
+	int			nextparam;		/* paramid last handed out */
+	List	   *consts;			/* the Consts replaced, in paramid order */
+} RefreshParamizeContext;
+
+/*
+ * Names that the SQL from refresh_by_direct_modification() gives to the two
+ * relations it reads.
+ *
+ * MATVIEW_ALIAS is also what we deparse the predicate against, so the deparse
+ * and the statements agree.  Both halves of the fused statement read
+ * MATVIEW_SOURCE_ENR_NAME and both get the same tuplestore, so they cannot
+ * disagree about which rows the view produces.
+ */
+#define MATVIEW_SOURCE_ENR_NAME	"new_data"
+#define MATVIEW_ALIAS			"mv"
+
 static HTAB *MatViewRefreshCache = NULL;
 
 /*
@@ -1243,18 +1264,6 @@ transformRefreshWhereClause(Oid relid, Node *whereClause, ParamListInfo params,
 }
 
 /*
- * Names that the SQL from refresh_by_direct_modification() gives to the two
- * relations it reads.
- *
- * MATVIEW_ALIAS is also what we deparse the predicate against, so the deparse
- * and the statements agree.  Both halves of the fused statement read
- * MATVIEW_SOURCE_ENR_NAME and both get the same tuplestore, so they cannot
- * disagree about which rows the view produces.
- */
-#define MATVIEW_SOURCE_ENR_NAME	"new_data"
-#define MATVIEW_ALIAS			"mv"
-
-/*
  * Render an analyzed WHERE clause back to text, for the statements SPI builds.
  *
  * We must name the matview the way those statements do, which is
@@ -1271,15 +1280,6 @@ deparseRefreshWhereClause(Oid relid, Node *whereClause)
 
 	return deparse_expression(whereClause, dpcontext, false, false);
 }
-
-/*
- * Working state for parameterizeRefreshWhereClause().
- */
-typedef struct RefreshParamizeContext
-{
-	int			nextparam;		/* paramid last handed out */
-	List	   *consts;			/* the Consts replaced, in paramid order */
-} RefreshParamizeContext;
 
 /*
  * May this Const become a Param?
@@ -1838,8 +1838,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 	 * a different object or none at all.  The tree would then drive the
 	 * source while the stale text drives the pre-lock and the prune, over
 	 * different rows.  So we ask plancache whether its plan is still good,
-	 * and rebuild from a fresh deparse when it is not.
-	 * ri_FetchPreparedPlan() does the same thing for the same reason.
+	 * and rebuild from a fresh deparse when it is not. ri_FetchPreparedPlan()
+	 * does the same thing for the same reason.
 	 */
 	reuse = (found &&
 			 cacheEntry->uniqueIndexOid == uniqueIndexOid &&
