@@ -1059,11 +1059,12 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	}
 
 	/*
-	 * The grammar rejects a predicate without CONCURRENTLY, and the checks
-	 * below rely on that.  The unique-index count a partial refresh needs is
-	 * only taken under "concurrent".
+	 * The grammar rejects a predicate without CONCURRENTLY, and rejects one
+	 * with WITH NO DATA.  The code below relies on both.  The unique-index
+	 * count a partial refresh needs is only taken under "concurrent", and the
+	 * dispatch tests only for a predicate.
 	 */
-	Assert(!qual || concurrent);
+	Assert(!qual || (concurrent && !skipData));
 
 	/*
 	 * Check that there is a unique index with no WHERE clause on one or more
@@ -1156,14 +1157,9 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	/*
 	 * A predicate selects direct modification, which is the only algorithm
 	 * that can apply a change without rewriting rows the predicate does not
-	 * name.  We measured diff/merge against it across scopes from a small
-	 * fraction of the matview up to nearly all of it.  It was slower at every
-	 * point, and the margin widened as the scope grew.
-	 *
-	 * (WITH NO DATA is rejected together with a WHERE clause long before
-	 * here, so the !skipData test is redundant.)
+	 * name.
 	 */
-	if (qual && !skipData)
+	if (qual)
 	{
 		processed = refresh_by_direct_modification(matviewOid, relowner,
 												  save_userid, save_sec_context,
