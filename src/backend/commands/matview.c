@@ -967,8 +967,11 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	RewriteRule *rule;
 	List	   *actions;
 	Query	   *dataQuery;
+	Oid			tableSpace;
 	Oid			relowner;
+	Oid			OIDNewHeap;
 	uint64		processed = 0;
+	char		relpersistence;
 	Oid			save_userid;
 	int			save_sec_context;
 	int			save_nestlevel;
@@ -1151,8 +1154,6 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	SetMatViewPopulatedState(matviewRel, !skipData);
 
 	/*
-	 * STRATEGY 1: PARTIAL REFRESH.
-	 *
 	 * A predicate selects direct modification, which is the only algorithm
 	 * that can apply a change without rewriting rows the predicate does not
 	 * name.  We measured diff/merge against it across scopes from a small
@@ -1165,39 +1166,33 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	if (qual && !skipData)
 	{
 		processed = refresh_by_direct_modification(matviewOid, relowner,
-												   save_userid, save_sec_context,
-												   dataQuery, qual, queryString,
-												   params);
+												  save_userid, save_sec_context,
+												  dataQuery, qual, queryString,
+												  params);
 	}
-
-	/*
-	 * STRATEGY 2: FULL CONCURRENT REFRESH
-	 */
-	else if (concurrent)
+	else
 	{
-		Oid			tableSpace;
-		char		relpersistence;
-		Oid			OIDNewHeap;
-		int			old_depth = matview_maintenance_depth;
-		Oid			old_relid = matview_maintenance_relid;
+		/* Concurrent refresh builds new data in temp tablespace, and does diff. */
+		if (concurrent)
+		{
+			tableSpace = GetDefaultTablespace(RELPERSISTENCE_TEMP, false);
+			relpersistence = RELPERSISTENCE_TEMP;
+		}
+		else
+		{
+			tableSpace = matviewRel->rd_rel->reltablespace;
+			relpersistence = matviewRel->rd_rel->relpersistence;
+		}
 
 		/*
-		 * Concurrent refresh builds new data in temp tablespace, and does
-		 * diff.
-		 */
-		tableSpace = GetDefaultTablespace(RELPERSISTENCE_TEMP, false);
-		relpersistence = RELPERSISTENCE_TEMP;
-
-		/*
-		 * Create the transient table that will receive the regenerated data.
-		 * Lock it against access by any other process until commit (by which
-		 * time it will be gone).
+		 * Create the transient table that will receive the regenerated data. Lock
+		 * it against access by any other process until commit (by which time it
+		 * will be gone).
 		 */
 		OIDNewHeap = make_new_heap(matviewOid, tableSpace,
 								   matviewRel->rd_rel->relam,
 								   relpersistence, ExclusiveLock);
-		Assert(CheckRelationOidLockedByMe(OIDNewHeap, AccessExclusiveLock,
-										  false));
+		Assert(CheckRelationOidLockedByMe(OIDNewHeap, AccessExclusiveLock, false));
 
 		/* Generate the data, if wanted. */
 		if (!skipData)
@@ -1205,67 +1200,44 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 			DestReceiver *dest;
 
 			dest = CreateTransientRelDestReceiver(OIDNewHeap);
-			processed = refresh_matview_datafill(dest, dataQuery, queryString, is_create);
+			processed = refresh_matview_datafill(dest, dataQuery, queryString,
+												 is_create);
 		}
 
-		PG_TRY();
+		/* Make the matview match the newly generated data. */
+		if (concurrent)
 		{
-			refresh_by_match_merge(matviewOid, OIDNewHeap, relowner,
-								   save_sec_context);
+			int			old_depth = matview_maintenance_depth;
+			Oid			old_relid = matview_maintenance_relid;
+
+			PG_TRY();
+			{
+				refresh_by_match_merge(matviewOid, OIDNewHeap, relowner,
+									   save_sec_context);
+			}
+			PG_CATCH();
+			{
+				matview_maintenance_depth = old_depth;
+				matview_maintenance_relid = old_relid;
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+			Assert(matview_maintenance_depth == old_depth);
 		}
-		PG_CATCH();
+		else
 		{
-			matview_maintenance_depth = old_depth;
-			matview_maintenance_relid = old_relid;
-			PG_RE_THROW();
+			refresh_by_heap_swap(matviewOid, OIDNewHeap, relpersistence);
+
+			/*
+			 * Inform cumulative stats system about our activity: basically, we
+			 * truncated the matview and inserted some new data.  (The concurrent
+			 * code path above doesn't need to worry about this because the
+			 * inserts and deletes it issues get counted by lower-level code.)
+			 */
+			pgstat_count_truncate(matviewRel);
+			if (!skipData)
+				pgstat_count_heap_insert(matviewRel, processed);
 		}
-		PG_END_TRY();
-
-		Assert(matview_maintenance_depth == old_depth);
-	}
-
-	/*
-	 * STRATEGY 3: FULL REBUILD
-	 */
-	else
-	{
-		Oid			tableSpace;
-		char		relpersistence;
-		Oid			OIDNewHeap;
-
-		tableSpace = matviewRel->rd_rel->reltablespace;
-		relpersistence = matviewRel->rd_rel->relpersistence;
-
-		/*
-		 * Create the transient table that will receive the regenerated data.
-		 * Lock it against access by any other process until commit (by which
-		 * time it will be gone).
-		 */
-		OIDNewHeap = make_new_heap(matviewOid, tableSpace,
-								   matviewRel->rd_rel->relam,
-								   relpersistence, ExclusiveLock);
-		Assert(CheckRelationOidLockedByMe(OIDNewHeap, AccessExclusiveLock,
-										  false));
-
-		if (!skipData)
-		{
-			DestReceiver *dest;
-
-			dest = CreateTransientRelDestReceiver(OIDNewHeap);
-			processed = refresh_matview_datafill(dest, dataQuery, queryString, is_create);
-		}
-
-		refresh_by_heap_swap(matviewOid, OIDNewHeap, relpersistence);
-
-		/*
-		 * Inform cumulative stats system about our activity: basically, we
-		 * truncated the matview and inserted some new data.  (The concurrent
-		 * code path above doesn't need to worry about this because the
-		 * inserts and deletes it issues get counted by lower-level code.)
-		 */
-		pgstat_count_truncate(matviewRel);
-		if (!skipData)
-			pgstat_count_heap_insert(matviewRel, processed);
 	}
 
 	table_close(matviewRel, NoLock);
