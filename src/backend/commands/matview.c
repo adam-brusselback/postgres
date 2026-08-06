@@ -173,6 +173,7 @@ static uint64 refresh_by_direct_modification(Oid matviewOid, Oid relowner,
 											 Oid callerId,
 											 int save_sec_context,
 											 Query *dataQuery, Node *qual,
+											 Oid uniqueIndexOid,
 											 const char *queryString,
 											 ParamListInfo params);
 static void refresh_by_heap_swap(Oid matviewOid, Oid OIDNewHeap, char relpersistence);
@@ -353,6 +354,7 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	ObjectAddress address;
 	Node	   *qual = NULL;
 	int			nUniqueIndexes = 0;
+	Oid			uniqueIndexOid = InvalidOid;
 
 	matviewRel = table_open(matviewOid, NoLock);
 	relowner = matviewRel->rd_rel->relowner;
@@ -452,7 +454,6 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	{
 		List	   *indexoidlist = RelationGetIndexList(matviewRel);
 		ListCell   *indexoidscan;
-		bool		hasUniqueIndex = false;
 
 		Assert(!is_create);
 
@@ -470,14 +471,14 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 				indexStruct->indimmediate)
 				nUniqueIndexes++;
 
-			if (!hasUniqueIndex)
-				hasUniqueIndex = is_usable_unique_index(indexRel);
+			if (!OidIsValid(uniqueIndexOid) && is_usable_unique_index(indexRel))
+				uniqueIndexOid = indexoid;
 			index_close(indexRel, AccessShareLock);
 		}
 
 		list_free(indexoidlist);
 
-		if (!hasUniqueIndex)
+		if (!OidIsValid(uniqueIndexOid))
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("cannot refresh materialized view \"%s\" concurrently",
@@ -537,8 +538,8 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	{
 		processed = refresh_by_direct_modification(matviewOid, relowner,
 												   save_userid, save_sec_context,
-												   dataQuery, qual, queryString,
-												   params);
+												   dataQuery, qual, uniqueIndexOid,
+												   queryString, params);
 	}
 	else
 	{
@@ -1747,13 +1748,10 @@ matview_materialize_source(CachedPlanSource *plansource, ParamListInfo params,
 static uint64
 refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 							   int save_sec_context, Query *dataQuery,
-							   Node *qual, const char *queryString,
-							   ParamListInfo params)
+							   Node *qual, Oid uniqueIndexOid,
+							   const char *queryString, ParamListInfo params)
 {
 	Relation	matviewRel;
-	Oid			uniqueIndexOid = InvalidOid;
-	List	   *indexoidlist;
-	ListCell   *lc;
 	MatViewPartialRefreshCache *cacheEntry;
 	MatViewPartialRefreshCache localEntry;
 	bool		use_cache;
@@ -1768,31 +1766,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 
 	matviewRel = table_open(matviewOid, NoLock);
 
-	indexoidlist = RelationGetIndexList(matviewRel);
-	foreach(lc, indexoidlist)
-	{
-		Oid			indexoid = lfirst_oid(lc);
-		Relation	indexRel;
-		bool		usable;
-
-		indexRel = index_open(indexoid, AccessShareLock);
-		usable = is_usable_unique_index(indexRel);
-		index_close(indexRel, AccessShareLock);
-
-		if (usable)
-		{
-			uniqueIndexOid = indexoid;
-			break;
-		}
-	}
-	list_free(indexoidlist);
-
-	if (!OidIsValid(uniqueIndexOid))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("cannot perform partial refresh on materialized view \"%s\"",
-						RelationGetRelationName(matviewRel)),
-				 errdetail("Partial refresh requires a usable unique index to perform an UPSERT operation.")));
+	/* RefreshMatViewByOid() picked this out for us, under the same locks. */
+	Assert(OidIsValid(uniqueIndexOid));
 
 	/*
 	 * We use the session cache only at the outermost level.  A predicate
