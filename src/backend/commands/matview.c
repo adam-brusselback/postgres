@@ -172,6 +172,24 @@ static void refresh_qual_permission_error(Relation matviewRel,
 										  RefreshQualContext *ctx);
 static bool matview_argtypes_match(MatViewPartialRefreshCache *entry,
 								   ParamListInfo params);
+static Node *refresh_paramref_hook(ParseState *pstate, ParamRef *pref);
+static bool non_leakproof_checker(Oid func_id, void *context);
+static bool refresh_caller_may_select(Oid relid, RTEPermissionInfo *perminfo,
+									 Oid callerId);
+static void refresh_where_clause_error_callback(void *arg);
+static Node *transformRefreshWhereClause(Oid relid, Node *whereClause,
+										 ParamListInfo params, Oid callerId);
+static char *deparseRefreshWhereClause(Oid relid, Node *whereClause);
+static bool refresh_const_is_paramizable(Const *con);
+static Node *paramize_refresh_consts_mutator(Node *node, void *context);
+static Node *parameterizeRefreshWhereClause(Node *qual, ParamListInfo *params);
+static Query *matview_build_source_query(Relation matviewRel, Query *dataQuery,
+										 Node *qual, int nkeyatts,
+										 const int16 *keyattnums);
+static double matview_materialize_source(CachedPlanSource *plansource,
+										 ParamListInfo params,
+										 Snapshot snapshot,
+										 Tuplestorestate *tupstore);
 
 /*
  * SetMatViewPopulatedState
@@ -220,6 +238,548 @@ SetMatViewPopulatedState(Relation relation, bool newstate)
 	 * visible.
 	 */
 	CommandCounterIncrement();
+}
+
+/*
+ * ExecRefreshMatView -- execute a REFRESH MATERIALIZED VIEW command
+ *
+ * Takes the lock the statement needs and hands off to RefreshMatViewByOid(),
+ * which chooses the refresh strategy.  The statement node's skipData field
+ * shows whether WITH NO DATA was used.
+ */
+ObjectAddress
+ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
+				   ParamListInfo params, QueryCompletion *qc)
+{
+	Oid			matviewOid;
+	LOCKMODE	lockmode;
+
+	/*
+	 * Determine strength of lock needed.  A partial refresh modifies rows in
+	 * place and serializes on its own row locks.  RowExclusiveLock is enough.
+	 */
+	if (stmt->whereClause)
+		lockmode = RowExclusiveLock;
+	else if (stmt->concurrent)
+		lockmode = ExclusiveLock;
+	else
+		lockmode = AccessExclusiveLock;
+
+	/*
+	 * Get a lock until end of transaction.
+	 */
+	matviewOid = RangeVarGetRelidExtended(stmt->relation,
+										  lockmode, 0,
+										  RangeVarCallbackMaintainsTable,
+										  NULL);
+
+	return RefreshMatViewByOid(matviewOid, false, stmt->skipData,
+							   stmt->concurrent, stmt->whereClause,
+							   queryString, params, qc);
+}
+
+/*
+ * RefreshMatViewByOid -- refresh materialized view by OID
+ *
+ * This refreshes a materialized view using one of three strategies, numbered
+ * below as the code tests for them:
+ *
+ * 1. Partial refresh (CONCURRENTLY with a WHERE clause).  Modifies in place
+ * only the rows the clause selects, under RowExclusiveLock.  See
+ * refresh_by_direct_modification().
+ *
+ * 2. Full concurrent refresh (CONCURRENTLY).  Computes the new contents into a
+ * temporary table, diffs that against the matview and applies the difference,
+ * under ExclusiveLock.  Readers are not blocked, but writers are.
+ *
+ * 3. Full rebuild (no options).  Creates a new heap, populates it, and swaps
+ * relfilenumbers under AccessExclusiveLock.  The OID of the original
+ * materialized view is preserved, so we do not lose GRANT nor references to
+ * this materialized view.
+ *
+ * If skipData is true, this is effectively like a TRUNCATE; otherwise it is
+ * like a TRUNCATE followed by an INSERT using the SELECT statement associated
+ * with the materialized view.
+ *
+ * For full rebuild, indexes are rebuilt too, via REINDEX.  Since we are
+ * effectively bulk-loading the new heap, it's better to create the indexes
+ * afterwards than to fill them incrementally while we load.
+ *
+ * The matview's "populated" state is changed based on whether the contents
+ * reflect the result set of the materialized view's query.
+ *
+ * This is also used to populate the materialized view created by CREATE
+ * MATERIALIZED VIEW command.
+ */
+ObjectAddress
+RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
+					bool concurrent, Node *whereClause,
+					const char *queryString, ParamListInfo params,
+					QueryCompletion *qc)
+{
+	Relation	matviewRel;
+	RewriteRule *rule;
+	List	   *actions;
+	Query	   *dataQuery;
+	Oid			tableSpace;
+	Oid			relowner;
+	Oid			OIDNewHeap;
+	uint64		processed = 0;
+	char		relpersistence;
+	Oid			save_userid;
+	int			save_sec_context;
+	int			save_nestlevel;
+	ObjectAddress address;
+	Node	   *qual = NULL;
+	int			nUniqueIndexes = 0;
+
+	matviewRel = table_open(matviewOid, NoLock);
+	relowner = matviewRel->rd_rel->relowner;
+
+	/*
+	 * Switch to the owner's userid, so that any functions are run as that
+	 * user.  Also lock down security-restricted operations and arrange to
+	 * make GUC variable changes local to this command.
+	 */
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	SetUserIdAndSecContext(relowner,
+						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+	save_nestlevel = NewGUCNestLevel();
+	RestrictSearchPath();
+
+	/* Make sure it is a materialized view. */
+	if (matviewRel->rd_rel->relkind != RELKIND_MATVIEW)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("\"%s\" is not a materialized view",
+						RelationGetRelationName(matviewRel))));
+
+	/* Check that CONCURRENTLY is not specified if not populated. */
+	if (concurrent && !RelationIsPopulated(matviewRel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("CONCURRENTLY cannot be used when the materialized view is not populated")));
+
+	if (whereClause && !RelationIsPopulated(matviewRel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("WHERE clause cannot be used when the materialized view is not populated")));
+
+	/* Check that conflicting options have not been specified. */
+	if (concurrent && skipData)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("%s options %s and %s cannot be used together",
+						"REFRESH", "CONCURRENTLY", "WITH NO DATA")));
+
+	/*
+	 * Check that everything is correct for a refresh. Problems at this point
+	 * are internal errors, so elog is sufficient.
+	 */
+	if (matviewRel->rd_rel->relhasrules == false ||
+		matviewRel->rd_rules->numLocks < 1)
+		elog(ERROR,
+			 "materialized view \"%s\" is missing rewrite information",
+			 RelationGetRelationName(matviewRel));
+
+	if (matviewRel->rd_rules->numLocks > 1)
+		elog(ERROR,
+			 "materialized view \"%s\" has too many rules",
+			 RelationGetRelationName(matviewRel));
+
+	rule = matviewRel->rd_rules->rules[0];
+	if (rule->event != CMD_SELECT || !(rule->isInstead))
+		elog(ERROR,
+			 "the rule for materialized view \"%s\" is not a SELECT INSTEAD OF rule",
+			 RelationGetRelationName(matviewRel));
+
+	actions = rule->actions;
+	if (list_length(actions) != 1)
+		elog(ERROR,
+			 "the rule for materialized view \"%s\" is not a single action",
+			 RelationGetRelationName(matviewRel));
+
+	if (whereClause)
+	{
+		qual = transformRefreshWhereClause(matviewOid, whereClause, params,
+										   save_userid);
+
+		/*
+		 * Substitute here, before anything reads the predicate.  The source
+		 * query, the plan cache key and both generated statements all come
+		 * from this tree, and they must not disagree about it.
+		 */
+		qual = parameterizeRefreshWhereClause(qual, &params);
+	}
+
+	/*
+	 * The grammar rejects a predicate without CONCURRENTLY, and rejects one
+	 * with WITH NO DATA.  The code below relies on both.  The unique-index
+	 * count a partial refresh needs is only taken under "concurrent", and the
+	 * dispatch tests only for a predicate.
+	 */
+	Assert(!qual || (concurrent && !skipData));
+
+	/*
+	 * Check that there is a unique index with no WHERE clause on one or more
+	 * columns of the materialized view if CONCURRENTLY is specified.
+	 *
+	 * Count them too, since a partial refresh requires there to be exactly
+	 * one.  The reason is given at the check below.
+	 */
+	if (concurrent)
+	{
+		List	   *indexoidlist = RelationGetIndexList(matviewRel);
+		ListCell   *indexoidscan;
+		bool		hasUniqueIndex = false;
+
+		Assert(!is_create);
+
+		foreach(indexoidscan, indexoidlist)
+		{
+			Oid			indexoid = lfirst_oid(indexoidscan);
+			Relation	indexRel;
+			Form_pg_index indexStruct;
+
+			indexRel = index_open(indexoid, AccessShareLock);
+			indexStruct = indexRel->rd_index;
+
+			/* Count every unique index the upsert would have to satisfy. */
+			if (indexStruct->indisunique && indexStruct->indisvalid &&
+				indexStruct->indimmediate)
+				nUniqueIndexes++;
+
+			if (!hasUniqueIndex)
+				hasUniqueIndex = is_usable_unique_index(indexRel);
+			index_close(indexRel, AccessShareLock);
+		}
+
+		list_free(indexoidlist);
+
+		if (!hasUniqueIndex)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot refresh materialized view \"%s\" concurrently",
+							quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
+													   RelationGetRelationName(matviewRel))),
+					 errhint("Create a unique index with no WHERE clause on one or more columns of the materialized view.")));
+
+		/*
+		 * A partial refresh applies its changes with ON CONFLICT against one
+		 * arbiter index, a row at a time.  Each row must satisfy every unique
+		 * index as we write it.  Two rows exchanging their values on a
+		 * second unique index would need one deleted before the other is
+		 * inserted, which ON CONFLICT cannot do.  No choice of arbiter helps,
+		 * since whichever index arbitrates, the exchange collides on the
+		 * other.  A full refresh is unaffected, since it rewrites the whole
+		 * matview and never reconciles a new row against one it is not
+		 * replacing.
+		 */
+		if (qual && nUniqueIndexes > 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot refresh materialized view \"%s\" with a WHERE clause",
+							quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
+													   RelationGetRelationName(matviewRel))),
+					 errdetail("A partial refresh applies its changes against a single unique index, and the materialized view has more than one."),
+					 errhint("Refresh the materialized view without a WHERE clause.")));
+	}
+
+	/*
+	 * The stored query was rewritten at the time of the MV definition, but
+	 * has not been scribbled on by the planner.
+	 */
+	dataQuery = linitial_node(Query, actions);
+
+	/*
+	 * Check for active uses of the relation in the current transaction, such
+	 * as open scans.
+	 *
+	 * NB: We count on this to protect us against problems with refreshing the
+	 * data using TABLE_INSERT_FROZEN.
+	 */
+	CheckTableNotInUse(matviewRel,
+					   is_create ? "CREATE MATERIALIZED VIEW" :
+					   "REFRESH MATERIALIZED VIEW");
+
+	/*
+	 * Tentatively mark the matview as populated or not (this will roll back
+	 * if we fail later).
+	 */
+	SetMatViewPopulatedState(matviewRel, !skipData);
+
+	/*
+	 * A predicate selects direct modification, which is the only algorithm
+	 * that can apply a change without rewriting rows the predicate does not
+	 * name.
+	 */
+	if (qual)
+	{
+		processed = refresh_by_direct_modification(matviewOid, relowner,
+												  save_userid, save_sec_context,
+												  dataQuery, qual, queryString,
+												  params);
+	}
+	else
+	{
+		/* Concurrent refresh builds new data in temp tablespace, and does diff. */
+		if (concurrent)
+		{
+			tableSpace = GetDefaultTablespace(RELPERSISTENCE_TEMP, false);
+			relpersistence = RELPERSISTENCE_TEMP;
+		}
+		else
+		{
+			tableSpace = matviewRel->rd_rel->reltablespace;
+			relpersistence = matviewRel->rd_rel->relpersistence;
+		}
+
+		/*
+		 * Create the transient table that will receive the regenerated data. Lock
+		 * it against access by any other process until commit (by which time it
+		 * will be gone).
+		 */
+		OIDNewHeap = make_new_heap(matviewOid, tableSpace,
+								   matviewRel->rd_rel->relam,
+								   relpersistence, ExclusiveLock);
+		Assert(CheckRelationOidLockedByMe(OIDNewHeap, AccessExclusiveLock, false));
+
+		/* Generate the data, if wanted. */
+		if (!skipData)
+		{
+			DestReceiver *dest;
+
+			dest = CreateTransientRelDestReceiver(OIDNewHeap);
+			processed = refresh_matview_datafill(dest, dataQuery, queryString,
+												 is_create);
+		}
+
+		/* Make the matview match the newly generated data. */
+		if (concurrent)
+		{
+			int			old_depth = matview_maintenance_depth;
+			Oid			old_relid = matview_maintenance_relid;
+
+			PG_TRY();
+			{
+				refresh_by_match_merge(matviewOid, OIDNewHeap, relowner,
+									   save_sec_context);
+			}
+			PG_CATCH();
+			{
+				matview_maintenance_depth = old_depth;
+				matview_maintenance_relid = old_relid;
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+			Assert(matview_maintenance_depth == old_depth);
+		}
+		else
+		{
+			refresh_by_heap_swap(matviewOid, OIDNewHeap, relpersistence);
+
+			/*
+			 * Inform cumulative stats system about our activity: basically, we
+			 * truncated the matview and inserted some new data.  (The concurrent
+			 * code path above doesn't need to worry about this because the
+			 * inserts and deletes it issues get counted by lower-level code.)
+			 */
+			pgstat_count_truncate(matviewRel);
+			if (!skipData)
+				pgstat_count_heap_insert(matviewRel, processed);
+		}
+	}
+
+	table_close(matviewRel, NoLock);
+
+	/* Roll back any GUC changes */
+	AtEOXact_GUC(false, save_nestlevel);
+
+	/* Restore userid and security context */
+	SetUserIdAndSecContext(save_userid, save_sec_context);
+
+	ObjectAddressSet(address, RelationRelationId, matviewOid);
+
+	/*
+	 * Save the rowcount so that pg_stat_statements can track the total number
+	 * of rows processed by REFRESH MATERIALIZED VIEW command. Note that we
+	 * still don't display the rowcount in the command completion tag output,
+	 * i.e., the display_rowcount flag of CMDTAG_REFRESH_MATERIALIZED_VIEW
+	 * command tag is left false in cmdtaglist.h. Otherwise, the change of
+	 * completion tag output might break applications using it.
+	 *
+	 * When called from CREATE MATERIALIZED VIEW command, the rowcount is
+	 * displayed with the command tag CMDTAG_SELECT.
+	 */
+	if (qc)
+		SetQueryCompletion(qc,
+						   is_create ? CMDTAG_SELECT : CMDTAG_REFRESH_MATERIALIZED_VIEW,
+						   processed);
+
+	return address;
+}
+
+/*
+ * refresh_matview_datafill
+ *
+ * Execute the given query, sending result rows to "dest" (which will
+ * insert them into the target matview).
+ *
+ * Returns number of rows inserted.
+ */
+static uint64
+refresh_matview_datafill(DestReceiver *dest, Query *query,
+						 const char *queryString, bool is_create)
+{
+	List	   *rewritten;
+	PlannedStmt *plan;
+	QueryDesc  *queryDesc;
+	Query	   *copied_query;
+	uint64		processed;
+
+	/* Lock and rewrite, using a copy to preserve the original query. */
+	copied_query = copyObject(query);
+	AcquireRewriteLocks(copied_query, true, false);
+	rewritten = QueryRewrite(copied_query);
+
+	/* SELECT should never rewrite to more or less than one SELECT query */
+	if (list_length(rewritten) != 1)
+		elog(ERROR, "unexpected rewrite result for %s",
+			 is_create ? "CREATE MATERIALIZED VIEW " : "REFRESH MATERIALIZED VIEW");
+	query = (Query *) linitial(rewritten);
+
+	/* Check for user-requested abort. */
+	CHECK_FOR_INTERRUPTS();
+
+	/* Plan the query which will generate data for the refresh. */
+	plan = pg_plan_query(query, queryString, CURSOR_OPT_PARALLEL_OK, NULL, NULL);
+
+	/*
+	 * Use a snapshot with an updated command ID to ensure this query sees
+	 * results of any previously executed queries.  (This could only matter if
+	 * the planner executed an allegedly-stable function that changed the
+	 * database contents, but let's do it anyway to be safe.)
+	 */
+	PushCopiedSnapshot(GetActiveSnapshot());
+	UpdateActiveSnapshotCommandId();
+
+	/* Create a QueryDesc, redirecting output to our tuple receiver */
+	queryDesc = CreateQueryDesc(plan, queryString,
+								GetActiveSnapshot(), InvalidSnapshot,
+								dest, NULL, NULL, 0);
+
+	/* call ExecutorStart to prepare the plan for execution */
+	ExecutorStart(queryDesc, 0);
+
+	/* run the plan */
+	ExecutorRun(queryDesc, ForwardScanDirection, 0);
+
+	processed = queryDesc->estate->es_processed;
+
+	/* and clean up */
+	ExecutorFinish(queryDesc);
+	ExecutorEnd(queryDesc);
+
+	FreeQueryDesc(queryDesc);
+
+	PopActiveSnapshot();
+
+	return processed;
+}
+
+DestReceiver *
+CreateTransientRelDestReceiver(Oid transientoid)
+{
+	DR_transientrel *self = palloc0_object(DR_transientrel);
+
+	self->pub.receiveSlot = transientrel_receive;
+	self->pub.rStartup = transientrel_startup;
+	self->pub.rShutdown = transientrel_shutdown;
+	self->pub.rDestroy = transientrel_destroy;
+	self->pub.mydest = DestTransientRel;
+	self->transientoid = transientoid;
+
+	return (DestReceiver *) self;
+}
+
+/*
+ * transientrel_startup --- executor startup
+ */
+static void
+transientrel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
+{
+	DR_transientrel *myState = (DR_transientrel *) self;
+	Relation	transientrel;
+
+	transientrel = table_open(myState->transientoid, NoLock);
+
+	/*
+	 * Fill private fields of myState for use by later routines
+	 */
+	myState->transientrel = transientrel;
+	myState->output_cid = GetCurrentCommandId(true);
+	myState->ti_options = TABLE_INSERT_SKIP_FSM | TABLE_INSERT_FROZEN;
+	myState->bistate = GetBulkInsertState();
+
+	/*
+	 * Valid smgr_targblock implies something already wrote to the relation.
+	 * This may be harmless, but this function hasn't planned for it.
+	 */
+	Assert(RelationGetTargetBlock(transientrel) == InvalidBlockNumber);
+}
+
+/*
+ * transientrel_receive --- receive one tuple
+ */
+static bool
+transientrel_receive(TupleTableSlot *slot, DestReceiver *self)
+{
+	DR_transientrel *myState = (DR_transientrel *) self;
+
+	/*
+	 * Note that the input slot might not be of the type of the target
+	 * relation. That's supported by table_tuple_insert(), but slightly less
+	 * efficient than inserting with the right slot - but the alternative
+	 * would be to copy into a slot of the right type, which would not be
+	 * cheap either. This also doesn't allow accessing per-AM data (say a
+	 * tuple's xmin), but since we don't do that here...
+	 */
+
+	table_tuple_insert(myState->transientrel,
+					   slot,
+					   myState->output_cid,
+					   myState->ti_options,
+					   myState->bistate);
+
+	/* We know this is a newly created relation, so there are no indexes */
+
+	return true;
+}
+
+/*
+ * transientrel_shutdown --- executor end
+ */
+static void
+transientrel_shutdown(DestReceiver *self)
+{
+	DR_transientrel *myState = (DR_transientrel *) self;
+
+	FreeBulkInsertState(myState->bistate);
+
+	table_finish_bulk_insert(myState->transientrel, myState->ti_options);
+
+	/* close transientrel, but keep lock until commit */
+	table_close(myState->transientrel, NoLock);
+	myState->transientrel = NULL;
+}
+
+/*
+ * transientrel_destroy --- release DestReceiver object
+ */
+static void
+transientrel_destroy(DestReceiver *self)
+{
+	pfree(self);
 }
 
 /*
@@ -884,548 +1444,6 @@ matview_execute_spi_plan(SPIPlanPtr plan, ParamListInfo params,
 		pfree(nulls);
 
 	return res;
-}
-
-/*
- * ExecRefreshMatView -- execute a REFRESH MATERIALIZED VIEW command
- *
- * Takes the lock the statement needs and hands off to RefreshMatViewByOid(),
- * which chooses the refresh strategy.  The statement node's skipData field
- * shows whether WITH NO DATA was used.
- */
-ObjectAddress
-ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
-				   ParamListInfo params, QueryCompletion *qc)
-{
-	Oid			matviewOid;
-	LOCKMODE	lockmode;
-
-	/*
-	 * Determine strength of lock needed.  A partial refresh modifies rows in
-	 * place and serializes on its own row locks.  RowExclusiveLock is enough.
-	 */
-	if (stmt->whereClause)
-		lockmode = RowExclusiveLock;
-	else if (stmt->concurrent)
-		lockmode = ExclusiveLock;
-	else
-		lockmode = AccessExclusiveLock;
-
-	/*
-	 * Get a lock until end of transaction.
-	 */
-	matviewOid = RangeVarGetRelidExtended(stmt->relation,
-										  lockmode, 0,
-										  RangeVarCallbackMaintainsTable,
-										  NULL);
-
-	return RefreshMatViewByOid(matviewOid, false, stmt->skipData,
-							   stmt->concurrent, stmt->whereClause,
-							   queryString, params, qc);
-}
-
-/*
- * RefreshMatViewByOid -- refresh materialized view by OID
- *
- * This refreshes a materialized view using one of three strategies, numbered
- * below as the code tests for them:
- *
- * 1. Partial refresh (CONCURRENTLY with a WHERE clause).  Modifies in place
- * only the rows the clause selects, under RowExclusiveLock.  See
- * refresh_by_direct_modification().
- *
- * 2. Full concurrent refresh (CONCURRENTLY).  Computes the new contents into a
- * temporary table, diffs that against the matview and applies the difference,
- * under ExclusiveLock.  Readers are not blocked, but writers are.
- *
- * 3. Full rebuild (no options).  Creates a new heap, populates it, and swaps
- * relfilenumbers under AccessExclusiveLock.  The OID of the original
- * materialized view is preserved, so we do not lose GRANT nor references to
- * this materialized view.
- *
- * If skipData is true, this is effectively like a TRUNCATE; otherwise it is
- * like a TRUNCATE followed by an INSERT using the SELECT statement associated
- * with the materialized view.
- *
- * For full rebuild, indexes are rebuilt too, via REINDEX.  Since we are
- * effectively bulk-loading the new heap, it's better to create the indexes
- * afterwards than to fill them incrementally while we load.
- *
- * The matview's "populated" state is changed based on whether the contents
- * reflect the result set of the materialized view's query.
- *
- * This is also used to populate the materialized view created by CREATE
- * MATERIALIZED VIEW command.
- */
-ObjectAddress
-RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
-					bool concurrent, Node *whereClause,
-					const char *queryString, ParamListInfo params,
-					QueryCompletion *qc)
-{
-	Relation	matviewRel;
-	RewriteRule *rule;
-	List	   *actions;
-	Query	   *dataQuery;
-	Oid			tableSpace;
-	Oid			relowner;
-	Oid			OIDNewHeap;
-	uint64		processed = 0;
-	char		relpersistence;
-	Oid			save_userid;
-	int			save_sec_context;
-	int			save_nestlevel;
-	ObjectAddress address;
-	Node	   *qual = NULL;
-	int			nUniqueIndexes = 0;
-
-	matviewRel = table_open(matviewOid, NoLock);
-	relowner = matviewRel->rd_rel->relowner;
-
-	/*
-	 * Switch to the owner's userid, so that any functions are run as that
-	 * user.  Also lock down security-restricted operations and arrange to
-	 * make GUC variable changes local to this command.
-	 */
-	GetUserIdAndSecContext(&save_userid, &save_sec_context);
-	SetUserIdAndSecContext(relowner,
-						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
-	save_nestlevel = NewGUCNestLevel();
-	RestrictSearchPath();
-
-	/* Make sure it is a materialized view. */
-	if (matviewRel->rd_rel->relkind != RELKIND_MATVIEW)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("\"%s\" is not a materialized view",
-						RelationGetRelationName(matviewRel))));
-
-	/* Check that CONCURRENTLY is not specified if not populated. */
-	if (concurrent && !RelationIsPopulated(matviewRel))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("CONCURRENTLY cannot be used when the materialized view is not populated")));
-
-	if (whereClause && !RelationIsPopulated(matviewRel))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("WHERE clause cannot be used when the materialized view is not populated")));
-
-	/* Check that conflicting options have not been specified. */
-	if (concurrent && skipData)
-		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("%s options %s and %s cannot be used together",
-						"REFRESH", "CONCURRENTLY", "WITH NO DATA")));
-
-	/*
-	 * Check that everything is correct for a refresh. Problems at this point
-	 * are internal errors, so elog is sufficient.
-	 */
-	if (matviewRel->rd_rel->relhasrules == false ||
-		matviewRel->rd_rules->numLocks < 1)
-		elog(ERROR,
-			 "materialized view \"%s\" is missing rewrite information",
-			 RelationGetRelationName(matviewRel));
-
-	if (matviewRel->rd_rules->numLocks > 1)
-		elog(ERROR,
-			 "materialized view \"%s\" has too many rules",
-			 RelationGetRelationName(matviewRel));
-
-	rule = matviewRel->rd_rules->rules[0];
-	if (rule->event != CMD_SELECT || !(rule->isInstead))
-		elog(ERROR,
-			 "the rule for materialized view \"%s\" is not a SELECT INSTEAD OF rule",
-			 RelationGetRelationName(matviewRel));
-
-	actions = rule->actions;
-	if (list_length(actions) != 1)
-		elog(ERROR,
-			 "the rule for materialized view \"%s\" is not a single action",
-			 RelationGetRelationName(matviewRel));
-
-	if (whereClause)
-	{
-		qual = transformRefreshWhereClause(matviewOid, whereClause, params,
-										   save_userid);
-
-		/*
-		 * Substitute here, before anything reads the predicate.  The source
-		 * query, the plan cache key and both generated statements all come
-		 * from this tree, and they must not disagree about it.
-		 */
-		qual = parameterizeRefreshWhereClause(qual, &params);
-	}
-
-	/*
-	 * The grammar rejects a predicate without CONCURRENTLY, and rejects one
-	 * with WITH NO DATA.  The code below relies on both.  The unique-index
-	 * count a partial refresh needs is only taken under "concurrent", and the
-	 * dispatch tests only for a predicate.
-	 */
-	Assert(!qual || (concurrent && !skipData));
-
-	/*
-	 * Check that there is a unique index with no WHERE clause on one or more
-	 * columns of the materialized view if CONCURRENTLY is specified.
-	 *
-	 * Count them too, since a partial refresh requires there to be exactly
-	 * one.  The reason is given at the check below.
-	 */
-	if (concurrent)
-	{
-		List	   *indexoidlist = RelationGetIndexList(matviewRel);
-		ListCell   *indexoidscan;
-		bool		hasUniqueIndex = false;
-
-		Assert(!is_create);
-
-		foreach(indexoidscan, indexoidlist)
-		{
-			Oid			indexoid = lfirst_oid(indexoidscan);
-			Relation	indexRel;
-			Form_pg_index indexStruct;
-
-			indexRel = index_open(indexoid, AccessShareLock);
-			indexStruct = indexRel->rd_index;
-
-			/* Count every unique index the upsert would have to satisfy. */
-			if (indexStruct->indisunique && indexStruct->indisvalid &&
-				indexStruct->indimmediate)
-				nUniqueIndexes++;
-
-			if (!hasUniqueIndex)
-				hasUniqueIndex = is_usable_unique_index(indexRel);
-			index_close(indexRel, AccessShareLock);
-		}
-
-		list_free(indexoidlist);
-
-		if (!hasUniqueIndex)
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("cannot refresh materialized view \"%s\" concurrently",
-							quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
-													   RelationGetRelationName(matviewRel))),
-					 errhint("Create a unique index with no WHERE clause on one or more columns of the materialized view.")));
-
-		/*
-		 * A partial refresh applies its changes with ON CONFLICT against one
-		 * arbiter index, a row at a time.  Each row must satisfy every unique
-		 * index as we write it.  Two rows exchanging their values on a
-		 * second unique index would need one deleted before the other is
-		 * inserted, which ON CONFLICT cannot do.  No choice of arbiter helps,
-		 * since whichever index arbitrates, the exchange collides on the
-		 * other.  A full refresh is unaffected, since it rewrites the whole
-		 * matview and never reconciles a new row against one it is not
-		 * replacing.
-		 */
-		if (qual && nUniqueIndexes > 1)
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("cannot refresh materialized view \"%s\" with a WHERE clause",
-							quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
-													   RelationGetRelationName(matviewRel))),
-					 errdetail("A partial refresh applies its changes against a single unique index, and the materialized view has more than one."),
-					 errhint("Refresh the materialized view without a WHERE clause.")));
-	}
-
-	/*
-	 * The stored query was rewritten at the time of the MV definition, but
-	 * has not been scribbled on by the planner.
-	 */
-	dataQuery = linitial_node(Query, actions);
-
-	/*
-	 * Check for active uses of the relation in the current transaction, such
-	 * as open scans.
-	 *
-	 * NB: We count on this to protect us against problems with refreshing the
-	 * data using TABLE_INSERT_FROZEN.
-	 */
-	CheckTableNotInUse(matviewRel,
-					   is_create ? "CREATE MATERIALIZED VIEW" :
-					   "REFRESH MATERIALIZED VIEW");
-
-	/*
-	 * Tentatively mark the matview as populated or not (this will roll back
-	 * if we fail later).
-	 */
-	SetMatViewPopulatedState(matviewRel, !skipData);
-
-	/*
-	 * A predicate selects direct modification, which is the only algorithm
-	 * that can apply a change without rewriting rows the predicate does not
-	 * name.
-	 */
-	if (qual)
-	{
-		processed = refresh_by_direct_modification(matviewOid, relowner,
-												  save_userid, save_sec_context,
-												  dataQuery, qual, queryString,
-												  params);
-	}
-	else
-	{
-		/* Concurrent refresh builds new data in temp tablespace, and does diff. */
-		if (concurrent)
-		{
-			tableSpace = GetDefaultTablespace(RELPERSISTENCE_TEMP, false);
-			relpersistence = RELPERSISTENCE_TEMP;
-		}
-		else
-		{
-			tableSpace = matviewRel->rd_rel->reltablespace;
-			relpersistence = matviewRel->rd_rel->relpersistence;
-		}
-
-		/*
-		 * Create the transient table that will receive the regenerated data. Lock
-		 * it against access by any other process until commit (by which time it
-		 * will be gone).
-		 */
-		OIDNewHeap = make_new_heap(matviewOid, tableSpace,
-								   matviewRel->rd_rel->relam,
-								   relpersistence, ExclusiveLock);
-		Assert(CheckRelationOidLockedByMe(OIDNewHeap, AccessExclusiveLock, false));
-
-		/* Generate the data, if wanted. */
-		if (!skipData)
-		{
-			DestReceiver *dest;
-
-			dest = CreateTransientRelDestReceiver(OIDNewHeap);
-			processed = refresh_matview_datafill(dest, dataQuery, queryString,
-												 is_create);
-		}
-
-		/* Make the matview match the newly generated data. */
-		if (concurrent)
-		{
-			int			old_depth = matview_maintenance_depth;
-			Oid			old_relid = matview_maintenance_relid;
-
-			PG_TRY();
-			{
-				refresh_by_match_merge(matviewOid, OIDNewHeap, relowner,
-									   save_sec_context);
-			}
-			PG_CATCH();
-			{
-				matview_maintenance_depth = old_depth;
-				matview_maintenance_relid = old_relid;
-				PG_RE_THROW();
-			}
-			PG_END_TRY();
-			Assert(matview_maintenance_depth == old_depth);
-		}
-		else
-		{
-			refresh_by_heap_swap(matviewOid, OIDNewHeap, relpersistence);
-
-			/*
-			 * Inform cumulative stats system about our activity: basically, we
-			 * truncated the matview and inserted some new data.  (The concurrent
-			 * code path above doesn't need to worry about this because the
-			 * inserts and deletes it issues get counted by lower-level code.)
-			 */
-			pgstat_count_truncate(matviewRel);
-			if (!skipData)
-				pgstat_count_heap_insert(matviewRel, processed);
-		}
-	}
-
-	table_close(matviewRel, NoLock);
-
-	/* Roll back any GUC changes */
-	AtEOXact_GUC(false, save_nestlevel);
-
-	/* Restore userid and security context */
-	SetUserIdAndSecContext(save_userid, save_sec_context);
-
-	ObjectAddressSet(address, RelationRelationId, matviewOid);
-
-	/*
-	 * Save the rowcount so that pg_stat_statements can track the total number
-	 * of rows processed by REFRESH MATERIALIZED VIEW command. Note that we
-	 * still don't display the rowcount in the command completion tag output,
-	 * i.e., the display_rowcount flag of CMDTAG_REFRESH_MATERIALIZED_VIEW
-	 * command tag is left false in cmdtaglist.h. Otherwise, the change of
-	 * completion tag output might break applications using it.
-	 *
-	 * When called from CREATE MATERIALIZED VIEW command, the rowcount is
-	 * displayed with the command tag CMDTAG_SELECT.
-	 */
-	if (qc)
-		SetQueryCompletion(qc,
-						   is_create ? CMDTAG_SELECT : CMDTAG_REFRESH_MATERIALIZED_VIEW,
-						   processed);
-
-	return address;
-}
-
-/*
- * refresh_matview_datafill
- *
- * Execute the given query, sending result rows to "dest" (which will
- * insert them into the target matview).
- *
- * Returns number of rows inserted.
- */
-static uint64
-refresh_matview_datafill(DestReceiver *dest, Query *query,
-						 const char *queryString, bool is_create)
-{
-	List	   *rewritten;
-	PlannedStmt *plan;
-	QueryDesc  *queryDesc;
-	Query	   *copied_query;
-	uint64		processed;
-
-	/* Lock and rewrite, using a copy to preserve the original query. */
-	copied_query = copyObject(query);
-	AcquireRewriteLocks(copied_query, true, false);
-	rewritten = QueryRewrite(copied_query);
-
-	/* SELECT should never rewrite to more or less than one SELECT query */
-	if (list_length(rewritten) != 1)
-		elog(ERROR, "unexpected rewrite result for %s",
-			 is_create ? "CREATE MATERIALIZED VIEW " : "REFRESH MATERIALIZED VIEW");
-	query = (Query *) linitial(rewritten);
-
-	/* Check for user-requested abort. */
-	CHECK_FOR_INTERRUPTS();
-
-	/* Plan the query which will generate data for the refresh. */
-	plan = pg_plan_query(query, queryString, CURSOR_OPT_PARALLEL_OK, NULL, NULL);
-
-	/*
-	 * Use a snapshot with an updated command ID to ensure this query sees
-	 * results of any previously executed queries.  (This could only matter if
-	 * the planner executed an allegedly-stable function that changed the
-	 * database contents, but let's do it anyway to be safe.)
-	 */
-	PushCopiedSnapshot(GetActiveSnapshot());
-	UpdateActiveSnapshotCommandId();
-
-	/* Create a QueryDesc, redirecting output to our tuple receiver */
-	queryDesc = CreateQueryDesc(plan, queryString,
-								GetActiveSnapshot(), InvalidSnapshot,
-								dest, NULL, NULL, 0);
-
-	/* call ExecutorStart to prepare the plan for execution */
-	ExecutorStart(queryDesc, 0);
-
-	/* run the plan */
-	ExecutorRun(queryDesc, ForwardScanDirection, 0);
-
-	processed = queryDesc->estate->es_processed;
-
-	/* and clean up */
-	ExecutorFinish(queryDesc);
-	ExecutorEnd(queryDesc);
-
-	FreeQueryDesc(queryDesc);
-
-	PopActiveSnapshot();
-
-	return processed;
-}
-
-DestReceiver *
-CreateTransientRelDestReceiver(Oid transientoid)
-{
-	DR_transientrel *self = palloc0_object(DR_transientrel);
-
-	self->pub.receiveSlot = transientrel_receive;
-	self->pub.rStartup = transientrel_startup;
-	self->pub.rShutdown = transientrel_shutdown;
-	self->pub.rDestroy = transientrel_destroy;
-	self->pub.mydest = DestTransientRel;
-	self->transientoid = transientoid;
-
-	return (DestReceiver *) self;
-}
-
-/*
- * transientrel_startup --- executor startup
- */
-static void
-transientrel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
-{
-	DR_transientrel *myState = (DR_transientrel *) self;
-	Relation	transientrel;
-
-	transientrel = table_open(myState->transientoid, NoLock);
-
-	/*
-	 * Fill private fields of myState for use by later routines
-	 */
-	myState->transientrel = transientrel;
-	myState->output_cid = GetCurrentCommandId(true);
-	myState->ti_options = TABLE_INSERT_SKIP_FSM | TABLE_INSERT_FROZEN;
-	myState->bistate = GetBulkInsertState();
-
-	/*
-	 * Valid smgr_targblock implies something already wrote to the relation.
-	 * This may be harmless, but this function hasn't planned for it.
-	 */
-	Assert(RelationGetTargetBlock(transientrel) == InvalidBlockNumber);
-}
-
-/*
- * transientrel_receive --- receive one tuple
- */
-static bool
-transientrel_receive(TupleTableSlot *slot, DestReceiver *self)
-{
-	DR_transientrel *myState = (DR_transientrel *) self;
-
-	/*
-	 * Note that the input slot might not be of the type of the target
-	 * relation. That's supported by table_tuple_insert(), but slightly less
-	 * efficient than inserting with the right slot - but the alternative
-	 * would be to copy into a slot of the right type, which would not be
-	 * cheap either. This also doesn't allow accessing per-AM data (say a
-	 * tuple's xmin), but since we don't do that here...
-	 */
-
-	table_tuple_insert(myState->transientrel,
-					   slot,
-					   myState->output_cid,
-					   myState->ti_options,
-					   myState->bistate);
-
-	/* We know this is a newly created relation, so there are no indexes */
-
-	return true;
-}
-
-/*
- * transientrel_shutdown --- executor end
- */
-static void
-transientrel_shutdown(DestReceiver *self)
-{
-	DR_transientrel *myState = (DR_transientrel *) self;
-
-	FreeBulkInsertState(myState->bistate);
-
-	table_finish_bulk_insert(myState->transientrel, myState->ti_options);
-
-	/* close transientrel, but keep lock until commit */
-	table_close(myState->transientrel, NoLock);
-	myState->transientrel = NULL;
-}
-
-/*
- * transientrel_destroy --- release DestReceiver object
- */
-static void
-transientrel_destroy(DestReceiver *self)
-{
-	pfree(self);
 }
 
 /*
