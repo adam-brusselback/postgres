@@ -1,38 +1,28 @@
-# REFRESH MATERIALIZED VIEW ... WHERE ... -- the prune must not delete a row
-# that another refresh committed while this one was in flight
+# REFRESH MATERIALIZED VIEW ... WHERE ...: the prune must not delete a row that
+# another refresh committed while this one was in flight
 #
 # A partial refresh decides which rows the view no longer produces by comparing
 # the matview against the rows it just computed.  If those two are read at
 # different points in time, anything that appeared in the matview in between is
 # in one and not the other, and the prune deletes it.
 #
-# The fused CTE could not have that gap: computing and comparing were arms of
-# one statement under one snapshot.  Evaluating the view separately -- which is
-# what the Query-tree path does, because a Query tree cannot be handed to SPI as
-# a subquery -- puts a seam there, and the seam has to be closed by hand by
-# running the DML under the snapshot the evaluation used.  This spec is what
-# says so.
+# The defining query is evaluated in its own step, because a Query tree cannot
+# be handed to SPI as a subquery, so there is a seam between computing the rows
+# and applying them.  It is closed by running the DML under the snapshot the
+# evaluation used, and this spec is what says so.
 #
-# Why a new key rather than a changed one.  Overlapping refreshes are ordered by
-# the locking SELECT, which takes FOR NO KEY UPDATE on the rows in scope -- so
-# a refresh that would change an existing row is made to wait, and cannot be in
-# flight at the same time as another one over the same rows.  A key the matview
-# does not hold yet locks nothing.  A refresh whose scope contains only such
-# keys therefore runs beside a wider refresh over the same scope with nothing
-# ordering the two, which is the only way to be inside the window at all.
+# It uses a key the matview has never held rather than a changed one.
+# Overlapping refreshes are ordered by the locking SELECT, which takes FOR NO
+# KEY UPDATE on the rows in scope, so a refresh that would change an existing
+# row waits and cannot be in flight beside another over the same rows.  A key
+# the matview does not hold yet locks nothing.  A refresh whose scope contains
+# only such keys runs beside a wider refresh with nothing ordering the two,
+# which is the only way to be inside the window at all.
 #
 # That is also why a probabilistic reproducer cannot stand in for this.  One was
 # written and run against a build with the bug deliberately present, and it
-# reported a clean run: the window is microseconds wide and the violation needs
-# two commits inside it.  A window needs an injection point; only a rate needs a
-# fuzzer.
-#
-# Disposition: keep, and rewrite the two SET lines away when the text path goes.
-# The property is not scaffolding -- a prune that deletes rows the base still
-# produces is data loss -- but selecting the implementation with a GUC is, and
-# so is the injection point, which exists only where the seam does.  If a later
-# implementation closes the seam by construction (one plan, no separate
-# evaluation), delete this with the injection point and say why.
+# reported a clean run.  The window is microseconds wide and the violation needs
+# two commits inside it.
 
 setup
 {
@@ -60,7 +50,7 @@ setup {
 # the wait in this backend, so s2's refresh below runs straight through.
 step s1_wide { REFRESH MATERIALIZED VIEW CONCURRENTLY mvgap WHERE tag = 'hot'; }
 # A no-op so the detach is not launched until the refresh has actually
-# returned -- the same sequencing guard basic.spec uses.
+# returned.  This is the sequencing guard basic.spec uses.
 step s1_noop { }
 
 session s2
