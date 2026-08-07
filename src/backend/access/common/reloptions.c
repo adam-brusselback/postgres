@@ -127,6 +127,15 @@ static relopt_bool boolRelOpts[] =
 	},
 	{
 		{
+			"suppress_redundant_updates",
+			"Skip updates whose new row is identical to the stored row",
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock
+		},
+		false
+	},
+	{
+		{
 			"fastupdate",
 			"Enables \"fast update\" feature for this GIN index",
 			RELOPT_KIND_GIN,
@@ -2018,6 +2027,8 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, analyze_scale_factor)},
 		{"user_catalog_table", RELOPT_TYPE_BOOL,
 		offsetof(StdRdOptions, user_catalog_table)},
+		{"suppress_redundant_updates", RELOPT_TYPE_BOOL,
+		offsetof(StdRdOptions, suppress_redundant_updates)},
 		{"parallel_workers", RELOPT_TYPE_INT,
 		offsetof(StdRdOptions, parallel_workers)},
 		{"vacuum_index_cleanup", RELOPT_TYPE_ENUM,

@@ -128,6 +128,7 @@ typedef struct ModifyTableContext
 typedef struct UpdateContext
 {
 	bool		crossPartUpdate;	/* was it a cross-partition update? */
+	bool		suppressed;		/* did we skip a no-op update? */
 	TU_UpdateIndexes updateIndexes; /* Which index updates are required? */
 
 	/*
@@ -2442,12 +2443,61 @@ ExecUpdatePrepareSlot(ResultRelInfo *resultRelInfo,
 }
 
 /*
+ * ExecUpdateIsRedundant -- would this update leave the row byte-identical?
+ *
+ * Compares the tuple we are about to store against the one already stored,
+ * using the same test as suppress_redundant_updates_trigger(): same length,
+ * same header layout, same natts, same content-derived infomask bits, and
+ * identical payload.  Transaction-status bits are masked out because they
+ * describe the row version rather than its contents.
+ *
+ * This is intentionally a physical comparison rather than a datum-by-datum
+ * one.  It is cheap and never reports a false positive, but it does report
+ * false negatives: a value that is toasted in the stored row but not yet in
+ * the new one compares unequal even when the logical values match, so the
+ * update simply goes ahead.  The trigger has always behaved this way.
+ */
+static bool
+ExecUpdateIsRedundant(TupleTableSlot *oldSlot, TupleTableSlot *newSlot)
+{
+	HeapTuple	oldtup;
+	HeapTuple	newtup;
+	bool		oldShouldFree;
+	bool		newShouldFree;
+	bool		result;
+
+	oldtup = ExecFetchSlotHeapTuple(oldSlot, false, &oldShouldFree);
+	newtup = ExecFetchSlotHeapTuple(newSlot, false, &newShouldFree);
+
+	result = (newtup->t_len == oldtup->t_len &&
+			  newtup->t_data->t_hoff == oldtup->t_data->t_hoff &&
+			  HeapTupleHeaderGetNatts(newtup->t_data) ==
+			  HeapTupleHeaderGetNatts(oldtup->t_data) &&
+			  (newtup->t_data->t_infomask & ~HEAP_XACT_MASK) ==
+			  (oldtup->t_data->t_infomask & ~HEAP_XACT_MASK) &&
+			  memcmp((char *) newtup->t_data + SizeofHeapTupleHeader,
+					 (char *) oldtup->t_data + SizeofHeapTupleHeader,
+					 newtup->t_len - SizeofHeapTupleHeader) == 0);
+
+	if (oldShouldFree)
+		heap_freetuple(oldtup);
+	if (newShouldFree)
+		heap_freetuple(newtup);
+
+	return result;
+}
+
+/*
  * ExecUpdateAct -- subroutine for ExecUpdate
  *
  * Actually update the tuple, when operating on a plain table.  If the
  * table is a partition, and the command was called referencing an ancestor
  * partitioned table, this routine migrates the resulting tuple to another
  * partition.
+ *
+ * oldSlot holds the row currently stored, and may be NULL in call paths that
+ * do not have it available; the suppress_redundant_updates check is skipped
+ * in that case.
  *
  * The caller is in charge of keeping indexes current as necessary.  The
  * caller is also in charge of doing EvalPlanQual if the tuple is found to
@@ -2456,13 +2506,22 @@ ExecUpdatePrepareSlot(ResultRelInfo *resultRelInfo,
  */
 static TM_Result
 ExecUpdateAct(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
-			  ItemPointer tupleid, HeapTuple oldtuple, TupleTableSlot *slot,
-			  bool canSetTag, UpdateContext *updateCxt)
+			  ItemPointer tupleid, HeapTuple oldtuple, TupleTableSlot *oldSlot,
+			  TupleTableSlot *slot, bool canSetTag, UpdateContext *updateCxt)
 {
 	EState	   *estate = context->estate;
 	Relation	resultRelationDesc = resultRelInfo->ri_RelationDesc;
 	bool		partition_constraint_failed;
 	TM_Result	result;
+
+	/*
+	 * Only the caller's oldSlot is known to hold the current version of the
+	 * row.  If we loop back to lreplace after a failed cross-partition move,
+	 * the row may have been concurrently updated and oldSlot is then stale,
+	 * so the redundancy test must not run a second time.
+	 */
+	bool		check_redundant = (oldSlot != NULL &&
+								   RelationGetSuppressRedundantUpdates(resultRelationDesc));
 
 	updateCxt->crossPartUpdate = false;
 
@@ -2478,6 +2537,33 @@ lreplace:
 
 	/* ensure slot is independent, consider e.g. EPQ */
 	ExecMaterializeSlot(slot);
+
+	/*
+	 * If the table asks us to, drop updates that would store exactly the row
+	 * that is already there.
+	 *
+	 * Doing this here, before table_tuple_update(), is the whole point: a
+	 * BEFORE ROW trigger doing the same job cannot get here without
+	 * trigger.c having already taken a tuple lock on the old row, which
+	 * dirties the page and emits an XLOG_HEAP_LOCK record per row even when
+	 * the update is then thrown away.  Deciding at this point costs a memcmp
+	 * of two tuples we are already holding.
+	 *
+	 * As with a BEFORE trigger that returns NULL, the row is not counted in
+	 * the command tag, produces no RETURNING output, and fires no AFTER row
+	 * triggers.  Constraints and WITH CHECK OPTION policies are not
+	 * re-evaluated either, which is safe because the stored row is unchanged
+	 * and already satisfies them.
+	 */
+	if (check_redundant)
+	{
+		if (ExecUpdateIsRedundant(oldSlot, slot))
+		{
+			updateCxt->suppressed = true;
+			return TM_Ok;
+		}
+		check_redundant = false;
+	}
 
 	/*
 	 * If partition constraint fails, this row might get moved to another
@@ -2841,8 +2927,8 @@ ExecUpdate(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 		 */
 redo_act:
 		lockedtid = *tupleid;
-		result = ExecUpdateAct(context, resultRelInfo, tupleid, oldtuple, slot,
-							   canSetTag, &updateCxt);
+		result = ExecUpdateAct(context, resultRelInfo, tupleid, oldtuple,
+							   oldSlot, slot, canSetTag, &updateCxt);
 
 		/*
 		 * If ExecUpdateAct reports that a cross-partition update was done,
@@ -2851,6 +2937,14 @@ redo_act:
 		 */
 		if (updateCxt.crossPartUpdate)
 			return context->cpUpdateReturningSlot;
+
+		/*
+		 * The new row turned out to be identical to the stored one and the
+		 * table is marked suppress_redundant_updates, so nothing was written.
+		 * Treat it exactly like a BEFORE trigger returning NULL.
+		 */
+		if (updateCxt.suppressed)
+			return NULL;
 
 		switch (result)
 		{
@@ -3691,8 +3785,12 @@ lmerge_matched:
 					/* checked ri_needLockTagTuple above */
 					Assert(oldtuple == NULL);
 
+					/*
+					 * No oldSlot here, so suppress_redundant_updates does not
+					 * apply to MERGE; it has its own row accounting.
+					 */
 					result = ExecUpdateAct(context, resultRelInfo, tupleid,
-										   NULL, newslot, canSetTag,
+										   NULL, NULL, newslot, canSetTag,
 										   &updateCxt);
 
 					/*

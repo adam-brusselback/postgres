@@ -670,3 +670,44 @@ update hash_parted set b = b + 8 where b = 1;
 drop table hash_parted;
 drop operator class custom_opclass using hash;
 drop function dummy_hashint4(a int4, seed int8);
+
+-- ----------------------------------------------------------------------
+-- suppress_redundant_updates storage parameter
+-- ----------------------------------------------------------------------
+create table sru_test (id int primary key, a int, b text);
+insert into sru_test values (1, 1, 'x'), (2, 2, 'y');
+alter table sru_test set (suppress_redundant_updates = on);
+
+create temp table sru_before as select id, ctid as old_ctid from sru_test;
+
+-- no-op update: reports zero rows and leaves the stored row versions alone
+update sru_test set a = a, b = b;
+select count(*) as rows_rewritten
+  from sru_test t join sru_before o using (id) where t.ctid <> o.old_ctid;
+
+-- a real update still happens
+update sru_test set a = a + 1 where id = 1;
+select id, a from sru_test order by id;
+
+-- suppressed rows produce no RETURNING output
+update sru_test set a = a where id = 1 returning id, a;
+
+-- ... and fire no AFTER ROW triggers
+create function sru_notice() returns trigger language plpgsql as
+  $$ begin raise notice 'after update on id %', new.id; return null; end $$;
+create trigger sru_after after update on sru_test
+  for each row execute function sru_notice();
+update sru_test set a = a where id = 2;
+update sru_test set a = a + 1 where id = 2;
+
+-- NULLs compare equal to NULLs
+update sru_test set b = null where id = 2;
+update sru_test set b = null where id = 2;
+
+-- turning the option off restores the normal behaviour
+alter table sru_test set (suppress_redundant_updates = off);
+update sru_test set a = a where id = 1;
+
+-- cleanup
+drop table sru_test;
+drop function sru_notice();

@@ -347,6 +347,7 @@ typedef struct StdRdOptions
 	int			toast_tuple_target; /* target for tuple toasting */
 	AutoVacOpts autovacuum;		/* autovacuum-related options */
 	bool		user_catalog_table; /* use as an additional catalog relation */
+	bool		suppress_redundant_updates; /* skip no-op updates */
 	int			parallel_workers;	/* max number of parallel workers */
 	StdRdOptIndexCleanup vacuum_index_cleanup;	/* controls index vacuuming */
 	pg_ternary	vacuum_truncate;	/* enables vacuum to truncate a relation */
@@ -368,6 +369,15 @@ typedef struct StdRdOptions
 #define RelationGetToastTupleTarget(relation, defaulttarg) \
 	((relation)->rd_options ? \
 	 ((StdRdOptions *) (relation)->rd_options)->toast_tuple_target : (defaulttarg))
+
+/*
+ * RelationGetSuppressRedundantUpdates
+ *		Returns true if the relation is marked to skip updates that would not
+ *		change the stored row.  Note multiple eval of argument!
+ */
+#define RelationGetSuppressRedundantUpdates(relation) \
+	((relation)->rd_options ? \
+	 ((StdRdOptions *) (relation)->rd_options)->suppress_redundant_updates : false)
 
 /*
  * RelationGetFillFactor

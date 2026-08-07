@@ -2049,6 +2049,52 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     </listitem>
    </varlistentry>
 
+   <varlistentry id="reloption-suppress-redundant-updates"
+                 xreflabel="suppress_redundant_updates">
+    <term><literal>suppress_redundant_updates</literal> (<type>boolean</type>)
+    <indexterm>
+     <primary><varname>suppress_redundant_updates</varname> storage parameter</primary>
+    </indexterm>
+    </term>
+    <listitem>
+     <para>
+      If set to true, an <command>UPDATE</command> whose new row would be
+      byte-for-byte identical to the row already stored is skipped instead of
+      being applied.  Such a row is not counted in the command tag, produces
+      no <literal>RETURNING</literal> output, and fires no
+      <literal>AFTER ... FOR EACH ROW</literal> triggers, exactly as if a
+      <literal>BEFORE ... FOR EACH ROW</literal> trigger had returned
+      <literal>NULL</literal>.  The default is false.
+     </para>
+
+     <para>
+      This serves the same purpose as the
+      <function>suppress_redundant_updates_trigger</function> function
+      described in <xref linkend="functions-trigger"/>, but is
+      substantially cheaper: the decision is made before the row is locked, so
+      a skipped update writes no WAL and does not dirty the page, whereas the
+      trigger must lock the old row before it can run and therefore writes a
+      lock record per row regardless.
+     </para>
+
+     <para>
+      Note that a skipped update also does not take a row lock, so it no
+      longer blocks a concurrent update of the same row.  Do not enable this
+      on a table where <literal>UPDATE</literal> is used to serialize
+      concurrent writers.  Values that are stored out of line
+      (see <xref linkend="storage-toast"/>) may compare unequal even when the
+      logical values match, in which case the update is applied normally.
+     </para>
+
+     <para>
+      This parameter applies to <command>UPDATE</command>, including the
+      update performed by <literal>ON CONFLICT DO UPDATE</literal>.  It does
+      not currently apply to the <literal>UPDATE</literal> action of
+      <command>MERGE</command>, which always applies the row.
+     </para>
+    </listitem>
+   </varlistentry>
+
    </variablelist>
 
   </refsect2>
