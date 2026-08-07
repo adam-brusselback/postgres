@@ -208,10 +208,10 @@ static Node *parameterizeRefreshWhereClause(Node *qual, ParamListInfo *params);
 static Query *matview_build_source_query(Relation matviewRel, Query *dataQuery,
 										 Node *qual, int nkeyatts,
 										 const int16 *keyattnums);
-static double matview_materialize_source(CachedPlanSource *plansource,
-										 ParamListInfo params,
-										 Snapshot snapshot,
-										 Tuplestorestate *tupstore);
+static void matview_materialize_source(CachedPlanSource *plansource,
+									   ParamListInfo params,
+									   Snapshot snapshot,
+									   Tuplestorestate *tupstore);
 
 /*
  * SetMatViewPopulatedState
@@ -1649,14 +1649,14 @@ matview_build_source_plansource(Query *sourceQuery, const char *queryString)
 
 /*
  * Run the source query under the given snapshot, collecting its rows into the
- * tuplestore the fused statement reads.  Returns the number of rows collected.
+ * tuplestore the fused statement reads.
  *
  * This runs the same executor sequence as refresh_matview_datafill() on the
- * full-refresh path.  It differs in three ways.  The plan comes from the
- * cache rather than being rewritten and planned here, the snapshot is the
- * caller's rather than one we push, and the rows go to a tuplestore.
+ * full-refresh path.  The plan is taken from the cache rather than rewritten
+ * and planned here, the snapshot is the caller's rather than one we push, and
+ * the rows go to a tuplestore.
  */
-static double
+static void
 matview_materialize_source(CachedPlanSource *plansource, ParamListInfo params,
 						   Snapshot snapshot, Tuplestorestate *tupstore)
 {
@@ -1665,7 +1665,6 @@ matview_materialize_source(CachedPlanSource *plansource, ParamListInfo params,
 	QueryDesc  *queryDesc;
 	DestReceiver *dest;
 	ResourceOwner owner;
-	double		processed;
 	const CachedPlan *generic_before;
 	int64		custom_before;
 
@@ -1694,7 +1693,6 @@ matview_materialize_source(CachedPlanSource *plansource, ParamListInfo params,
 
 	ExecutorStart(queryDesc, 0);
 	ExecutorRun(queryDesc, ForwardScanDirection, 0);
-	processed = (double) queryDesc->estate->es_processed;
 	ExecutorFinish(queryDesc);
 	ExecutorEnd(queryDesc);
 	FreeQueryDesc(queryDesc);
@@ -1702,8 +1700,6 @@ matview_materialize_source(CachedPlanSource *plansource, ParamListInfo params,
 	dest->rDestroy(dest);
 
 	ReleaseCachedPlan(cplan, owner);
-
-	return processed;
 }
 
 /*
@@ -1741,9 +1737,10 @@ matview_materialize_source(CachedPlanSource *plansource, ParamListInfo params,
  * key cannot be applied a row at a time, so we reject that between steps 3
  * and 4.
  *
- * The plans for steps 1 and 4, and the plansource for step 3, are cached for
- * the session and keyed on the arbiter index, the predicate and the parameter
- * types.
+ * The statements for steps 1 and 4, the duplicate-key check between steps 3
+ * and 4, and the plansource for step 3 are all cached for the session.  The
+ * entry is keyed on the matview, and reused only when the arbiter index, the
+ * predicate and the parameter types all match and the plans are still valid.
  */
 static uint64
 refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
@@ -2156,11 +2153,8 @@ refresh_by_direct_modification(Oid matviewOid, Oid relowner, Oid callerId,
 		}
 
 		/*
-		 * We lock the matview rows in scope before evaluating the source, and
-		 * take the snapshot the source runs under only afterwards.  The order
-		 * matters.  A refresh that queued behind another must not evaluate
-		 * its source from before that one committed, or it writes stale
-		 * values back over it.
+		 * Lock the rows in scope first.  The snapshot the rest of the work
+		 * runs under is taken after this, not before.
 		 */
 		if (matview_execute_spi_plan(cacheEntry->lockPlan, params,
 									 InvalidSnapshot, false) < 0)
