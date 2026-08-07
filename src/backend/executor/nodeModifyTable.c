@@ -2456,6 +2456,17 @@ ExecUpdatePrepareSlot(ResultRelInfo *resultRelInfo,
  * false negatives: a value that is toasted in the stored row but not yet in
  * the new one compares unequal even when the logical values match, so the
  * update simply goes ahead.  The trigger has always behaved this way.
+ *
+ * We must also be sure oldSlot really is the live version of the row.  It is
+ * fetched with SnapshotAny before any concurrency check has run, so if
+ * another transaction has updated the row in the meantime we would otherwise
+ * compare against a superseded version and skip an update that
+ * table_tuple_update() would have rejected.  Requiring HEAP_XMAX_INVALID
+ * settles that: the bit is only set once xmax is known to be invalid, so
+ * when it is set nobody has updated, deleted or locked this version.  When
+ * it is not set we simply fall through to the normal update path, which does
+ * the full check and raises a serialization failure or runs EvalPlanQual as
+ * appropriate.
  */
 static bool
 ExecUpdateIsRedundant(TupleTableSlot *oldSlot, TupleTableSlot *newSlot)
@@ -2467,6 +2478,15 @@ ExecUpdateIsRedundant(TupleTableSlot *oldSlot, TupleTableSlot *newSlot)
 	bool		result;
 
 	oldtup = ExecFetchSlotHeapTuple(oldSlot, false, &oldShouldFree);
+
+	/* Not provably the live version?  Let the normal path sort it out. */
+	if ((oldtup->t_data->t_infomask & HEAP_XMAX_INVALID) == 0)
+	{
+		if (oldShouldFree)
+			heap_freetuple(oldtup);
+		return false;
+	}
+
 	newtup = ExecFetchSlotHeapTuple(newSlot, false, &newShouldFree);
 
 	result = (newtup->t_len == oldtup->t_len &&
@@ -2519,8 +2539,14 @@ ExecUpdateAct(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 	 * row.  If we loop back to lreplace after a failed cross-partition move,
 	 * the row may have been concurrently updated and oldSlot is then stale,
 	 * so the redundancy test must not run a second time.
+	 *
+	 * Skipping is also confined to READ COMMITTED.  Under an isolation level
+	 * that uses a transaction snapshot, a row updated by a concurrent
+	 * transaction must raise a serialization failure, and we can only find
+	 * that out by attempting the update, so there we never suppress.
 	 */
 	bool		check_redundant = (oldSlot != NULL &&
+								   !IsolationUsesXactSnapshot() &&
 								   RelationGetSuppressRedundantUpdates(resultRelationDesc));
 
 	updateCxt->crossPartUpdate = false;

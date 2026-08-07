@@ -2078,10 +2078,21 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
      </para>
 
      <para>
-      Note that a skipped update also does not take a row lock, so it no
-      longer blocks a concurrent update of the same row.  Do not enable this
-      on a table where <literal>UPDATE</literal> is used to serialize
-      concurrent writers.  Values that are stored out of line
+      Concurrency checks are preserved.  A row that another transaction has
+      updated is never skipped: under <literal>REPEATABLE READ</literal> and
+      <literal>SERIALIZABLE</literal> such a row still raises
+      <literal>could not serialize access due to concurrent update</literal>,
+      and under <literal>READ COMMITTED</literal> it is still re-evaluated
+      against the newest row version.  What a skipped row does not do is take
+      a row lock, so it no longer blocks a concurrent update of the same row.
+      Do not enable this on a table where a no-op <literal>UPDATE</literal> is
+      used to serialize concurrent writers; use
+      <link linkend="sql-select"><literal>SELECT ... FOR UPDATE</literal></link>
+      or an advisory lock for that instead.
+     </para>
+
+     <para>
+      Values that are stored out of line
       (see <xref linkend="storage-toast"/>) may compare unequal even when the
       logical values match, in which case the update is applied normally.
      </para>

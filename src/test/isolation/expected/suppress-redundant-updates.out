@@ -1,0 +1,103 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_begin_rr s1_snapshot s2_upd_plain s1_upd_plain s1_commit s3_show
+step s1_begin_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_snapshot: SELECT count(*) FROM sru; SELECT count(*) FROM ctl;
+count
+-----
+    1
+(1 row)
+
+count
+-----
+    1
+(1 row)
+
+step s2_upd_plain: UPDATE sru SET x = 2 WHERE id = 1;
+step s1_upd_plain: UPDATE sru SET x = 1 WHERE id = 1;
+ERROR:  could not serialize access due to concurrent update
+step s1_commit: COMMIT;
+step s3_show: SELECT 'sru' AS t, x FROM sru WHERE id = 1
+					  UNION ALL SELECT 'ctl', x FROM ctl WHERE id = 1 ORDER BY 1;
+t  |x
+---+-
+ctl|1
+sru|2
+(2 rows)
+
+
+starting permutation: s1_begin_rr s1_snapshot s2_upd_supp s1_upd_supp s1_commit s3_show
+step s1_begin_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_snapshot: SELECT count(*) FROM sru; SELECT count(*) FROM ctl;
+count
+-----
+    1
+(1 row)
+
+count
+-----
+    1
+(1 row)
+
+step s2_upd_supp: UPDATE ctl SET x = 2 WHERE id = 1;
+step s1_upd_supp: UPDATE ctl SET x = 1 WHERE id = 1;
+ERROR:  could not serialize access due to concurrent update
+step s1_commit: COMMIT;
+step s3_show: SELECT 'sru' AS t, x FROM sru WHERE id = 1
+					  UNION ALL SELECT 'ctl', x FROM ctl WHERE id = 1 ORDER BY 1;
+t  |x
+---+-
+ctl|2
+sru|1
+(2 rows)
+
+
+starting permutation: s1_begin_rc s1_snapshot s2_upd_plain s1_upd_plain s1_commit s3_show
+step s1_begin_rc: BEGIN ISOLATION LEVEL READ COMMITTED;
+step s1_snapshot: SELECT count(*) FROM sru; SELECT count(*) FROM ctl;
+count
+-----
+    1
+(1 row)
+
+count
+-----
+    1
+(1 row)
+
+step s2_upd_plain: UPDATE sru SET x = 2 WHERE id = 1;
+step s1_upd_plain: UPDATE sru SET x = 1 WHERE id = 1;
+step s1_commit: COMMIT;
+step s3_show: SELECT 'sru' AS t, x FROM sru WHERE id = 1
+					  UNION ALL SELECT 'ctl', x FROM ctl WHERE id = 1 ORDER BY 1;
+t  |x
+---+-
+ctl|1
+sru|1
+(2 rows)
+
+
+starting permutation: s1_begin_rc s1_snapshot s2_upd_supp s1_upd_supp s1_commit s3_show
+step s1_begin_rc: BEGIN ISOLATION LEVEL READ COMMITTED;
+step s1_snapshot: SELECT count(*) FROM sru; SELECT count(*) FROM ctl;
+count
+-----
+    1
+(1 row)
+
+count
+-----
+    1
+(1 row)
+
+step s2_upd_supp: UPDATE ctl SET x = 2 WHERE id = 1;
+step s1_upd_supp: UPDATE ctl SET x = 1 WHERE id = 1;
+step s1_commit: COMMIT;
+step s3_show: SELECT 'sru' AS t, x FROM sru WHERE id = 1
+					  UNION ALL SELECT 'ctl', x FROM ctl WHERE id = 1 ORDER BY 1;
+t  |x
+---+-
+ctl|1
+sru|1
+(2 rows)
+
