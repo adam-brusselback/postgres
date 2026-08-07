@@ -319,14 +319,76 @@ Median of 3, `VACUUM FULL` before each rep, prepared protocol
 
 | workload | stock | trigger | reloption |
 |---|---|---|---|
-| narrow, redundant | 9,097 | 10,459 (+15.0%) | **10,971 (+20.6%)** |
-| wide, redundant | 9,027 | 9,700 (+7.4%) | **10,026 (+11.1%)** |
-| narrow, changing | 8,916 | 8,566 (−3.9%) | **8,834 (−0.9%)** |
+| narrow, redundant | 9,517 | 9,810 (+3.1%) | **10,829 (+13.8%)** |
+| wide, redundant | 9,226 | 9,621 (+4.3%) | **10,021 (+8.6%)** |
+| narrow, changing | 8,896 | 8,382 (−5.8%) | **8,739 (−1.8%)** |
 
 The last row matters as much as the first two: when nothing can be suppressed,
-the reloption costs 0.9% instead of the trigger's 3.9%, because the only thing
-it adds is the `memcmp` — no lock, no trigger invocation, no per-row
-`bms_union`.
+the reloption costs ~2% instead of the trigger's ~6%, because the only thing it
+adds is the `memcmp` — no lock, no trigger invocation, no per-row `bms_union`.
+
+Treat the percentages as indicative rather than precise. This 4 vCPU container
+shows roughly ±5% run to run, and the stock and trigger baselines moved that
+much between runs; the reloption's own absolute figure was stable across runs
+(10,971 then 10,829 on the narrow redundant workload). The WAL and buffer
+numbers above are exact — they are counters, not timings.
+
+### Concurrency: the first version of this was wrong
+
+Suppressing an update means `table_tuple_update()` is never called, and the
+first version dropped that call's concurrency checks along with it. The
+comparison runs against `oldSlot`, fetched with `SnapshotAny` before anything
+has established that it is still the live version, so a row another
+transaction had already updated could compare equal and be skipped. Under
+REPEATABLE READ that swallowed a serialization failure outright:
+
+| isolation | reloption off | reloption on (first version) |
+|---|---|---|
+| REPEATABLE READ | `ERROR: could not serialize access due to concurrent update` | no error, silently skipped |
+| READ COMMITTED | row re-evaluated, update applied | same (fresh snapshot, so no staleness) |
+
+An application retrying on serialization errors would have lost the update
+with no indication. Two restrictions fix it, neither of which costs anything
+measurable:
+
+* Suppression is confined to READ COMMITTED. There the statement takes a fresh
+  snapshot, so `oldSlot` is the version the statement is entitled to act on.
+  An isolation level using a transaction snapshot can only discover the
+  conflict by attempting the update, so it always attempts it.
+* The old tuple must carry `HEAP_XMAX_INVALID`, which is set only once xmax is
+  known invalid and therefore proves nobody has updated, deleted or locked
+  this version. Anything else falls through to the normal path.
+
+`heap_update()` sets `HEAP_XMAX_INVALID` on every new row version, so a row
+becomes eligible again as soon as it has been updated once — the guard does
+not accumulate misses.
+
+`src/test/isolation/specs/suppress-redundant-updates.spec` asserts that a
+suppressing table and a plain table behave identically across both isolation
+levels when a concurrent transaction updates the same row.
+
+### What is still different, and the floor on fixing it
+
+After the above, the only remaining behavioural difference is that a skipped
+row takes **no row lock**, so a no-op `UPDATE` no longer blocks a concurrent
+writer. That cannot be given back cheaply: PostgreSQL stores row locks in the
+tuple header (`xmax`), so there is no lock without a page write, and no page
+write without a WAL record — and with `full_page_writes = on`, possibly an
+8 KB full page image. Any variant that genuinely serializes pays approximately
+the floor the trigger already pays.
+
+There is still room above that floor. The lock is only 63–76% of the trigger's
+cost; the rest is trigger invocation, the per-row `bms_union` and materializing
+a `HeapTuple` for the trigger API. A "compare, then lock, then skip the write"
+mode should beat the trigger by a few percent with identical semantics — but
+it must lock *first* and compare against the locked version, or it inherits
+exactly the staleness bug described above. The correct place for that is inside
+`heap_update()`, after `HeapTupleSatisfiesUpdate()` has validated the row and
+while the buffer lock is already held. That is not implemented here.
+
+If the goal is a mutex rather than an update, `SELECT ... FOR NO KEY UPDATE`
+costs the same lock and says so, and `pg_advisory_xact_lock()` is pure shared
+memory — no page write and no WAL at all.
 
 `flamegraphs/patched_reloption_redundant.svg` shows the result: the
 `ExecBRUpdateTriggers` tower is simply gone.
@@ -340,7 +402,8 @@ and defaults to off:
 
 * **No row lock is taken.** A no-op `UPDATE` no longer serializes against a
   concurrent update of the same row. Anyone using `UPDATE ... SET x = x` as a
-  mutex must not enable this.
+  mutex must not enable this. Concurrency *checks* are preserved — see below —
+  it is only the lock that is gone.
 * **MERGE is not covered.** Its `UPDATE` action has separate row accounting
   and restart-on-conflict logic; it always applies the row. Supporting it is
   possible but wanted its own testing rather than being tacked on.
@@ -351,12 +414,16 @@ concurrently updated by then and `oldSlot` would be stale.
 
 ### Testing
 
-`make installcheck` against the patched server fails exactly the same 17 tests
-as against an unpatched server built from the same tree in this container —
-i.e. the patch introduces no new failures. (Those 17 are environmental, not
-related to this work.) `src/test/regress/sql/update.sql` gains coverage for the
-command tag, row versions being untouched, `RETURNING`, AFTER-trigger
-suppression, NULL handling, and turning the option back off.
+`make installcheck` against the patched server fails only tests that an
+unpatched server built from the same tree in this container also fails — i.e.
+the patch introduces no new failures. (Those are environmental, not related to
+this work; the exact set varies slightly run to run.)
+
+`src/test/regress/sql/update.sql` gains coverage for the command tag, row
+versions being untouched, `RETURNING`, AFTER-trigger suppression, NULL
+handling, and turning the option back off.
+`src/test/isolation/specs/suppress-redundant-updates.spec` covers the
+concurrency semantics against a plain table.
 
 ---
 

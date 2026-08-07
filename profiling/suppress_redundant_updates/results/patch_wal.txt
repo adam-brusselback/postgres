@@ -6,20 +6,20 @@ BEGIN
                                      QUERY PLAN                                      
 -------------------------------------------------------------------------------------
  Update on t_narrow_plain (actual rows=0.00 loops=1)
-   Buffers: shared hit=61658 dirtied=684 written=88
-   WAL: records=29905 bytes=2213678
+   Buffers: shared hit=61740 dirtied=734 written=87
+   WAL: records=29831 bytes=2209494
    ->  Bitmap Heap Scan on t_narrow_plain (actual rows=10000.00 loops=1)
          Recheck Cond: ((id >= 1) AND (id <= 10000))
-         Heap Blocks: exact=310
-         Buffers: shared hit=339
+         Heap Blocks: exact=458
+         Buffers: shared hit=487
          ->  Bitmap Index Scan on t_narrow_plain_pkey (actual rows=10000.00 loops=1)
                Index Cond: ((id >= 1) AND (id <= 10000))
                Index Searches: 1
                Buffers: shared hit=29
  Planning:
    Buffers: shared hit=25 dirtied=2
- Planning Time: 0.202 ms
- Execution Time: 45.476 ms
+ Planning Time: 0.191 ms
+ Execution Time: 44.367 ms
 (15 rows)
 
 ROLLBACK
@@ -28,12 +28,12 @@ BEGIN
                                       QUERY PLAN                                       
 ---------------------------------------------------------------------------------------
  Update on t_narrow_trigger (actual rows=0.00 loops=1)
-   Buffers: shared hit=30231 dirtied=202
+   Buffers: shared hit=30334 dirtied=305
    WAL: records=10000 bytes=540000
    ->  Bitmap Heap Scan on t_narrow_trigger (actual rows=10000.00 loops=1)
          Recheck Cond: ((id >= 1) AND (id <= 10000))
-         Heap Blocks: exact=202
-         Buffers: shared hit=231
+         Heap Blocks: exact=305
+         Buffers: shared hit=334
          ->  Bitmap Index Scan on t_narrow_trigger_pkey (actual rows=10000.00 loops=1)
                Index Cond: ((id >= 1) AND (id <= 10000))
                Index Searches: 1
@@ -42,7 +42,7 @@ BEGIN
    Buffers: shared hit=15
  Planning Time: 0.126 ms
  Trigger z_suppress: calls=10000
- Execution Time: 12.520 ms
+ Execution Time: 12.722 ms
 (16 rows)
 
 ROLLBACK
@@ -51,19 +51,19 @@ BEGIN
                                        QUERY PLAN                                        
 -----------------------------------------------------------------------------------------
  Update on t_narrow_reloption (actual rows=0.00 loops=1)
-   Buffers: shared hit=10233
+   Buffers: shared hit=10337
    ->  Bitmap Heap Scan on t_narrow_reloption (actual rows=10000.00 loops=1)
          Recheck Cond: ((id >= 1) AND (id <= 10000))
-         Heap Blocks: exact=204
-         Buffers: shared hit=233
+         Heap Blocks: exact=308
+         Buffers: shared hit=337
          ->  Bitmap Index Scan on t_narrow_reloption_pkey (actual rows=10000.00 loops=1)
                Index Cond: ((id >= 1) AND (id <= 10000))
                Index Searches: 1
                Buffers: shared hit=29
  Planning:
-   Buffers: shared hit=16 dirtied=1
- Planning Time: 0.128 ms
- Execution Time: 5.189 ms
+   Buffers: shared hit=16 dirtied=2
+ Planning Time: 0.169 ms
+ Execution Time: 5.765 ms
 (14 rows)
 
 ROLLBACK
@@ -72,20 +72,20 @@ BEGIN
                                     QUERY PLAN                                     
 -----------------------------------------------------------------------------------
  Update on t_wide_plain (actual rows=0.00 loops=1)
-   Buffers: shared hit=80512 dirtied=10061 written=28
-   WAL: records=25899 bytes=8318740
+   Buffers: shared hit=73676 dirtied=10061 written=28
+   WAL: records=22989 bytes=6944228
    ->  Bitmap Heap Scan on t_wide_plain (actual rows=10000.00 loops=1)
          Recheck Cond: ((id >= 1) AND (id <= 10000))
-         Heap Blocks: exact=2985
-         Buffers: shared hit=3014
+         Heap Blocks: exact=4179
+         Buffers: shared hit=4208
          ->  Bitmap Index Scan on t_wide_plain_pkey (actual rows=10000.00 loops=1)
                Index Cond: ((id >= 1) AND (id <= 10000))
                Index Searches: 1
                Buffers: shared hit=29
  Planning:
    Buffers: shared hit=15
- Planning Time: 0.112 ms
- Execution Time: 77.899 ms
+ Planning Time: 0.100 ms
+ Execution Time: 72.098 ms
 (15 rows)
 
 ROLLBACK
@@ -102,9 +102,9 @@ BEGIN
          Buffers: shared hit=1139
  Planning:
    Buffers: shared hit=17 dirtied=2
- Planning Time: 0.335 ms
+ Planning Time: 0.164 ms
  Trigger z_suppress: calls=10000
- Execution Time: 27.358 ms
+ Execution Time: 27.154 ms
 (12 rows)
 
 ROLLBACK
@@ -120,8 +120,8 @@ BEGIN
          Buffers: shared hit=1139
  Planning:
    Buffers: shared hit=18 dirtied=2
- Planning Time: 0.133 ms
- Execution Time: 18.190 ms
+ Planning Time: 0.195 ms
+ Execution Time: 19.045 ms
 (10 rows)
 
 ROLLBACK
