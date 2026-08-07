@@ -1,0 +1,149 @@
+Pager usage is off.
+================================================================
+WAL / buffer accounting for one batch of 10k UPDATEs
+"redundant" = NEW is byte-identical to OLD
+================================================================
+VACUUM
+CHECKPOINT
+
+--- narrow, NO trigger, redundant update (baseline: full rewrite)
+BEGIN
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Update on t_narrow_notrig (actual rows=0.00 loops=1)
+   Buffers: shared hit=61611 read=693 dirtied=779 written=80
+   WAL: records=29987 fpi=699 bytes=7822192 fpi bytes=5614296
+   ->  Bitmap Heap Scan on t_narrow_notrig (actual rows=10000.00 loops=1)
+         Recheck Cond: ((id >= 1) AND (id <= 10000))
+         Heap Blocks: exact=411
+         Buffers: shared hit=347 read=93
+         ->  Bitmap Index Scan on t_narrow_notrig_pkey (actual rows=10000.00 loops=1)
+               Index Cond: ((id >= 1) AND (id <= 10000))
+               Index Searches: 1
+               Buffers: shared hit=2 read=27
+ Planning:
+   Buffers: shared hit=24 read=2 dirtied=2
+ Planning Time: 0.486 ms
+ Execution Time: 59.478 ms
+(15 rows)
+
+ROLLBACK
+
+--- narrow, WITH suppress trigger, redundant update (all suppressed)
+BEGIN
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Update on t_narrow_trig (actual rows=0.00 loops=1)
+   Buffers: shared hit=30002 read=313 dirtied=287
+   WAL: records=10000 fpi=287 bytes=2853223 fpi bytes=2309508
+   ->  Bitmap Heap Scan on t_narrow_trig (actual rows=10000.00 loops=1)
+         Recheck Cond: ((id >= 1) AND (id <= 10000))
+         Heap Blocks: exact=286
+         Buffers: shared hit=2 read=313
+         ->  Bitmap Index Scan on t_narrow_trig_pkey (actual rows=10000.00 loops=1)
+               Index Cond: ((id >= 1) AND (id <= 10000))
+               Index Searches: 1
+               Buffers: shared hit=2 read=27
+ Planning:
+   Buffers: shared hit=13 read=2
+ Planning Time: 0.175 ms
+ Trigger z_suppress: calls=10000
+ Execution Time: 14.519 ms
+(16 rows)
+
+ROLLBACK
+
+--- narrow, NO trigger, changing update
+BEGIN
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Update on t_narrow_notrig (actual rows=0.00 loops=1)
+   Buffers: shared hit=67961 dirtied=58 written=58
+   WAL: records=29077 bytes=2076782
+   ->  Bitmap Heap Scan on t_narrow_notrig (actual rows=10000.00 loops=1)
+         Recheck Cond: ((id >= 1) AND (id <= 10000))
+         Heap Blocks: exact=717
+         Buffers: shared hit=774
+         WAL: records=67 bytes=3504
+         ->  Bitmap Index Scan on t_narrow_notrig_pkey (actual rows=19936.00 loops=1)
+               Index Cond: ((id >= 1) AND (id <= 10000))
+               Index Searches: 1
+               Buffers: shared hit=56
+ Planning:
+   Buffers: shared hit=5
+ Planning Time: 0.123 ms
+ Execution Time: 51.033 ms
+(16 rows)
+
+ROLLBACK
+
+--- narrow, WITH suppress trigger, changing update (nothing suppressed)
+BEGIN
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Update on t_narrow_trig (actual rows=0.00 loops=1)
+   Buffers: shared hit=71739 read=329 dirtied=444 written=83
+   WAL: records=39978 fpi=361 bytes=5647396 fpi bytes=2893728
+   ->  Bitmap Heap Scan on t_narrow_trig (actual rows=10000.00 loops=1)
+         Recheck Cond: ((id >= 1) AND (id <= 10000))
+         Heap Blocks: exact=286
+         Buffers: shared hit=315
+         ->  Bitmap Index Scan on t_narrow_trig_pkey (actual rows=10000.00 loops=1)
+               Index Cond: ((id >= 1) AND (id <= 10000))
+               Index Searches: 1
+               Buffers: shared hit=29
+ Planning:
+   Buffers: shared hit=3
+ Planning Time: 0.104 ms
+ Trigger z_suppress: calls=10000
+ Execution Time: 57.732 ms
+(16 rows)
+
+ROLLBACK
+
+--- wide, NO trigger, redundant update
+BEGIN
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Update on t_wide_notrig (actual rows=0.00 loops=1)
+   Buffers: shared hit=62399 read=9884 dirtied=10062 written=28
+   WAL: records=22125 fpi=10034 bytes=81266260 fpi bytes=79674896 buffers full=7146
+   ->  Bitmap Heap Scan on t_wide_notrig (actual rows=10000.00 loops=1)
+         Recheck Cond: ((id >= 1) AND (id <= 10000))
+         Heap Blocks: exact=4689
+         Buffers: shared hit=838 read=3880
+         ->  Bitmap Index Scan on t_wide_notrig_pkey (actual rows=10000.00 loops=1)
+               Index Cond: ((id >= 1) AND (id <= 10000))
+               Index Searches: 1
+               Buffers: shared hit=2 read=27
+ Planning:
+   Buffers: shared hit=13 read=2
+ Planning Time: 0.153 ms
+ Execution Time: 303.963 ms
+(15 rows)
+
+ROLLBACK
+
+--- wide, WITH suppress trigger, redundant update (all suppressed)
+BEGIN
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ Update on t_wide_trig (actual rows=0.00 loops=1)
+   Buffers: shared hit=30002 read=3787 dirtied=3761
+   WAL: records=10000 fpi=3761 bytes=27065905 fpi bytes=26477612 buffers full=1801
+   ->  Bitmap Heap Scan on t_wide_trig (actual rows=10000.00 loops=1)
+         Recheck Cond: ((id >= 1) AND (id <= 10000))
+         Heap Blocks: exact=3760
+         Buffers: shared hit=2 read=3787
+         ->  Bitmap Index Scan on t_wide_trig_pkey (actual rows=10000.00 loops=1)
+               Index Cond: ((id >= 1) AND (id <= 10000))
+               Index Searches: 1
+               Buffers: shared hit=2 read=27
+ Planning:
+   Buffers: shared hit=13 read=2 dirtied=1
+ Planning Time: 6.666 ms
+ Trigger z_suppress: calls=10000
+ Execution Time: 99.919 ms
+(16 rows)
+
+ROLLBACK

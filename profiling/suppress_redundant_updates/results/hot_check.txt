@@ -1,0 +1,43 @@
+Pager usage is off.
+psql:/tmp/claude-0/-home-user-postgres/3270ba05-7bc8-5226-9a93-a3534b405d6f/scratchpad/bench/hot_check2.sql:8: NOTICE:  table "sru_hot" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+INSERT 0 20000
+CREATE INDEX
+CREATE INDEX
+VACUUM
+ pg_stat_reset_single_table_counters 
+-------------------------------------
+ 
+(1 row)
+
+=== redundant UPDATE (indexed values unchanged):
+UPDATE 10000
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ n_tup_upd | n_tup_hot_upd | pct_hot 
+-----------+---------------+---------
+     10000 |         10000 |   100.0
+(1 row)
+
+ pg_stat_reset_single_table_counters 
+-------------------------------------
+ 
+(1 row)
+
+=== changing UPDATE (indexed values change):
+UPDATE 10000
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ n_tup_upd | n_tup_hot_upd | pct_hot 
+-----------+---------------+---------
+     10000 |             0 |     0.0
+(1 row)
+
+DROP TABLE

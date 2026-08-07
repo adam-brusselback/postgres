@@ -1,0 +1,37 @@
+Pager usage is off.
+VACUUM
+ pg_stat_reset_single_table_counters 
+-------------------------------------
+ 
+(1 row)
+
+=== redundant UPDATE (values unchanged), no trigger:
+UPDATE 10000
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ n_tup_upd | n_tup_hot_upd | pct_hot 
+-----------+---------------+---------
+     10000 |             0 |     0.0
+(1 row)
+
+VACUUM
+ pg_stat_reset_single_table_counters 
+-------------------------------------
+ 
+(1 row)
+
+=== changing UPDATE (indexed values change), no trigger:
+UPDATE 10000
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ n_tup_upd | n_tup_hot_upd | pct_hot 
+-----------+---------------+---------
+     10000 |             0 |     0.0
+(1 row)
+

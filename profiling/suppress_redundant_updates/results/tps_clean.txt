@@ -1,0 +1,12 @@
+narrow_notrig_redundant 8937.956214
+narrow_trig_redundant 9995.634678
+narrow_notrig_changing 9209.855663
+narrow_trig_changing 8696.527382
+wide_notrig_redundant 9095.307654
+wide_trig_redundant 9802.415107
+wide_notrig_changing 9068.900554
+wide_trig_changing 8880.985221
+idx_notrig_redundant 8939.064153
+idx_trig_redundant 9977.589867
+idx_notrig_changing 7235.645360
+idx_trig_changing 7012.928117

@@ -1,0 +1,9 @@
+p_narrow_plain_redundant 9096.813417
+p_narrow_trigger_redundant 10458.523003
+p_narrow_reloption_redundant 10970.695354
+p_wide_plain_redundant 9027.215211
+p_wide_trigger_redundant 9699.677541
+p_wide_reloption_redundant 10026.415415
+p_narrow_plain_changing 8916.195870
+p_narrow_trigger_changing 8565.792138
+p_narrow_reloption_changing 8833.840446

@@ -10,7 +10,9 @@ single thing**: the mandatory `heap_lock_tuple()` on the old tuple, taken
 *before* we can possibly know the update will be suppressed.
 
 So there is essentially nothing to win inside `trigfuncs.c`. The wins are in
-the machinery, and the biggest one is structural.
+the machinery, and the biggest one is structural — see §6, which implements
+it as a table storage parameter and removes the lock, the WAL and the XID
+entirely.
 
 ---
 
@@ -136,10 +138,30 @@ still dirtied.
 So suppression cuts WAL by 76% (narrow) and 94% (wide) — but never to zero, and
 the transaction is still a writing transaction: it consumes an XID, dirties
 heap pages, and must write a commit record. `suppress_redundant_updates_trigger`
-does not turn a no-op UPDATE into a read-only transaction.
+does not turn a no-op UPDATE into a read-only transaction. (Measured directly:
+`txid_current_if_assigned()` is non-NULL after a fully suppressed batch.)
 
 And when it *cannot* suppress, it adds 10,000 lock records — **+26% WAL
 records and +3.8% execution time** on top of the plain UPDATE.
+
+### With `full_page_writes = on` it is much worse
+
+The numbers above were taken with `full_page_writes = off`. That is not the
+production default, and it hides the real cost: because `heap_lock_tuple()`
+dirties the page, the first touch of a page after a checkpoint emits a full
+page image even for a row that is not being modified. Re-running the same
+batches with `full_page_writes = on`:
+
+| case | WAL records | FPIs | WAL bytes | exec time |
+|---|---|---|---|---|
+| narrow, no trigger, redundant | 29,987 | 699 | 7,822,192 | 59.5 ms |
+| narrow, trigger, redundant (all suppressed) | 10,000 | **287** | **2,853,223** | 14.5 ms |
+| wide, no trigger, redundant | 22,125 | 10,034 | 81,266,260 | 304.0 ms |
+| wide, trigger, redundant (all suppressed) | 10,000 | **3,761** | **27,065,905** | 99.9 ms |
+
+A batch of 10,000 updates that changed nothing at all still wrote **27 MB of
+WAL**, almost all of it full page images. Still an improvement on the 81 MB the
+plain UPDATE writes, but a long way from free.
 
 ---
 
@@ -214,29 +236,140 @@ with 76–94% less WAL.
 
 Single-row OLTP updates benefit far less, because per-statement costs
 (parse/plan, round-trip, commit) dominate and the trigger's own overhead eats
-much of the saving. It is also worth knowing that **PostgreSQL already handles
-redundant updates fairly well without the trigger**: if the new values equal the
-old ones, no indexed column has actually changed, so the update stays
-HOT-eligible and skips index maintenance on its own. That removes much of the
-benefit people expect on indexed tables.
+much of the saving. Clean single-row throughput, median of 3 runs with a
+`VACUUM FULL` before each so bloat cannot skew the comparison
+(`results/tps_clean.txt`):
 
-Throughput deltas from the profiled runs are reported in
-`results/profiled_tps.txt`, but they carry `perf` overhead and — more
-importantly — a bias: `_notrig` tables accumulate bloat within a phase because
-their updates actually apply, while suppressed `_trig` tables stay pristine.
-`harness/run3.sh` re-measures throughput with a `VACUUM FULL` before every
-repetition to remove that bias; see `results/tps_clean.txt`.
+| workload | no trigger | trigger | delta |
+|---|---|---|---|
+| narrow, redundant | 8,938 | 9,996 | **+11.8%** |
+| narrow, changing | 9,210 | 8,697 | −5.6% |
+| wide, redundant | 9,095 | 9,802 | **+7.8%** |
+| wide, changing | 9,069 | 8,881 | −2.1% |
+| indexed, redundant | 8,939 | 9,978 | **+11.6%** |
+| indexed, changing | 7,236 | 7,013 | −3.1% |
 
-Cost *attribution* — the subject of this report — is not sensitive to that bias:
-the 63–76% `heap_lock_tuple` share reproduces across all eight workloads.
+That bias is worth spelling out, because the profiled runs in
+`results/profiled_tps.txt` do *not* control for it: `_notrig` tables accumulate
+bloat within a phase because their updates actually apply, while suppressed
+`_trig` tables stay pristine. In those runs the indexed-table comparison came
+out at −10.9%, the opposite sign from the clean +11.6% above. Cost
+*attribution* — the subject of this report — is not sensitive to it: the 63–76%
+`heap_lock_tuple` share reproduces across all eight workloads.
+
+It is also worth knowing that **PostgreSQL already avoids the index work on
+redundant updates by itself**, which is why the indexed table does not benefit
+more than the others. If the new values equal the old ones then no indexed
+column has changed, so the update qualifies as HOT and skips index
+maintenance. Measured on a table with indexes on the updated columns
+(`results/hot_check.txt`):
+
+| update | n_tup_upd | n_tup_hot_upd | HOT |
+|---|---|---|---|
+| redundant (indexed values unchanged) | 10,000 | 10,000 | **100%** |
+| changing (indexed values change) | 10,000 | 0 | 0% |
+
+This holds only when the page has room for the new row version. An earlier
+version of this test ran `VACUUM FULL` first, which packs pages to 100%
+fillfactor and leaves nowhere on-page for the new version; it reported 0% HOT
+in *both* cases and was simply measuring the absence of free space. That
+invalid run is kept as `results/hot_check_invalid.txt` as a caution.
 
 ---
 
-## 6. Files
+## 6. Acting on §4.1: the `suppress_redundant_updates` reloption
+
+§4.1 argued the feature is mis-sited as a BEFORE ROW trigger. That is now
+implemented as a table storage parameter, in the commit
+"Add suppress_redundant_updates storage parameter".
+
+`ExecUpdateAct()` already holds the stored row — `oldSlot`, fetched anyway so
+`ExecGetUpdateNewTuple()` can build the new row from the unchanged columns —
+and the fully prepared new row. The same comparison the trigger performs
+therefore costs a `memcmp` of two tuples already in hand, and it happens
+*before* `table_tuple_update()`, so a skipped update takes no row lock.
+
+```sql
+ALTER TABLE t SET (suppress_redundant_updates = on);
+```
+
+### Result: the lock, the WAL and the XID all disappear
+
+Same 10,000-row batches, same server, three variants side by side
+(`results/patch_wal.txt`):
+
+| case | WAL records | WAL bytes | buffers dirtied | exec time |
+|---|---|---|---|---|
+| narrow, stock | 29,905 | 2,213,678 | 684 | 45.5 ms |
+| narrow, trigger | 10,000 | 540,000 | 202 | 12.5 ms |
+| **narrow, reloption** | **0** | **0** | **1** | **5.2 ms** |
+| wide, stock | 25,899 | 8,318,740 | 10,061 | 77.9 ms |
+| wide, trigger | 10,000 | 540,000 | 1,110 | 27.4 ms |
+| **wide, reloption** | **0** | **0** | **2** | **18.2 ms** |
+
+A fully suppressed batch now writes **no WAL at all** and dirties nothing, so
+the `full_page_writes` problem in §3 disappears with it. The transaction also
+stays read-only — `txid_current_if_assigned()` returns NULL under the
+reloption and non-NULL under the trigger, confirming no XID is burned.
+
+### Throughput, single-row updates
+
+Median of 3, `VACUUM FULL` before each rep, prepared protocol
+(`results/patch_tps.txt`):
+
+| workload | stock | trigger | reloption |
+|---|---|---|---|
+| narrow, redundant | 9,097 | 10,459 (+15.0%) | **10,971 (+20.6%)** |
+| wide, redundant | 9,027 | 9,700 (+7.4%) | **10,026 (+11.1%)** |
+| narrow, changing | 8,916 | 8,566 (−3.9%) | **8,834 (−0.9%)** |
+
+The last row matters as much as the first two: when nothing can be suppressed,
+the reloption costs 0.9% instead of the trigger's 3.9%, because the only thing
+it adds is the `memcmp` — no lock, no trigger invocation, no per-row
+`bms_union`.
+
+`flamegraphs/patched_reloption_redundant.svg` shows the result: the
+`ExecBRUpdateTriggers` tower is simply gone.
+
+### Semantics, stated plainly
+
+A skipped row is not counted in the command tag, produces no `RETURNING`
+output, and fires no AFTER row triggers — matching a BEFORE trigger that
+returns NULL. Two things are genuinely different and are why this is opt-in
+and defaults to off:
+
+* **No row lock is taken.** A no-op `UPDATE` no longer serializes against a
+  concurrent update of the same row. Anyone using `UPDATE ... SET x = x` as a
+  mutex must not enable this.
+* **MERGE is not covered.** Its `UPDATE` action has separate row accounting
+  and restart-on-conflict logic; it always applies the row. Supporting it is
+  possible but wanted its own testing rather than being tacked on.
+
+The check is deliberately not repeated when `ExecUpdateAct()` loops back to
+`lreplace` after a failed cross-partition move, since the row may have been
+concurrently updated by then and `oldSlot` would be stale.
+
+### Testing
+
+`make installcheck` against the patched server fails exactly the same 17 tests
+as against an unpatched server built from the same tree in this container —
+i.e. the patch introduces no new failures. (Those 17 are environmental, not
+related to this work.) `src/test/regress/sql/update.sql` gains coverage for the
+command tag, row versions being untouched, `RETURNING`, AFTER-trigger
+suppression, NULL handling, and turning the option back off.
+
+---
+
+## 7. Files
 
 * `harness/` — scripts to reproduce everything; see `harness/README.md`.
 * `results/cost_attribution.txt` — the tables in §2, generated.
 * `results/wal_report.txt` — the WAL accounting in §3.
+* `results/wal_report_fpw_on.txt` — the same with `full_page_writes = on`.
+* `results/tps_clean.txt` — unbiased throughput (§5).
+* `results/hot_check.txt` — the HOT measurement (§5);
+  `results/hot_check_invalid.txt` is the flawed earlier run.
+* `results/patch_tps.txt`, `results/patch_wal.txt` — the reloption results (§6).
 * `flamegraphs/*.svg` — per-workload flamegraphs (open in a browser; they zoom).
 * `flamegraphs/diff_*.svg` — differential flamegraphs, **red = time added by
   attaching the trigger**, blue = time removed. The clearest single view: the
