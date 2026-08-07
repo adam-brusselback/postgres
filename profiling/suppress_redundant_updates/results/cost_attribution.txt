@@ -1,0 +1,83 @@
+############ COST ATTRIBUTION (% of in-query backend CPU) ############
+workload                           ExecMT BRUpdTrg GetTupTrg heapLock  trgFunc AllUpdCols  heapUpd
+narrow_notrig_redundant             32.75     0.00     0.00     0.00     0.00     0.00     3.94
+narrow_trig_redundant               22.79     6.54     5.20     4.51     0.07     0.39     0.00
+narrow_notrig_changing              31.42     0.00     0.00     0.00     0.00     0.00     3.93
+narrow_trig_changing                33.05     4.15     2.75     2.44     0.12     0.37     1.99
+wide_notrig_redundant               29.65     0.00     0.00     0.00     0.00     0.00     4.42
+wide_trig_redundant                 25.04     6.26     5.10     4.50     0.09     0.33     0.00
+wide_notrig_changing                29.55     0.00     0.00     0.00     0.00     0.00     4.87
+wide_trig_changing                  30.53     3.89     2.69     2.33     0.07     0.34     3.12
+
+############ TRIGGER OVERHEAD BREAKDOWN (share of ExecBRUpdateTriggers) ############
+-- narrow_trig_redundant (ExecBRUpdateTriggers = 100%)
+      80.97%  GetTupleForTrigger
+      70.33%  heap_lock_tuple
+       3.66%  ExecCallTriggerFunc
+       1.06%  suppress_redundant_updates_trigger
+       6.15%  ExecGetAllUpdatedCols
+       2.25%  ExecFetchSlotHeapTuple
+-- wide_trig_redundant (ExecBRUpdateTriggers = 100%)
+      82.18%  GetTupleForTrigger
+      72.64%  heap_lock_tuple
+       4.37%  ExecCallTriggerFunc
+       1.38%  suppress_redundant_updates_trigger
+       5.40%  ExecGetAllUpdatedCols
+       2.41%  ExecFetchSlotHeapTuple
+-- narrow_trig_redundant_prep (ExecBRUpdateTriggers = 100%)
+      83.82%  GetTupleForTrigger
+      75.83%  heap_lock_tuple
+       2.92%  ExecCallTriggerFunc
+       1.27%  suppress_redundant_updates_trigger
+       5.56%  ExecGetAllUpdatedCols
+       1.95%  ExecFetchSlotHeapTuple
+-- wide_trig_redundant_prep (ExecBRUpdateTriggers = 100%)
+      78.45%  GetTupleForTrigger
+      70.62%  heap_lock_tuple
+       4.21%  ExecCallTriggerFunc
+       1.37%  suppress_redundant_updates_trigger
+       6.46%  ExecGetAllUpdatedCols
+       3.82%  ExecFetchSlotHeapTuple
+-- idx_trig_redundant_prep (ExecBRUpdateTriggers = 100%)
+      79.73%  GetTupleForTrigger
+      72.28%  heap_lock_tuple
+       3.79%  ExecCallTriggerFunc
+       1.83%  suppress_redundant_updates_trigger
+       5.86%  ExecGetAllUpdatedCols
+       2.69%  ExecFetchSlotHeapTuple
+-- narrow_trig_changing_prep (ExecBRUpdateTriggers = 100%)
+      71.91%  GetTupleForTrigger
+      63.36%  heap_lock_tuple
+       5.80%  ExecCallTriggerFunc
+       1.37%  suppress_redundant_updates_trigger
+       7.79%  ExecGetAllUpdatedCols
+       3.05%  ExecFetchSlotHeapTuple
+-- idx_trig_changing_prep (ExecBRUpdateTriggers = 100%)
+      72.57%  GetTupleForTrigger
+      65.93%  heap_lock_tuple
+       4.60%  ExecCallTriggerFunc
+       2.90%  suppress_redundant_updates_trigger
+       7.33%  ExecGetAllUpdatedCols
+       3.41%  ExecFetchSlotHeapTuple
+
+############ THROUGHPUT ############
+
+-- phase 1/2 (single run, profiled):
+  narrow_notrig_redundant              6212.0
+  narrow_trig_redundant                6969.2
+  narrow_notrig_changing               6061.3
+  narrow_trig_changing                 5927.9
+  wide_notrig_redundant                5934.6
+  wide_trig_redundant                  6206.3
+  wide_notrig_changing                 5570.6
+  wide_trig_changing                   5771.6
+  narrow_notrig_redundant_prep         8275.1
+  narrow_trig_redundant_prep           8888.4
+  narrow_notrig_changing_prep          8217.9
+  narrow_trig_changing_prep            8120.7
+  wide_notrig_redundant_prep           8408.3
+  wide_trig_redundant_prep             8633.8
+  idx_notrig_redundant_prep            8093.4
+  idx_trig_redundant_prep              7207.1
+  idx_notrig_changing_prep             6620.0
+  idx_trig_changing_prep               6750.5

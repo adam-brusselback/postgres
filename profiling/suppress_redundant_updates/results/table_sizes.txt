@@ -1,0 +1,4 @@
+t_narrow_notrig 5096 kB
+t_narrow_trig 5096 kB
+t_wide_notrig 87 MB
+t_wide_trig 87 MB

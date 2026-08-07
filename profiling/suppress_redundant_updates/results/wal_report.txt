@@ -1,0 +1,145 @@
+Pager usage is off.
+================================================================
+WAL / buffer accounting for one batch of 10k UPDATEs
+"redundant" = NEW is byte-identical to OLD
+================================================================
+VACUUM
+CHECKPOINT
+
+--- narrow, NO trigger, redundant update (baseline: full rewrite)
+BEGIN
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Update on t_narrow_notrig (actual rows=0.00 loops=1)
+   Buffers: shared hit=62585 dirtied=815 written=86
+   WAL: records=30140 bytes=2252165
+   ->  Bitmap Heap Scan on t_narrow_notrig (actual rows=10000.00 loops=1)
+         Recheck Cond: ((id >= 1) AND (id <= 10000))
+         Heap Blocks: exact=185
+         Buffers: shared hit=214
+         ->  Bitmap Index Scan on t_narrow_notrig_pkey (actual rows=10000.00 loops=1)
+               Index Cond: ((id >= 1) AND (id <= 10000))
+               Index Searches: 1
+               Buffers: shared hit=29
+ Planning:
+   Buffers: shared hit=25 dirtied=2
+ Planning Time: 0.327 ms
+ Execution Time: 51.711 ms
+(15 rows)
+
+ROLLBACK
+
+--- narrow, WITH suppress trigger, redundant update (all suppressed)
+BEGIN
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Update on t_narrow_trig (actual rows=0.00 loops=1)
+   Buffers: shared hit=30179 dirtied=150
+   WAL: records=10000 bytes=540000
+   ->  Bitmap Heap Scan on t_narrow_trig (actual rows=10000.00 loops=1)
+         Recheck Cond: ((id >= 1) AND (id <= 10000))
+         Heap Blocks: exact=150
+         Buffers: shared hit=179
+         ->  Bitmap Index Scan on t_narrow_trig_pkey (actual rows=10000.00 loops=1)
+               Index Cond: ((id >= 1) AND (id <= 10000))
+               Index Searches: 1
+               Buffers: shared hit=29
+ Planning:
+   Buffers: shared hit=16 dirtied=1
+ Planning Time: 0.126 ms
+ Trigger z_suppress: calls=10000
+ Execution Time: 12.097 ms
+(16 rows)
+
+ROLLBACK
+
+--- narrow, NO trigger, changing update
+BEGIN
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Update on t_narrow_notrig (actual rows=0.00 loops=1)
+   Buffers: shared hit=67721 dirtied=65 written=65
+   WAL: records=30511 bytes=2219322
+   ->  Bitmap Heap Scan on t_narrow_notrig (actual rows=10000.00 loops=1)
+         Recheck Cond: ((id >= 1) AND (id <= 10000))
+         Heap Blocks: exact=753
+         Buffers: shared hit=810
+         WAL: records=5 bytes=260
+         ->  Bitmap Index Scan on t_narrow_notrig_pkey (actual rows=19999.00 loops=1)
+               Index Cond: ((id >= 1) AND (id <= 10000))
+               Index Searches: 1
+               Buffers: shared hit=56
+ Planning:
+   Buffers: shared hit=5
+ Planning Time: 0.098 ms
+ Execution Time: 57.965 ms
+(16 rows)
+
+ROLLBACK
+
+--- narrow, WITH suppress trigger, changing update (nothing suppressed)
+BEGIN
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Update on t_narrow_trig (actual rows=0.00 loops=1)
+   Buffers: shared hit=72474 dirtied=649 written=86
+   WAL: records=40128 bytes=2791225
+   ->  Bitmap Heap Scan on t_narrow_trig (actual rows=10000.00 loops=1)
+         Recheck Cond: ((id >= 1) AND (id <= 10000))
+         Heap Blocks: exact=150
+         Buffers: shared hit=179
+         ->  Bitmap Index Scan on t_narrow_trig_pkey (actual rows=10000.00 loops=1)
+               Index Cond: ((id >= 1) AND (id <= 10000))
+               Index Searches: 1
+               Buffers: shared hit=29
+ Planning:
+   Buffers: shared hit=3
+ Planning Time: 0.098 ms
+ Trigger z_suppress: calls=10000
+ Execution Time: 60.172 ms
+(16 rows)
+
+ROLLBACK
+
+--- wide, NO trigger, redundant update
+BEGIN
+                                        QUERY PLAN                                         
+-------------------------------------------------------------------------------------------
+ Update on t_wide_notrig (actual rows=0.00 loops=1)
+   Buffers: shared hit=88753 dirtied=10057 written=28
+   WAL: records=28191 bytes=9403189
+   ->  Index Scan using t_wide_notrig_pkey on t_wide_notrig (actual rows=10000.00 loops=1)
+         Index Cond: ((id >= 1) AND (id <= 10000))
+         Index Searches: 1
+         Buffers: shared hit=4075
+ Planning:
+   Buffers: shared hit=15
+ Planning Time: 0.125 ms
+ Execution Time: 81.416 ms
+(11 rows)
+
+ROLLBACK
+
+--- wide, WITH suppress trigger, redundant update (all suppressed)
+BEGIN
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
+ Update on t_wide_trig (actual rows=0.00 loops=1)
+   Buffers: shared hit=32446 dirtied=2417
+   WAL: records=10000 bytes=540000
+   ->  Bitmap Heap Scan on t_wide_trig (actual rows=10000.00 loops=1)
+         Recheck Cond: ((id >= 1) AND (id <= 10000))
+         Heap Blocks: exact=2417
+         Buffers: shared hit=2446
+         ->  Bitmap Index Scan on t_wide_trig_pkey (actual rows=10000.00 loops=1)
+               Index Cond: ((id >= 1) AND (id <= 10000))
+               Index Searches: 1
+               Buffers: shared hit=29
+ Planning:
+   Buffers: shared hit=16 dirtied=2
+ Planning Time: 0.137 ms
+ Trigger z_suppress: calls=10000
+ Execution Time: 31.132 ms
+(16 rows)
+
+ROLLBACK
